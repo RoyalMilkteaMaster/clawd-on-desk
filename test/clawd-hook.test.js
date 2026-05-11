@@ -145,6 +145,75 @@ describe("buildStateBody", () => {
     assert.ok(!("pid_chain" in body));
   });
 
+  describe("agentPid and headless detection", () => {
+    const childProcess = require("child_process");
+    const makeResolve = (agentPid) =>
+      () => ({ stablePid: 1, agentPid, detectedEditor: null, pidChain: [] });
+
+    function withMockedExec(mockFn, cb) {
+      const orig = childProcess.execFileSync;
+      childProcess.execFileSync = mockFn;
+      try { cb(); } finally { childProcess.execFileSync = orig; }
+    }
+
+    it("sets agent_pid and claude_pid when agentPid is present", () => {
+      withMockedExec(() => "", () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(42));
+        assert.strictEqual(body.agent_pid, 42);
+        assert.strictEqual(body.claude_pid, 42);
+      });
+    });
+
+    it("omits agent_pid and claude_pid when agentPid is absent", () => {
+      const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(null));
+      assert.ok(!("agent_pid" in body));
+      assert.ok(!("claude_pid" in body));
+    });
+
+    it("sets headless when cmdline ends with -p", () => {
+      withMockedExec(() => "node claude-code -p", () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(99));
+        assert.strictEqual(body.headless, true);
+      });
+    });
+
+    it("sets headless when cmdline has -p followed by a space", () => {
+      withMockedExec(() => "node claude-code -p some-prompt", () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(99));
+        assert.strictEqual(body.headless, true);
+      });
+    });
+
+    it("sets headless when cmdline contains --print", () => {
+      withMockedExec(() => "node claude-code --print", () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(99));
+        assert.strictEqual(body.headless, true);
+      });
+    });
+
+    it("does not set headless when -p is a prefix of a longer option", () => {
+      withMockedExec(() => "node claude-code --port 3000", () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(99));
+        assert.ok(!("headless" in body));
+      });
+    });
+
+    it("does not set headless when cmdline is empty", () => {
+      withMockedExec(() => "", () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(99));
+        assert.ok(!("headless" in body));
+      });
+    });
+
+    it("keeps agent_pid set when execFileSync throws", () => {
+      withMockedExec(() => { throw new Error("ENOENT"); }, () => {
+        const body = buildStateBody("PreToolUse", { session_id: "s" }, makeResolve(77));
+        assert.strictEqual(body.agent_pid, 77);
+        assert.ok(!("headless" in body));
+      });
+    });
+  });
+
   it("passes through tool metadata for tool events", () => {
     const payload = {
       session_id: "s",
