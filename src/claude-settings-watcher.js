@@ -56,6 +56,80 @@ function settingsNeedClaudeHookResync(rawSettings, expectedPermissionUrl) {
   return !hasManagedCommandHook || !hasManagedPermissionHook;
 }
 
+function countCommandHooksInEntries(entries) {
+  if (!Array.isArray(entries)) return 0;
+  let count = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "http") continue;
+    if (typeof entry.command === "string") count += 1;
+    if (!Array.isArray(entry.hooks)) continue;
+    for (const hook of entry.hooks) {
+      if (!hook || typeof hook !== "object") continue;
+      if (hook.type === "http") continue;
+      if (typeof hook.command === "string") count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Count total command hooks across every event in the hooks object.
+ * Handles both nested format (entry.hooks[].command) and flat format (entry.command).
+ * HTTP hooks (type: "http") are excluded because they cannot encode the marker.
+ * @param {object|null|undefined} hooks
+ * @returns {number}
+ */
+function countAllHooks(hooks) {
+  if (!hooks || typeof hooks !== "object") return 0;
+  let total = 0;
+  for (const entries of Object.values(hooks)) {
+    total += countCommandHooksInEntries(entries);
+  }
+  return total;
+}
+
+/**
+ * Capture a snapshot of top-level key count and command hook count from settings.json text.
+ * Returns null when the payload is not a parseable JSON object so callers can skip comparisons.
+ * @param {string} raw
+ * @returns {{keyCount: number, hookCount: number}|null}
+ */
+function takeSnapshot(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return {
+    keyCount: Object.keys(parsed).length,
+    hookCount: countAllHooks(parsed.hooks),
+  };
+}
+
+/**
+ * Decide whether the shrink between two snapshots looks suspicious.
+ * Two independent OR triggers — hook drop ratio reaches shrinkRatio, or top-level key drop reaches keyLossThreshold.
+ * Either snapshot missing returns false because insufficient history cannot prove an attack.
+ * @param {{keyCount: number, hookCount: number}|null} prev
+ * @param {{keyCount: number, hookCount: number}|null} curr
+ * @param {number} shrinkRatio
+ * @param {number} keyLossThreshold
+ * @returns {boolean}
+ */
+function isSuspiciousShrink(prev, curr, shrinkRatio, keyLossThreshold) {
+  if (!prev || !curr) return false;
+  const keyDrop = prev.keyCount - curr.keyCount;
+  if (keyDrop >= keyLossThreshold) return true;
+  if (prev.hookCount <= 0) return false;
+  const hookDrop = prev.hookCount - curr.hookCount;
+  if (hookDrop <= 0) return false;
+  return (hookDrop / prev.hookCount) >= shrinkRatio;
+}
+
 function createClaudeSettingsWatcher(ctx = {}) {
   const fsApi = ctx.fs || fs;
   const pathApi = ctx.path || path;
@@ -65,10 +139,13 @@ function createClaudeSettingsWatcher(ctx = {}) {
   const nowFn = typeof ctx.now === "function" ? ctx.now : Date.now;
   const settingsWatchDebounceMs = Number.isFinite(ctx.settingsWatchDebounceMs) ? ctx.settingsWatchDebounceMs : 1000;
   const settingsWatchRateLimitMs = Number.isFinite(ctx.settingsWatchRateLimitMs) ? ctx.settingsWatchRateLimitMs : 5000;
+  const suspiciousShrinkRatio = Number.isFinite(ctx.suspiciousShrinkRatio) ? ctx.suspiciousShrinkRatio : 0.5;
+  const suspiciousKeyLossThreshold = Number.isFinite(ctx.suspiciousKeyLossThreshold) ? ctx.suspiciousKeyLossThreshold : 3;
 
   let settingsWatcher = null;
   let settingsWatchDebounceTimer = null;
   let settingsWatchLastSyncTime = 0;
+  let lastTrustedSnapshot = null;
 
   function getClaudeSettingsDir() {
     return typeof ctx.claudeSettingsDir === "string"
@@ -88,6 +165,7 @@ function createClaudeSettingsWatcher(ctx = {}) {
       settingsWatchDebounceTimer = null;
     }
     settingsWatchLastSyncTime = 0;
+    lastTrustedSnapshot = null;
     if (!settingsWatcher) return false;
     try {
       settingsWatcher.close();
@@ -100,6 +178,23 @@ function createClaudeSettingsWatcher(ctx = {}) {
     if (settingsWatcher) return false;
     const settingsDir = getClaudeSettingsDir();
     const settingsPath = getClaudeSettingsPath();
+    // Seed the trusted baseline from the current settings.json before the watcher starts,
+    // so the very first watcher event after Clawd boots (e.g. an external CLI minimize
+    // landing right after syncClawdHooks() ran) can be compared against a real snapshot
+    // instead of null. Wrapped in its own try/catch so a missing or unreadable file
+    // (fresh install, permission error) cannot prevent the watcher from starting.
+    // The settingsNeedClaudeHookResync guard inside this block also prevents seeding
+    // from a polluted state if an external CLI raced ahead of this read.
+    try {
+      const seedRaw = fsApi.readFileSync(settingsPath, "utf-8");
+      const seedPort = typeof ctx.getHookServerPort === "function" ? ctx.getHookServerPort() : null;
+      const seedExpectedPermissionUrl = buildPermissionUrl(seedPort);
+      if (!settingsNeedClaudeHookResync(seedRaw, seedExpectedPermissionUrl)) {
+        lastTrustedSnapshot = takeSnapshot(seedRaw);
+      }
+    } catch (err) {
+      console.warn("Clawd: could not seed settings baseline:", err.message);
+    }
     try {
       settingsWatcher = fsApi.watch(settingsDir, (_event, filename) => {
         if (filename && filename !== SETTINGS_FILENAME) return;
@@ -114,10 +209,24 @@ function createClaudeSettingsWatcher(ctx = {}) {
             const raw = fsApi.readFileSync(settingsPath, "utf-8");
             const port = typeof ctx.getHookServerPort === "function" ? ctx.getHookServerPort() : null;
             const expectedPermissionUrl = buildPermissionUrl(port);
+            const currentSnapshot = takeSnapshot(raw);
             if (settingsNeedClaudeHookResync(raw, expectedPermissionUrl)) {
+              // Snapshot guard — refuse to resync when settings.json shrank too much,
+              // since an external CLI may have minimized it and re-registering would
+              // drop third-party hooks. See PR description for the production race.
+              if (isSuspiciousShrink(lastTrustedSnapshot, currentSnapshot, suspiciousShrinkRatio, suspiciousKeyLossThreshold)) {
+                console.warn("Clawd: settings.json shrank suspiciously — skipping auto-resync to preserve third-party hooks");
+                if (typeof ctx.notifySuspiciousShrink === "function") {
+                  ctx.notifySuspiciousShrink(lastTrustedSnapshot, currentSnapshot);
+                }
+                return;
+              }
               console.log("Clawd: hooks missing from settings.json — re-registering");
               settingsWatchLastSyncTime = nowFn();
               if (typeof ctx.syncClawdHooks === "function") ctx.syncClawdHooks();
+            } else if (currentSnapshot) {
+              // Trust this state — refresh the baseline only when the file looks healthy.
+              lastTrustedSnapshot = currentSnapshot;
             }
           } catch {}
         }, settingsWatchDebounceMs);
@@ -147,5 +256,8 @@ module.exports = {
   entriesContainCommandMarker,
   entriesContainHttpHookUrl,
   settingsNeedClaudeHookResync,
+  countAllHooks,
+  takeSnapshot,
+  isSuspiciousShrink,
   createClaudeSettingsWatcher,
 };
