@@ -37,6 +37,7 @@ const STATE_PATH = "/state";
 // (main → renderer → main) ran under load and silently timed out.
 const POST_TIMEOUT_MS = 1000;
 const AGENT_ID = "opencode";
+const HOOK_SOURCE = "opencode-plugin";
 
 // opencode emits session.status=busy between every tool call as the LLM
 // deliberates the next step; without this gate the pet would flash
@@ -352,6 +353,7 @@ function sendState(state, eventName, sessionId) {
     session_id: sessionId || "default",
     event: eventName,
     agent_id: AGENT_ID,
+    hook_source: HOOK_SOURCE,
   });
 }
 
@@ -449,6 +451,7 @@ function handlePermissionAsked(event) {
   }
   postPermissionToClawd({
     agent_id: AGENT_ID,
+    hook_source: HOOK_SOURCE,
     tool_name: p.permission || "unknown",
     tool_input: p.metadata || {},
     patterns: Array.isArray(p.patterns) ? p.patterns : [],

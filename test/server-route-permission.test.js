@@ -247,6 +247,32 @@ describe("server-route-permission POST", () => {
     assert.deepStrictEqual(res.ctx.calls.replyOpencodePermission, []);
   });
 
+  it("routes opencode permissions by hook_source when agent_id is missing", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      hook_source: "opencode-plugin",
+      session_id: "opencode:s1",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      request_id: "req-1",
+      bridge_url: "http://127.0.0.1:1234",
+      bridge_token: "token",
+    }));
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body, "ok");
+    assert.strictEqual(res.ctx.pendingPermissions.length, 1);
+    const entry = res.ctx.pendingPermissions[0];
+    assert.strictEqual(entry.agentId, "opencode");
+    assert.strictEqual(entry.isOpencode, true);
+    assert.deepStrictEqual(res.ctx.calls.updateSession, [[
+      "opencode:s1",
+      "notification",
+      "PermissionRequest",
+      { agentId: "opencode" },
+    ]]);
+    assert.deepStrictEqual(res.recorder.map((item) => item.outcome).filter(Boolean), ["accepted"]);
+  });
+
   it("destroys the Claude/CodeBuddy connection during DND", async () => {
     const res = await callPermissionPost(JSON.stringify({
       tool_name: "Bash",

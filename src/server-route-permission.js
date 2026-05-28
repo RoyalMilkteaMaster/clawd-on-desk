@@ -13,6 +13,7 @@ const {
   normalizeCodexPermissionToolInput,
   buildToolInputFingerprint,
 } = require("./server-permission-utils");
+const { resolveHookAgentId } = require("./server-agent-id");
 
 const MAX_PERMISSION_BODY_BYTES = 524288;
 
@@ -219,6 +220,8 @@ function handlePermissionPost(req, res, options) {
       return;
     }
     const recordRequestHookEvent = createRequestHookRecorder(data, "permission");
+    const agentIdentity = resolveHookAgentId(data);
+    const agentId = agentIdentity.agentId;
 
     try {
       // ── opencode branch ──
@@ -233,7 +236,7 @@ function handlePermissionPost(req, res, options) {
       // HTTP response (fire-and-forget), so a generic HTTP deny would
       // leave the TUI hanging until timeout. Instead we route DND
       // through the same reverse bridge the plugin uses for replies.
-      if (data.agent_id === "opencode") {
+      if (agentId === "opencode") {
         res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
         res.end("ok");
 
@@ -342,7 +345,7 @@ function handlePermissionPost(req, res, options) {
       // permission.js / bubble-format.js are kept as intentional dead code so
       // a future Path C restoration (e.g. if agy ships a final-allow protocol
       // field) only needs to re-enable this entry point.
-      if (data.agent_id === "antigravity-cli") {
+      if (agentId === "antigravity-cli") {
         const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
         if (ctx.doNotDisturb) {
           recordRequestHookEvent.droppedByDnd();
@@ -359,7 +362,7 @@ function handlePermissionPost(req, res, options) {
       // ── Codex official PermissionRequest branch ──
       // The hook is blocking, but fallback must be no-decision rather than
       // Deny: Codex will then continue to its native approval prompt.
-      if (data.agent_id === "codex") {
+      if (agentId === "codex") {
         const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const description = typeof data.tool_input_description === "string" && data.tool_input_description
@@ -466,7 +469,7 @@ function handlePermissionPost(req, res, options) {
       // Qwen command hooks treat empty/no-decision output as "show native
       // permission prompt". Keep every fallback as 204/no-decision so Clawd
       // never denies tools on cleanup or disabled bubble paths.
-      if (data.agent_id === "qwen-code") {
+      if (agentId === "qwen-code") {
         const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
@@ -557,7 +560,7 @@ function handlePermissionPost(req, res, options) {
       // A pre-state-only managed extension may still be loaded in an existing
       // Pi process, so return "allow" to preserve Pi's native YOLO behavior
       // instead of turning Clawd fallback into a terminal confirmation prompt.
-      if (data.agent_id === "pi") {
+      if (agentId === "pi") {
         const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "unknown";
         if (ctx.doNotDisturb) {
           recordRequestHookEvent.droppedByDnd();
@@ -588,7 +591,7 @@ function handlePermissionPost(req, res, options) {
       // codebuddy, since they share this path) falls back to its built-in
       // chat prompt. Any non-opencode agent_id passing through here
       // gets the same treatment.
-      const ccAgentId = typeof data.agent_id === "string" && data.agent_id ? data.agent_id : "claude-code";
+      const ccAgentId = agentId;
       if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled(ccAgentId)) {
         recordRequestHookEvent.droppedByDisabled();
         ctx.permLog(`${ccAgentId} disabled → destroy connection, chat fallback`);
@@ -609,7 +612,7 @@ function handlePermissionPost(req, res, options) {
       // capabilities.permissionApproval=true and POST here). Stamping lets
       // dismissPermissionsByAgent() clean up the right ones when the user
       // disables an agent mid-flight.
-      const permAgentId = typeof data.agent_id === "string" && data.agent_id ? data.agent_id : "claude-code";
+      const permAgentId = agentId;
       const rawSuggestions = Array.isArray(data.permission_suggestions) ? data.permission_suggestions : [];
       const suggestions = normalizePermissionSuggestions(rawSuggestions);
 

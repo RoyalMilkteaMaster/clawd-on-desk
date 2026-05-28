@@ -10,6 +10,7 @@ const {
   findPendingPermissionForStateEvent,
 } = require("./server-permission-utils");
 const { resolveCodexOfficialHookState } = require("./server-codex-official-turns");
+const { resolveHookAgentId } = require("./server-agent-id");
 
 // /state POST body size cap. Raised from 1024 to 4096 to give new fields
 // (session_title) headroom on top of cwd / pid_chain / host / etc. Still a
@@ -74,7 +75,8 @@ function handleStatePost(req, res, options) {
       const pidChain = Array.isArray(data.pid_chain) ? data.pid_chain.filter(n => Number.isFinite(n) && n > 0) : null;
       const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
       const agentPid = Number.isFinite(rawAgentPid) && rawAgentPid > 0 ? Math.floor(rawAgentPid) : null;
-      const agentId = typeof data.agent_id === "string" ? data.agent_id : "claude-code";
+      const agentIdentity = resolveHookAgentId(data);
+      const agentId = agentIdentity.agentId;
       const host = typeof data.host === "string" ? data.host : null;
       const headless = data.headless === true;
       const platform = typeof data.platform === "string" && data.platform.trim()
@@ -185,6 +187,7 @@ function handleStatePost(req, res, options) {
             permissionSuspect,
             preserveState,
             hookSource,
+            ...(agentIdentity.defaulted ? { agentIdDefaulted: true } : {}),
           });
         }
         res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
