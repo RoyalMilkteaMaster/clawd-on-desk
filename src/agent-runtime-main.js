@@ -31,6 +31,7 @@ function createAgentRuntimeMain(options = {}) {
   const getPermissionRuntime = options.getPermissionRuntime || (() => null);
   const isAgentEnabled = options.isAgentEnabled || (() => true);
   const updateSession = options.updateSession || (() => {});
+  const captureGhosttyTerminalId = options.captureGhosttyTerminalId || null;
   const showCodexNotifyBubble = options.showCodexNotifyBubble || (() => {});
   const clearCodexNotifyBubbles = options.clearCodexNotifyBubbles || (() => {});
 
@@ -62,7 +63,24 @@ function createAgentRuntimeMain(options = {}) {
     if (opts && opts.agentId === "codex" && opts.hookSource === "codex-official") {
       markCodexOfficialHookSession(sessionId);
     }
-    return updateSession(sessionId, state, event, opts);
+    const result = updateSession(sessionId, state, event, opts);
+    maybeCaptureGhosttyTerminalId(sessionId, event, opts);
+    return result;
+  }
+
+  function maybeCaptureGhosttyTerminalId(sessionId, event, opts = {}) {
+    if (typeof captureGhosttyTerminalId !== "function") return false;
+    if (!sessionId || opts.host || opts.ghosttyTerminalId || !opts.sourcePid || !opts.cwd) return false;
+    if (event !== "SessionStart" && event !== "UserPromptSubmit") return false;
+    return captureGhosttyTerminalId({ sourcePid: opts.sourcePid, cwd: opts.cwd }, (terminalId) => {
+      if (!terminalId) return;
+      const state = getStateRuntime();
+      if (!state || typeof state.updateSessionFocusMetadata !== "function") return;
+      state.updateSessionFocusMetadata(String(sessionId), {
+        sourcePid: opts.sourcePid,
+        ghosttyTerminalId: terminalId,
+      });
+    });
   }
 
   function startMonitorForAgent(agentId) {

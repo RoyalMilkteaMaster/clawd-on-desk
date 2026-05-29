@@ -85,6 +85,46 @@ describe("agent-runtime-main", () => {
     );
   });
 
+  it("captures Ghostty terminal id for foreground session-start events", () => {
+    const updates = [];
+    const focusUpdates = [];
+    const captures = [];
+    const runtime = createAgentRuntimeMain({
+      updateSession: (...args) => updates.push(args),
+      getStateRuntime: () => ({
+        updateSessionFocusMetadata: (...args) => focusUpdates.push(args),
+      }),
+      captureGhosttyTerminalId: (request, callback) => {
+        captures.push(request);
+        callback("ghostty-term-42");
+        return true;
+      },
+      codexSubagentClassifier: {},
+    });
+
+    runtime.updateSessionFromServer("sid", "thinking", "UserPromptSubmit", {
+      agentId: "claude-code",
+      sourcePid: 1234,
+      cwd: "/repo",
+    });
+    runtime.updateSessionFromServer("remote", "thinking", "UserPromptSubmit", {
+      agentId: "claude-code",
+      sourcePid: 1235,
+      host: "remote-box",
+    });
+    runtime.updateSessionFromServer("tool", "working", "PreToolUse", {
+      agentId: "claude-code",
+      sourcePid: 1236,
+    });
+
+    assert.deepStrictEqual(updates.map((call) => call[0]), ["sid", "remote", "tool"]);
+    assert.deepStrictEqual(captures, [{ sourcePid: 1234, cwd: "/repo" }]);
+    assert.deepStrictEqual(focusUpdates, [["sid", {
+      sourcePid: 1234,
+      ghosttyTerminalId: "ghostty-term-42",
+    }]]);
+  });
+
   it("maps Codex JSONL monitor permission and state callbacks through the main runtime effects", () => {
     const instances = [];
     const calls = [];

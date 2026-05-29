@@ -87,6 +87,7 @@ function update(api, o = {}) {
       provider: o.provider ?? null,
       codexOriginator: o.codexOriginator ?? null,
       codexSource: o.codexSource ?? null,
+      ghosttyTerminalId: o.ghosttyTerminalId ?? null,
     },
   );
 }
@@ -111,6 +112,7 @@ function rawSession(state, opts = {}) {
     provider: opts.provider || null,
     codexOriginator: opts.codexOriginator || null,
     codexSource: opts.codexSource || null,
+    ghosttyTerminalId: opts.ghosttyTerminalId || null,
     sessionTitle: opts.sessionTitle ?? null,
     recentEvents: opts.recentEvents || [],
     pidReachable: opts.pidReachable ?? false,
@@ -995,6 +997,35 @@ describe("updateSession()", () => {
     assert.strictEqual(session.wtHwnd, "123456");
     const entry = api.getLastSessionSnapshot().sessions.find((item) => item.id === "s1");
     assert.strictEqual(entry.wtHwnd, "123456");
+  });
+
+  it("keeps Ghostty terminal id sticky and allows focus-only metadata updates", () => {
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "UserPromptSubmit",
+      sourcePid: 100,
+      ghosttyTerminalId: "term-a",
+    });
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PreToolUse",
+      sourcePid: 100,
+    });
+
+    assert.strictEqual(api.sessions.get("s1").ghosttyTerminalId, "term-a");
+    assert.strictEqual(api.updateSessionFocusMetadata("s1", { ghosttyTerminalId: "term-b" }), true);
+    assert.strictEqual(api.sessions.get("s1").ghosttyTerminalId, "term-b");
+    assert.strictEqual(api.updateSessionFocusMetadata("s1", {
+      sourcePid: 999,
+      ghosttyTerminalId: "term-wrong-source",
+    }), false);
+    assert.strictEqual(api.sessions.get("s1").ghosttyTerminalId, "term-b");
+    assert.strictEqual(api.updateSessionFocusMetadata("missing", { ghosttyTerminalId: "term-c" }), false);
+    assert.strictEqual(api.updateSessionFocusMetadata("s1", { ghosttyTerminalId: "error:-2753" }), false);
+    assert.strictEqual(api.updateSessionFocusMetadata("s1", { ghosttyTerminalId: "missing-frontmost" }), false);
+    assert.strictEqual(api.sessions.get("s1").ghosttyTerminalId, "term-b");
   });
 
   it("Codex PermissionRequest focus metadata respects the session cap", () => {

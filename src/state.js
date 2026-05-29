@@ -40,6 +40,19 @@ module.exports = function initState(ctx) {
 const _getCursor = ctx.getCursorScreenPoint || (screen ? () => screen.getCursorScreenPoint() : null);
 const _kill = ctx.processKill || process.kill.bind(process);
 
+function normalizeGhosttyTerminalId(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).replace(/[\r\n\t]+/g, " ").trim();
+  if (!text || text.length > 160) return null;
+  if (/^(error|unsupported|missing|miss)([-:]|$)/i.test(text)) return null;
+  return text;
+}
+
+function normalizePositiveInteger(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
 // ── Theme-driven state (refreshed on hot theme switch) ──
 let theme = null;
 let SVG_IDLE_FOLLOW = null;
@@ -868,6 +881,19 @@ function resolveIncomingAgentId(existing, incomingAgentId, incomingDefaulted) {
   return incomingAgentId || remembered || null;
 }
 
+function updateSessionFocusMetadata(sessionId, opts = {}) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  const expectedSourcePid = normalizePositiveInteger(opts.sourcePid);
+  if (expectedSourcePid && normalizePositiveInteger(session.sourcePid) !== expectedSourcePid) return false;
+  const ghosttyTerminalId = normalizeGhosttyTerminalId(opts.ghosttyTerminalId);
+  if (!ghosttyTerminalId) return false;
+  session.ghosttyTerminalId = ghosttyTerminalId;
+  return true;
+}
+
 // ── Session management ──
 // Session-related fields go through `opts`. Earlier versions took 13
 // positional params — refactored in B2 to an options bag so new fields
@@ -889,6 +915,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     provider = null,
     codexOriginator = null,
     codexSource = null,
+    ghosttyTerminalId = null,
     displayHint = undefined,
     sessionTitle = null,
     assistantLastOutput = null,
@@ -922,7 +949,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     ) return;
     const shouldPersistCodexPermissionFocus = permAgentId === "codex" && (
       sourcePid || wtHwnd || agentPid || (pidChain && pidChain.length) || cwd || host ||
-      model || provider || codexOriginator || codexSource || platform
+      model || provider || codexOriginator || codexSource || platform || ghosttyTerminalId
     );
     if (shouldPersistCodexPermissionFocus) {
       const existing = sessions.get(sessionId);
@@ -941,6 +968,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       const srcProvider = provider || (existing && existing.provider) || null;
       const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
       const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
+      const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
       const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
       // PermissionRequest should flash the pet via setState("notification"),
       // but a brand-new Codex permission session must not persist as
@@ -967,6 +995,7 @@ function updateSession(sessionId, state, event, opts = {}) {
         provider: srcProvider,
         codexOriginator: srcCodexOriginator,
         codexSource: srcCodexSource,
+        ghosttyTerminalId: srcGhosttyTerminalId,
         sessionTitle: srcSessionTitle,
         recentEvents,
         pidReachable: resolvePidReachable(existing, srcAgentPid, srcPid),
@@ -994,6 +1023,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcProvider = provider || (existing && existing.provider) || null;
   const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
   const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
+  const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
   // Sticky: empty input does not clear an existing title. A session that has
   // ever been named keeps that name until the user explicitly renames it.
   const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
@@ -1053,7 +1083,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcLastStopAt = isStopBoundary
     ? Date.now()
     : (existing && Number.isFinite(existing.lastStopAt) ? existing.lastStopAt : null);
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, sessionTitle: srcSessionTitle, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, muteNotificationSound: state === "notification" && muteNotificationSound === true };
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, muteNotificationSound: state === "notification" && muteNotificationSound === true };
   if (preserveCompletionAck) base.requiresCompletionAck = true;
 
   // Evict oldest session if at capacity and this is a new session.
@@ -1691,6 +1721,7 @@ return {
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,
   getActiveSessionAliasKeys,
   dismissSession,
+  updateSessionFocusMetadata,
   clearPermissionNotification,
   ackSessionCompletion,
   clearSessionsByAgent,

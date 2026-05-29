@@ -491,6 +491,14 @@ function normalizePidChain(value) {
   return out.length ? out : null;
 }
 
+function normalizeGhosttyTerminalId(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).replace(/[\r\n\t]+/g, " ").trim();
+  if (!text || text.length > 160) return null;
+  if (/^(error|unsupported|missing|miss)([-:]|$)/i.test(text)) return null;
+  return text;
+}
+
 function normalizeFocusRequest(sourcePidOrRequest, cwd, editor, pidChain, meta = {}) {
   if (sourcePidOrRequest && typeof sourcePidOrRequest === "object" && !Array.isArray(sourcePidOrRequest)) {
     const request = sourcePidOrRequest;
@@ -503,6 +511,7 @@ function normalizeFocusRequest(sourcePidOrRequest, cwd, editor, pidChain, meta =
       sessionId: typeof request.sessionId === "string" ? request.sessionId : null,
       agentId: typeof request.agentId === "string" ? request.agentId : null,
       requestSource: typeof request.requestSource === "string" ? request.requestSource : null,
+      ghosttyTerminalId: normalizeGhosttyTerminalId(request.ghosttyTerminalId ?? request.ghostty_terminal_id),
     };
   }
 
@@ -515,6 +524,7 @@ function normalizeFocusRequest(sourcePidOrRequest, cwd, editor, pidChain, meta =
     sessionId: meta && typeof meta.sessionId === "string" ? meta.sessionId : null,
     agentId: meta && typeof meta.agentId === "string" ? meta.agentId : null,
     requestSource: meta && typeof meta.requestSource === "string" ? meta.requestSource : null,
+    ghosttyTerminalId: normalizeGhosttyTerminalId(meta && (meta.ghosttyTerminalId ?? meta.ghostty_terminal_id)),
   };
 }
 
@@ -533,6 +543,12 @@ function summarizeCwd(cwd) {
 
 function formatPidChain(pidChain) {
   return Array.isArray(pidChain) && pidChain.length ? `[${pidChain.join(">")}]` : "[]";
+}
+
+function summarizeOpaqueId(value) {
+  const text = normalizeGhosttyTerminalId(value);
+  if (!text) return "-";
+  return crypto.createHash("sha1").update(text).digest("hex").slice(0, 8);
 }
 
 function buildFocusCacheKey(request) {
@@ -579,6 +595,7 @@ function logFocusRequest(request) {
     `cwdHash=${safeLogValue(cwd.hash)}`,
     `chain=${formatPidChain(request.pidChain)}`,
     `wtHwnd=${request.wtHwnd ? "1" : "-"}`,
+    `ghosttyId=${summarizeOpaqueId(request.ghosttyTerminalId)}`,
   ].join(" "));
 }
 
@@ -701,6 +718,17 @@ function buildGhosttyPidCandidates(sourcePid, pidChain) {
   return sanitizeGhosttyPidCandidates(pidChain, sourcePid);
 }
 
+function buildGhosttyCwdCandidates(cwd) {
+  const candidates = [];
+  if (typeof cwd !== "string" || !cwd) return candidates;
+  candidates.push(cwd);
+  try {
+    const real = fs.realpathSync(cwd);
+    if (real && real !== cwd) candidates.push(real);
+  } catch {}
+  return candidates;
+}
+
 function buildGhosttyCwdFocusScript(cwdCandidates) {
   const literalList = buildAppleScriptStringList(cwdCandidates);
   return `
@@ -714,6 +742,54 @@ function buildGhosttyCwdFocusScript(cwdCandidates) {
           end if
         end repeat
         return "miss-cwd"
+      end tell`;
+}
+
+function buildGhosttyIdFocusScript(terminalId) {
+  const id = normalizeGhosttyTerminalId(terminalId);
+  if (!id) return null;
+  return `
+      tell application "Ghostty"
+        set targetId to "${escapeAppleScriptString(id)}"
+        repeat with terminalRef in terminals
+          try
+            if ((id of terminalRef) as text) is targetId then
+              focus terminalRef
+              return "ok-id"
+            end if
+          on error errMsg number errNum
+            return "unsupported-id:" & errNum
+          end try
+        end repeat
+        return "miss-id"
+      end tell`;
+}
+
+function buildGhosttyFocusedTerminalIdScript(cwdCandidates = []) {
+  const requireCwdMatch = Array.isArray(cwdCandidates) && cwdCandidates.length > 0;
+  const cwdCheck = requireCwdMatch
+    ? `
+          set targetCwds to {${buildAppleScriptStringList(cwdCandidates)}}
+          set terminalCwd to working directory of terminalRef
+          set cwdMatched to false
+          repeat with cwdLiteral in targetCwds
+            if terminalCwd is (contents of cwdLiteral) then
+              set cwdMatched to true
+              exit repeat
+            end if
+          end repeat
+          if cwdMatched is false then return "miss-cwd"`
+    : "";
+  return `
+      tell application "Ghostty"
+        try
+          if frontmost is false then return "missing-frontmost"
+          set terminalRef to focused terminal of selected tab of front window
+${cwdCheck}
+          return (id of terminalRef) as text
+        on error errMsg number errNum
+          return "error:" & errNum
+        end try
       end tell`;
 }
 
@@ -1015,7 +1091,7 @@ function executeMacFocusRequest(request) {
   scheduleITermTabFocus(request.sourcePid, request.pidChain);
   scheduleCmuxWorkspaceSwitch(request.pidChain);
   scheduleSupersetFocus(request.sourcePid, request.cwd);
-  scheduleGhosttyFocus(request.sourcePid, request.cwd, request.pidChain);
+  scheduleGhosttyFocus(request.sourcePid, request.cwd, request.pidChain, request.ghosttyTerminalId);
 }
 
 function scheduleSupersetFocus(sourcePid, cwd) {
@@ -1053,12 +1129,12 @@ function scheduleSupersetFocus(sourcePid, cwd) {
   });
 }
 
-function scheduleGhosttyFocus(sourcePid, cwd, pidChain) {
+function scheduleGhosttyFocus(sourcePid, cwd, pidChain, ghosttyTerminalId = null) {
   // Mirror scheduleITermTabFocus: detect Ghostty by the source process
-  // command name, then try a per-terminal tty/pid match before falling back
-  // to cwd. `focus` selects the surface and raises its window, so no separate
-  // System Events activate is needed.
-  if (!isMac || !sourcePid || !cwd) return;
+  // command name, then try a captured terminal id or per-terminal tty/pid
+  // match before falling back to cwd. `focus` selects the surface and raises
+  // its window, so no separate System Events activate is needed.
+  if (!isMac || !sourcePid || (!cwd && !ghosttyTerminalId)) return;
   execFile("ps", ["-o", "comm=", "-p", String(sourcePid)], { encoding: "utf8", timeout: 500 }, (err, stdout) => {
     if (err) {
       logGhosttyFocusResult("source-lookup-failed");
@@ -1070,19 +1146,8 @@ function scheduleGhosttyFocus(sourcePid, cwd, pidChain) {
       return;
     }
 
-    const cwdCandidates = [cwd];
-    try {
-      const real = fs.realpathSync(cwd);
-      if (real && real !== cwd) cwdCandidates.push(real);
-    } catch {}
+    const cwdCandidates = buildGhosttyCwdCandidates(cwd);
 
-    const runFallback = () => {
-      const script = buildGhosttyCwdFocusScript(cwdCandidates);
-      logGhosttyFocusResult("cwd-fallback");
-      runGhosttyScript(script, "cwd", null);
-    };
-
-    const pidCandidates = buildGhosttyPidCandidates(sourcePid, pidChain);
     const runGhosttyScript = (script, label, onMiss) => {
       if (!script) {
         logGhosttyFocusResult(label === "tty" ? "no-tty" : `no-${label}-script`);
@@ -1098,6 +1163,17 @@ function scheduleGhosttyFocus(sourcePid, cwd, pidChain) {
         });
       }, 400);
     };
+    const runFallback = () => {
+      if (!cwdCandidates.length) {
+        logGhosttyFocusResult("no-cwd-fallback");
+        return;
+      }
+      const script = buildGhosttyCwdFocusScript(cwdCandidates);
+      logGhosttyFocusResult("cwd-fallback");
+      runGhosttyScript(script, "cwd", null);
+    };
+
+    const pidCandidates = buildGhosttyPidCandidates(sourcePid, pidChain);
     const runPidOrFallback = () => {
       const pidScript = buildGhosttyPidFocusScript(pidCandidates);
       if (!pidScript) {
@@ -1111,20 +1187,59 @@ function scheduleGhosttyFocus(sourcePid, cwd, pidChain) {
       const ttyScript = buildGhosttyTtyFocusScript(ttyName);
       runGhosttyScript(ttyScript, "tty", runPidOrFallback);
     };
+    const runPrecisePath = () => {
+      if (!pidCandidates.length) {
+        logGhosttyFocusResult("no-pid-candidates");
+        runFallback();
+        return;
+      }
 
-    if (!pidCandidates.length) {
-      logGhosttyFocusResult("no-pid-candidates");
-      runFallback();
-      return;
-    }
+      const pidsArg = pidCandidates.join(",");
+      execFile("ps", ["-o", "pid=,tty=", "-p", pidsArg], { encoding: "utf8", timeout: 500 }, (psErr, psOut) => {
+        if (psErr || !psOut) logGhosttyFocusResult("tty-lookup-failed");
+        const ttyName = psErr || !psOut ? null : findFirstValidTty(psOut);
+        runPreciseOrFallback(ttyName);
+      });
+    };
+    const runIdOrPrecise = () => {
+      const idScript = buildGhosttyIdFocusScript(ghosttyTerminalId);
+      if (!idScript) {
+        runPrecisePath();
+        return;
+      }
+      runGhosttyScript(idScript, "id", runPrecisePath);
+    };
 
-    const pidsArg = pidCandidates.join(",");
-    execFile("ps", ["-o", "pid=,tty=", "-p", pidsArg], { encoding: "utf8", timeout: 500 }, (psErr, psOut) => {
-      if (psErr || !psOut) logGhosttyFocusResult("tty-lookup-failed");
-      const ttyName = psErr || !psOut ? null : findFirstValidTty(psOut);
-      runPreciseOrFallback(ttyName);
+    runIdOrPrecise();
+  });
+}
+
+function captureGhosttyTerminalId(sourcePidOrRequest, callback) {
+  const request = normalizeFocusRequest(sourcePidOrRequest);
+  const done = typeof callback === "function" ? callback : () => {};
+  if (!isMac || !request.sourcePid) return false;
+  execFile("ps", ["-o", "comm=", "-p", String(request.sourcePid)], { encoding: "utf8", timeout: 500 }, (err, stdout) => {
+    if (err) return done(null);
+    const name = path.basename(stdout.trim()).toLowerCase();
+    if (name !== "ghostty") return done(null);
+    const cwdCandidates = buildGhosttyCwdCandidates(request.cwd);
+    execFile("osascript", ["-e", buildGhosttyFocusedTerminalIdScript(cwdCandidates)], { timeout: MAC_FOCUS_TIMEOUT_MS }, (osaErr, osaOut) => {
+      if (osaErr) {
+        logFocusResult(`branch=ghostty-capture reason=osascript-failed:${safeLogValue(osaErr.code || osaErr.name || "error")}`);
+        done(null);
+        return;
+      }
+      const id = normalizeGhosttyTerminalId(osaOut);
+      if (!id) {
+        logFocusResult("branch=ghostty-capture reason=missing-id");
+        done(null);
+        return;
+      }
+      logFocusResult(`branch=ghostty-capture reason=ok-id idHash=${summarizeOpaqueId(id)}`);
+      done(id);
     });
   });
+  return true;
 }
 
 function requestMacFocus(request) {
@@ -1293,16 +1408,20 @@ return {
   initFocusHelper,
   killFocusHelper,
   focusTerminalWindow,
+  captureGhosttyTerminalId,
   clearMacFocusCooldownTimer,
   cleanup,
   __test: {
     makeFocusCmd,
     buildWindowsTitleCandidates,
     normalizeFocusRequest,
+    normalizeGhosttyTerminalId,
     summarizeCwd,
     handleFocusHelperCompleteOutput,
     PS_FOCUS_ADDTYPE,
     findFirstValidTty,
+    buildGhosttyIdFocusScript,
+    buildGhosttyFocusedTerminalIdScript,
     buildGhosttyPidCandidates,
     buildGhosttyTtyCandidates,
     buildGhosttyTtyFocusScript,
