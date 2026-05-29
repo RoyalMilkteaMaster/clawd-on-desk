@@ -150,7 +150,8 @@ describe("Agent Registry", () => {
 
     const copilot = registry.getAgent("copilot-cli");
     assert.strictEqual(copilot.capabilities.httpHook, false);
-    assert.strictEqual(copilot.capabilities.permissionApproval, false);
+    assert.strictEqual(copilot.capabilities.permissionApproval, true);
+    assert.strictEqual(copilot.capabilities.interactiveBubble, true);
     assert.strictEqual(copilot.capabilities.sessionEnd, true);
     assert.strictEqual(copilot.capabilities.subagent, true);
 

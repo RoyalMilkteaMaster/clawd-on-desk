@@ -5,6 +5,7 @@ const DEFAULT_HOOK_AGENT_ID = "claude-code";
 const HOOK_SOURCE_AGENT_IDS = new Map([
   ["antigravity-hook", "antigravity-cli"],
   ["codex-official", "codex"],
+  ["copilot-hook", "copilot-cli"],
   ["opencode-plugin", "opencode"],
   ["openclaw-plugin", "openclaw"],
   ["pi-extension", "pi"],

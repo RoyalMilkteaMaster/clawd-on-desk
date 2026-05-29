@@ -186,6 +186,33 @@ function buildAntigravityPermissionResponseBody(decisionOrBehavior, message) {
   return decision ? JSON.stringify(decision) : "{}";
 }
 
+// Copilot CLI wire format: hook reads `{behavior, message?}` JSON from the
+// HTTP response body and re-emits it on stdout. Unlike Codex/Qwen there is
+// no hookSpecificOutput envelope — Phase 0 §5 locked the schema. Anything
+// other than allow/deny falls back to "{}" so the caller can emit 204 and
+// let copilot-hook.js write empty stdout (Phase 0 §3 native-flow signal).
+function sanitizeCopilotPermissionDecision(decisionOrBehavior, message) {
+  const source = typeof decisionOrBehavior === "string"
+    ? { behavior: decisionOrBehavior, message }
+    : (decisionOrBehavior && typeof decisionOrBehavior === "object" ? decisionOrBehavior : null);
+  if (!source) return null;
+
+  const behavior = source.behavior === "deny" ? "deny"
+    : (source.behavior === "allow" ? "allow" : null);
+  if (!behavior) return null;
+
+  const decision = { behavior };
+  if (behavior === "deny" && typeof source.message === "string" && source.message) {
+    decision.message = source.message;
+  }
+  return decision;
+}
+
+function buildCopilotPermissionResponseBody(decisionOrBehavior, message) {
+  const decision = sanitizeCopilotPermissionDecision(decisionOrBehavior, message);
+  return decision ? JSON.stringify(decision) : "{}";
+}
+
 function isPassiveNotifyEntry(permEntry) {
   return !!(permEntry && (permEntry.isCodexNotify || permEntry.isKimiNotify));
 }
@@ -608,7 +635,11 @@ function showPermissionBubble(permEntry) {
   bub.on("closed", () => {
     const idx = pendingPermissions.indexOf(permEntry);
     if (idx !== -1) {
-      const behavior = permEntry.isQwenCode ? "no-decision" : "deny";
+      // Qwen + Copilot are fail-open agents: a closed bubble means "no
+      // decision, let the native flow run" so the user isn't forced into a
+      // deny they didn't pick. CC/CodeBuddy still get an explicit deny so
+      // the hook unblocks instead of waiting for the long timeout.
+      const behavior = (permEntry.isQwenCode || permEntry.isCopilotCli) ? "no-decision" : "deny";
       resolvePermissionEntry(permEntry, behavior, "Bubble window closed by user");
     }
   });
@@ -751,7 +782,7 @@ function compactRemoteApprovalText(value, maxLen = 200) {
 
 function isRemoteApprovalActionable(permEntry) {
   if (!permEntry || typeof permEntry !== "object") return false;
-  if (permEntry.isElicitation || permEntry.isCodexNotify || permEntry.isKimiNotify || permEntry.isOpencode || permEntry.isAntigravity) return false;
+  if (permEntry.isElicitation || permEntry.isCodexNotify || permEntry.isKimiNotify || permEntry.isOpencode || permEntry.isAntigravity || permEntry.isCopilotCli) return false;
   if (permEntry.toolName === "ExitPlanMode" || permEntry.toolName === "AskUserQuestion") return false;
   if (PASSTHROUGH_TOOLS.has(permEntry.toolName)) return false;
   // Headless sessions auto-deny locally; mirror that on the Telegram side so a
@@ -998,6 +1029,18 @@ function maybeStartRemoteApproval(permEntry) {
     return;
   }
 
+  if (permEntry.isCopilotCli) {
+    if (behavior === "no-decision") {
+      sendCopilotNoDecisionResponse(res, message || "fallback");
+    } else {
+      sendCopilotPermissionResponse(res, {
+        behavior: behavior === "deny" ? "deny" : "allow",
+        message,
+      });
+    }
+    return;
+  }
+
   if (permEntry.isAntigravity) {
     if (behavior === "no-decision") {
       sendAntigravityNoDecisionResponse(res, message || "fallback");
@@ -1183,6 +1226,25 @@ function sendQwenCodePermissionResponse(res, decisionOrBehavior, message) {
   return true;
 }
 
+function sendCopilotNoDecisionResponse(res, reason = "") {
+  return sendNoDecisionResponse(res, reason, "copilot-cli");
+}
+
+function sendCopilotPermissionResponse(res, decisionOrBehavior, message) {
+  if (!res || res.writableEnded || res.destroyed || res.headersSent) return false;
+  const responseBody = buildCopilotPermissionResponseBody(decisionOrBehavior, message);
+  if (responseBody === "{}") {
+    return sendCopilotNoDecisionResponse(res, "invalid decision");
+  }
+  permLog(`copilot-cli response: ${responseBody}`);
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID,
+  });
+  res.end(responseBody);
+  return true;
+}
+
 function sendAntigravityNoDecisionResponse(res, reason = "") {
   return sendNoDecisionResponse(res, reason, "antigravity");
 }
@@ -1242,6 +1304,22 @@ function handleDecide(event, behavior) {
       return;
     }
     resolvePermissionEntry(perm, "no-decision", `Unsupported Qwen bubble action: ${String(behavior)}`);
+    if (behavior === "deny-and-focus") {
+      ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
+    }
+    return;
+  }
+  if (perm.isCopilotCli) {
+    if (behavior === "allow" || behavior === "deny") {
+      resolvePermissionEntry(perm, behavior);
+      return;
+    }
+    // Mirror Codex/Qwen: any non-allow/deny UI action (deny-and-focus,
+    // suggestion picker, opencode-always) is unsupported for Copilot's
+    // simple {behavior, message} wire format. Resolve as no-decision so
+    // the hook returns empty stdout and Copilot's native menu owns the
+    // call rather than the bubble parking until timeout.
+    resolvePermissionEntry(perm, "no-decision", `Unsupported Copilot bubble action: ${String(behavior)}`);
     if (behavior === "deny-and-focus") {
       ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
     }
@@ -1444,6 +1522,8 @@ function dismissInteractivePermissionWithoutDecision(perm, reason) {
     sendCodexNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isQwenCode) {
     sendQwenCodeNoDecisionResponse(perm.res, reason || "permission-dismissed");
+  } else if (perm.isCopilotCli) {
+    sendCopilotNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (perm.isAntigravity) {
     sendAntigravityNoDecisionResponse(perm.res, reason || "permission-dismissed");
   } else if (!perm.isOpencode && perm.res && !perm.res.destroyed) {
@@ -1530,13 +1610,13 @@ function cleanup() {
   if (typeof unsubscribeShortcuts === "function") {
     try { unsubscribeShortcuts(); } catch {}
   }
-  // Clean up all pending permission requests. Codex/Qwen/Antigravity get
-  // no-decision so their native flow can continue; Claude/CodeBuddy get
+  // Clean up all pending permission requests. Codex/Qwen/Copilot/Antigravity
+  // get no-decision so their native flow can continue; Claude/CodeBuddy get
   // explicit deny so they don't hang while quitting.
   for (const perm of [...pendingPermissions]) {
     if (perm._delayTimer) clearTimeout(perm._delayTimer);
     if (perm.autoExpireTimer) clearTimeout(perm.autoExpireTimer);
-    if (perm.isCodex || perm.isQwenCode || perm.isAntigravity) resolvePermissionEntry(perm, "no-decision", "Clawd is quitting");
+    if (perm.isCodex || perm.isQwenCode || perm.isCopilotCli || perm.isAntigravity) resolvePermissionEntry(perm, "no-decision", "Clawd is quitting");
     else resolvePermissionEntry(perm, "deny", "Clawd is quitting");
   }
 }
