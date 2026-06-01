@@ -108,8 +108,7 @@ describe("Mobile Preview Server", () => {
       sessions,
       getPendingPermissions: () => pendingPermissions,
     });
-    server.start();
-    port = await waitForPort(() => server.getPort());
+    port = await server.start();
     token = server.getToken();
   });
 

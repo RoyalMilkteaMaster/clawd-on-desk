@@ -447,13 +447,26 @@ function registerSettingsIpc(options = {}) {
       const os = require("os");
       let lanIp = "127.0.0.1";
       const interfaces = os.networkInterfaces();
+      const wlanPattern = /WLAN|Wi-?Fi|Wireless|无线/i;
+      // 1) 优先找 WLAN 接口
       for (const name of Object.keys(interfaces)) {
-        for (const iface of interfaces[name]) {
-          if (iface.family === "IPv4" && !iface.internal) { lanIp = iface.address; break; }
+        if (wlanPattern.test(name)) {
+          for (const iface of interfaces[name]) {
+            if (iface.family === "IPv4" && !iface.internal) { lanIp = iface.address; break; }
+          }
+          if (lanIp !== "127.0.0.1") break;
         }
-        if (lanIp !== "127.0.0.1") break;
       }
-      const pairUrl = `clawd://${lanIp}:${port}/${tok}`;
+      // 2) fallback：第一个非 internal IPv4
+      if (lanIp === "127.0.0.1") {
+        for (const name of Object.keys(interfaces)) {
+          for (const iface of interfaces[name]) {
+            if (iface.family === "IPv4" && !iface.internal) { lanIp = iface.address; break; }
+          }
+          if (lanIp !== "127.0.0.1") break;
+        }
+      }
+      const pairUrl = `http://${lanIp}:${port}/mobile/?host=${lanIp}&port=${port}&token=${tok}`;
       return { status: "ok", port, token: tok, lanIp, pairUrl };
     } catch (err) {
       return { status: "error", message: (err && err.message) || String(err) };

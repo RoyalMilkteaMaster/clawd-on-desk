@@ -72,6 +72,16 @@ function initMobilePreviewServer(ctx) {
 
   function getLocalIP() {
     const interfaces = os.networkInterfaces();
+    const wlanPattern = /WLAN|Wi-?Fi|Wireless|无线/i;
+    // 1) 优先找 WLAN 接口
+    for (const name of Object.keys(interfaces)) {
+      if (wlanPattern.test(name)) {
+        for (const iface of interfaces[name]) {
+          if (iface.family === "IPv4" && !iface.internal) return iface.address;
+        }
+      }
+    }
+    // 2) fallback：第一个非 internal IPv4
     for (const name of Object.keys(interfaces)) {
       for (const iface of interfaces[name]) {
         if (iface.family === "IPv4" && !iface.internal) return iface.address;
@@ -309,22 +319,32 @@ function initMobilePreviewServer(ctx) {
     for (let i = 0; i < PORT_RANGE; i++) ports.push(DEFAULT_PORT + i);
     let idx = 0;
 
-    httpServer.on("error", (err) => {
-      if (err.code === "EADDRINUSE" && idx < ports.length - 1) {
-        idx++;
-        httpServer.listen(ports[idx], "0.0.0.0");
-        return;
-      }
-      console.error("[lan-ws] Server error:", err.message);
-    });
-
-    httpServer.on("listening", () => {
-      activePort = ports[idx];
-      console.log(`[mobile-preview] started on 0.0.0.0:${activePort}`);
+    const ready = new Promise((resolve, reject) => {
+      const onError = (err) => {
+        if (err.code === "EADDRINUSE" && idx < ports.length - 1) {
+          idx++;
+          httpServer.listen(ports[idx], "0.0.0.0");
+          return;
+        }
+        console.error("[lan-ws] Server error:", err.message);
+        httpServer.removeListener("error", onError);
+        httpServer.removeListener("listening", onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        activePort = ports[idx];
+        console.log(`[mobile-preview] started on 0.0.0.0:${activePort}`);
+        httpServer.removeListener("error", onError);
+        httpServer.removeListener("listening", onListening);
+        resolve(activePort);
+      };
+      httpServer.on("error", onError);
+      httpServer.on("listening", onListening);
     });
 
     httpServer.listen(ports[0], "0.0.0.0");
     pollTimer = setInterval(pollSessions, SESSION_POLL_MS);
+    return ready;
   }
 
   function cleanup() {

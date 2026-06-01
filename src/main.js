@@ -2489,8 +2489,8 @@ _settingsController.subscribeKey("tgApproval", () => {
   if (suppressTelegramApprovalSidecarSync > 0) return;
   queueTelegramApprovalSidecarSync("settings");
 });
-_settingsController.subscribeKey("mobilePreviewEnabled", (enabled) => {
-  if (enabled) { _lanWss.start(); } else { _lanWss.cleanup(); }
+_settingsController.subscribeKey("mobilePreviewEnabled", async (enabled) => {
+  if (enabled) { await _lanWss.start(); } else { _lanWss.cleanup(); }
 });
 
 animationOverridesMain = createSettingsAnimationOverridesMain({
@@ -2674,6 +2674,7 @@ registerSettingsIpc({
     : { status: "error", code: "quick_commands_unavailable", message: "Quick Commands are unavailable" },
   checkForUpdates,
   aboutHeroSvgPath: path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg"),
+  getLanWsServer: () => _lanWss,
 });
 
 registerSessionIpc({

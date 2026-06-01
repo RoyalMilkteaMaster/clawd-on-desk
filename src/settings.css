@@ -3570,19 +3570,3 @@ html, body {
   transition: background 0.15s;
 }
 .mobile-copy-btn:hover { background: var(--accent); color: #fff; }
-.mobile-conn-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 16px;
-}
-.mobile-open-link {
-  display: inline-block;
-  padding: 8px 20px;
-  background: var(--accent);
-  color: #fff;
-  border-radius: 6px;
-  font-size: 13px;
-  text-decoration: none;
-  transition: background 0.15s;
-}
-.mobile-open-link:hover { background: var(--accent-hover); }

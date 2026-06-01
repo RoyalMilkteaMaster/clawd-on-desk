@@ -56,11 +56,6 @@
         html += `<button class="mobile-copy-btn" data-copy="${escapeHtml(info.pairUrl)}">Copy</button></div>`;
       }
 
-      // Open PWA link
-      html += `<div class="mobile-conn-actions">`;
-      html += `<a class="mobile-open-link" href="http://${escapeHtml(info.lanIp)}:${info.port}/mobile/" target="_blank">Open PWA</a>`;
-      html += '</div>';
-
       html += '</div>';
 
       container.innerHTML = html;
