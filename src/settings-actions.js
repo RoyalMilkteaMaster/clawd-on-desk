@@ -101,6 +101,47 @@ const {
   repairLocalServer,
   uninstallHooks,
 } = require("./settings-actions-system");
+const {
+  validateProfile: validateRemoteSshProfile,
+  sanitizeProfile: sanitizeRemoteSshProfile,
+  isValidDetectedRemoteNodeBin,
+  isValidDetectedRemoteNodeVersion,
+  isValidDetectedRemoteNodeSource,
+  deployTargetFingerprint,
+  deployTargetDrift,
+} = require("./remote-ssh-profile");
+const {
+  validateTelegramApproval,
+  validateTelegramBotToken,
+} = require("./telegram-approval-settings");
+const { EVENTS: TELEGRAM_MIGRATION_EVENTS } = require("./telegram-migration-state");
+const {
+  validateHardwareBuddySettings,
+} = require("./hardware-buddy-settings");
+
+const TELEGRAM_MIGRATION_RENDERER_EVENTS = new Set([
+  TELEGRAM_MIGRATION_EVENTS.USER_TEST_NATIVE,
+  TELEGRAM_MIGRATION_EVENTS.USER_ENABLE_LEGACY,
+  TELEGRAM_MIGRATION_EVENTS.USER_ROLLBACK_TO_LEGACY,
+  TELEGRAM_MIGRATION_EVENTS.USER_DISABLE,
+]);
+
+const MANAGED_CLEANUP_AGENT_IDS = Object.freeze([
+  "claude-code",
+  "codex",
+  "copilot-cli",
+  "cursor-agent",
+  "gemini-cli",
+  "antigravity-cli",
+  "codebuddy",
+  "kiro-cli",
+  "kimi-cli",
+  "qwen-code",
+  "opencode",
+  "pi",
+  "openclaw",
+  "hermes",
+]);
 
 // ── updateRegistry ──
 // Maps prefs field name → validator. Controller looks up by key and runs.
@@ -140,18 +181,29 @@ const updateRegistry = {
   savedPixelHeight: requireNonNegativeFiniteNumber("savedPixelHeight"),
 
   // ── Pure data prefs (function-form: validator only) ──
-  lang: requireEnum("lang", ["en", "zh", "ko", "ja"]),
+  lang: requireEnum("lang", ["en", "zh", "zh-TW", "ko", "ja"]),
   soundMuted: requireBoolean("soundMuted"),
   soundVolume: requireNumberInRange("soundVolume", 0, 1),
+  flashTaskbarOnComplete: requireBoolean("flashTaskbarOnComplete"),
+  flashIntervalMs: requireNumberInRange("flashIntervalMs", 200, 2000),
+  flashDurationMs: requireNumberInRange("flashDurationMs", 0, 60000),
   lowPowerIdleMode: requireBoolean("lowPowerIdleMode"),
+  keepAwakeWhileWorking: requireBoolean("keepAwakeWhileWorking"),
   bubbleFollowPet: requireBoolean("bubbleFollowPet"),
   sessionHudEnabled: requireBoolean("sessionHudEnabled"),
+  sessionHudShowStateLabels: requireBoolean("sessionHudShowStateLabels"),
   sessionHudShowElapsed: requireBoolean("sessionHudShowElapsed"),
   sessionHudCleanupDetached: requireBoolean("sessionHudCleanupDetached"),
+  sessionHudPinned: requireBoolean("sessionHudPinned"),
   hideBubbles: requireBoolean("hideBubbles"),
   permissionBubblesEnabled: requireBoolean("permissionBubblesEnabled"),
   notificationBubbleAutoCloseSeconds: requireIntegerInRange(
     "notificationBubbleAutoCloseSeconds",
+    0,
+    MAX_AUTO_CLOSE_SECONDS
+  ),
+  permissionBubbleAutoCloseSeconds: requireIntegerInRange(
+    "permissionBubbleAutoCloseSeconds",
     0,
     MAX_AUTO_CLOSE_SECONDS
   ),
@@ -160,8 +212,44 @@ const updateRegistry = {
     0,
     MAX_AUTO_CLOSE_SECONDS
   ),
+  // Session stale-cleanup intervals. Cross-field invariant
+  // (sessionStaleMs > 0 -> workingStaleMs <= sessionStaleMs) is enforced
+  // here against the live snapshot AND atomically through the
+  // `sessionCleanup.setTriple` command below. Hand-edit fallback lives in
+  // prefs.normalizeStaleTriple.
+  sessionStaleMs(value, deps = {}) {
+    if (value === 0) return { status: "ok" };
+    const base = requireIntegerInRange("sessionStaleMs", 60_000, 86_400_000)(value);
+    if (base.status !== "ok") return base;
+    const snapshot = (deps && deps.snapshot) || {};
+    const currentWorking = Number(snapshot.workingStaleMs);
+    if (Number.isFinite(currentWorking) && currentWorking > value) {
+      return {
+        status: "error",
+        message:
+          `sessionStaleMs (${value}) must be >= workingStaleMs (${currentWorking}). ` +
+          "To lower both, use the Reset / paired control.",
+      };
+    }
+    return { status: "ok" };
+  },
+  workingStaleMs(value, deps = {}) {
+    const base = requireIntegerInRange("workingStaleMs", 30_000, 86_400_000)(value);
+    if (base.status !== "ok") return base;
+    const snapshot = (deps && deps.snapshot) || {};
+    const currentSession = Number(snapshot.sessionStaleMs);
+    if (Number.isFinite(currentSession) && currentSession > 0 && value > currentSession) {
+      return {
+        status: "error",
+        message: `workingStaleMs (${value}) must be <= sessionStaleMs (${currentSession}).`,
+      };
+    }
+    return { status: "ok" };
+  },
+  detachedIdleStaleMs: requireIntegerInRange("detachedIdleStaleMs", 5_000, 300_000),
   allowEdgePinning: requireBoolean("allowEdgePinning"),
   keepSizeAcrossDisplays: requireBoolean("keepSizeAcrossDisplays"),
+  mobilePreviewEnabled: requireBoolean("mobilePreviewEnabled"),
 
   // ── System-backed prefs (object-form: validate + effect pre-commit gate) ──
   autoStartWithClaude,
@@ -225,6 +313,24 @@ const updateRegistry = {
     },
   },
 
+  // ── #329 background update check (Phase 4) ──
+  autoUpdateCheck: requireBoolean("autoUpdateCheck"),
+  pendingUpdateVersion: requireString("pendingUpdateVersion", { allowEmpty: true }),
+  dismissedUpdateVersions(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { status: "error", message: "dismissedUpdateVersions must be a plain object" };
+    }
+    for (const key of Object.keys(value)) {
+      if (typeof key !== "string" || !key) {
+        return { status: "error", message: "dismissedUpdateVersions keys must be non-empty strings" };
+      }
+      if (value[key] !== true) {
+        return { status: "error", message: `dismissedUpdateVersions["${key}"] must be the literal true` };
+      }
+    }
+    return { status: "ok" };
+  },
+
   // ── Phase 2/3 placeholders — schema reserves these so applyUpdate accepts them ──
   agents: requirePlainObject("agents"),
   themeOverrides: requirePlainObject("themeOverrides"),
@@ -245,6 +351,60 @@ const updateRegistry = {
   // Letting this field have an effect would double-activate when the UI
   // updates `theme` and `themeVariant` separately.
   themeVariant: requirePlainObject("themeVariant"),
+
+  // Remote SSH profile store. Plain validator — actual CRUD goes through
+  // commandRegistry below to keep id-uniqueness, default-fill, and
+  // monotonic createdAt logic in one place. The validator only ensures the
+  // top-level shape is sane so direct hydrate paths can't write garbage.
+  remoteSsh(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { status: "error", message: "remoteSsh must be a plain object" };
+    }
+    if (!Array.isArray(value.profiles)) {
+      return { status: "error", message: "remoteSsh.profiles must be an array" };
+    }
+    for (let i = 0; i < value.profiles.length; i++) {
+      const r = validateRemoteSshProfile(value.profiles[i]);
+      if (r.status !== "ok") {
+        return { status: "error", message: `remoteSsh.profiles[${i}]: ${r.message}` };
+      }
+    }
+    return { status: "ok" };
+  },
+  tgApproval(value) {
+    return validateTelegramApproval(value);
+  },
+
+  // v0.9.0 spike: persisted migration state across restarts. Shape:
+  //   { transport?: "legacy"|"native"|"off", nativeVerifiedAt?: number|null,
+  //     legacyEnabled?: boolean|null,
+  //     migration?: { importedAt: number|null, importError: string|null } }
+  tgMigration(value) {
+    if (value == null || typeof value !== "object") {
+      return { status: "error", message: "tgMigration must be a plain object" };
+    }
+    const allowed = new Set(["transport", "nativeVerifiedAt", "legacyEnabled", "migration"]);
+    for (const k of Object.keys(value)) {
+      if (!allowed.has(k)) return { status: "error", message: `tgMigration.${k} not supported` };
+    }
+    if (value.transport != null && !["legacy", "native", "off"].includes(value.transport)) {
+      return { status: "error", message: "tgMigration.transport must be legacy|native|off" };
+    }
+    if (value.nativeVerifiedAt != null && (typeof value.nativeVerifiedAt !== "number" || !Number.isFinite(value.nativeVerifiedAt))) {
+      return { status: "error", message: "tgMigration.nativeVerifiedAt must be a finite number" };
+    }
+    if (value.legacyEnabled != null && typeof value.legacyEnabled !== "boolean") {
+      return { status: "error", message: "tgMigration.legacyEnabled must be boolean" };
+    }
+    if (value.migration != null && typeof value.migration !== "object") {
+      return { status: "error", message: "tgMigration.migration must be an object" };
+    }
+    return { status: "ok" };
+  },
+
+  hardwareBuddy(value) {
+    return validateHardwareBuddySettings(value);
+  },
 
   shortcuts: {
     validate(value) {
@@ -296,6 +456,70 @@ function setBubbleCategoryEnabled(payload, deps) {
   const result = buildCategoryEnabledCommit((deps && deps.snapshot) || {}, category, enabled);
   if (result.error) return { status: "error", message: result.error };
   return { status: "ok", commit: result.commit };
+}
+
+// Atomic three-key writer for the session-cleanup intervals. Lives as a
+// command (not as `applyBulk`) because applyBulk runs each single-key
+// validator against the PRE-bulk snapshot, which would reject a Reset that
+// lowers both knobs simultaneously. The controller's command path re-runs
+// validators against the merged snapshot, so the cross-field invariant is
+// checked against the values being written together rather than mixed
+// with the current state.
+function setSessionCleanupTriple(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "sessionCleanup.setTriple: payload must be an object" };
+  }
+  const snapshot = (deps && deps.snapshot) || {};
+
+  // Strict presence check: a present-but-wrong-type value is a programmer
+  // error and must surface, not silently fall back to the snapshot.
+  function pick(key) {
+    if (key in payload) {
+      const v = payload[key];
+      if (!Number.isInteger(v)) {
+        return { error: `${key} must be an integer (received ${typeof v})` };
+      }
+      return { value: v };
+    }
+    const fallback = Number(snapshot[key]);
+    if (!Number.isFinite(fallback)) {
+      return { error: `${key} missing from payload and not present in snapshot` };
+    }
+    return { value: fallback };
+  }
+
+  const s = pick("sessionStaleMs");
+  if (s.error) return { status: "error", message: s.error };
+  const w = pick("workingStaleMs");
+  if (w.error) return { status: "error", message: w.error };
+  const d = pick("detachedIdleStaleMs");
+  if (d.error) return { status: "error", message: d.error };
+
+  const sessionStaleMs = s.value;
+  const workingStaleMs = w.value;
+  const detachedIdleStaleMs = d.value;
+
+  if (!(sessionStaleMs === 0 || (sessionStaleMs >= 60_000 && sessionStaleMs <= 86_400_000))) {
+    return { status: "error", message: `sessionStaleMs out of range: ${sessionStaleMs}` };
+  }
+  if (!(workingStaleMs >= 30_000 && workingStaleMs <= 86_400_000)) {
+    return { status: "error", message: `workingStaleMs out of range: ${workingStaleMs}` };
+  }
+  if (!(detachedIdleStaleMs >= 5_000 && detachedIdleStaleMs <= 300_000)) {
+    return { status: "error", message: `detachedIdleStaleMs out of range: ${detachedIdleStaleMs}` };
+  }
+
+  if (sessionStaleMs > 0 && workingStaleMs > sessionStaleMs) {
+    return {
+      status: "error",
+      message: `workingStaleMs (${workingStaleMs}) must be <= sessionStaleMs (${sessionStaleMs}).`,
+    };
+  }
+
+  return {
+    status: "ok",
+    commit: { sessionStaleMs, workingStaleMs, detachedIdleStaleMs },
+  };
 }
 
 function sessionAliasMapEqual(a, b) {
@@ -495,6 +719,407 @@ function resizePet(payload, deps) {
   }
 }
 
+// ── Remote SSH profile commands ──
+//
+// Three commands route through the controller so the IPC layer never writes
+// prefs directly. Each returns `{ status, commit }` so the controller can
+// atomically validate + write the new `remoteSsh` field.
+//
+// id semantics: `add` requires the caller to supply an id (the renderer
+// generates a uuid). This keeps the renderer in charge of the id it'll later
+// reference for connect/disconnect, avoiding a roundtrip race.
+
+function _remoteSshSnapshot(deps) {
+  const snap = (deps && deps.snapshot) || {};
+  const cur = snap.remoteSsh && typeof snap.remoteSsh === "object" ? snap.remoteSsh : {};
+  const profiles = Array.isArray(cur.profiles) ? cur.profiles.slice() : [];
+  return { profiles };
+}
+
+function normalizeRemoteNodeDetection(input, detectedAtFallback = Date.now()) {
+  if (!input || typeof input !== "object") return null;
+  const nodeBin = input.nodeBin || input.detectedRemoteNodeBin;
+  if (!isValidDetectedRemoteNodeBin(nodeBin)) return null;
+
+  const out = {
+    detectedRemoteNodeBin: nodeBin,
+  };
+  const version = input.version || input.detectedRemoteNodeVersion;
+  if (isValidDetectedRemoteNodeVersion(version)) {
+    out.detectedRemoteNodeVersion = version;
+  }
+  const source = input.source || input.detectedRemoteNodeSource;
+  if (isValidDetectedRemoteNodeSource(source)) {
+    out.detectedRemoteNodeSource = source;
+  }
+  const detectedAt = Number.isFinite(input.detectedAt)
+    ? input.detectedAt
+    : (Number.isFinite(input.detectedRemoteNodeAt) ? input.detectedRemoteNodeAt : detectedAtFallback);
+  if (Number.isFinite(detectedAt) && detectedAt > 0) {
+    out.detectedRemoteNodeAt = detectedAt;
+  }
+  return out;
+}
+
+function copyRemoteNodeDetection(target, source) {
+  if (!target || !source || !isValidDetectedRemoteNodeBin(source.detectedRemoteNodeBin)) return;
+  target.detectedRemoteNodeBin = source.detectedRemoteNodeBin;
+  if (isValidDetectedRemoteNodeVersion(source.detectedRemoteNodeVersion)) {
+    target.detectedRemoteNodeVersion = source.detectedRemoteNodeVersion;
+  }
+  if (isValidDetectedRemoteNodeSource(source.detectedRemoteNodeSource)) {
+    target.detectedRemoteNodeSource = source.detectedRemoteNodeSource;
+  }
+  if (Number.isFinite(source.detectedRemoteNodeAt) && source.detectedRemoteNodeAt > 0) {
+    target.detectedRemoteNodeAt = source.detectedRemoteNodeAt;
+  }
+}
+
+function remoteSshAddProfile(payload, deps) {
+  const profile = sanitizeRemoteSshProfile(payload);
+  if (!profile) {
+    const detail = validateRemoteSshProfile(payload || {});
+    return {
+      status: "error",
+      message: detail.status === "error" ? detail.message : "remoteSsh.add: invalid profile",
+    };
+  }
+  const next = _remoteSshSnapshot(deps);
+  if (next.profiles.some((p) => p.id === profile.id)) {
+    return { status: "error", message: `remoteSsh.add: profile id "${profile.id}" already exists` };
+  }
+  next.profiles.push(profile);
+  return { status: "ok", commit: { remoteSsh: next } };
+}
+
+function remoteSshUpdateProfile(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "remoteSsh.update: payload must be an object" };
+  }
+  const profile = sanitizeRemoteSshProfile(payload);
+  if (!profile) {
+    const detail = validateRemoteSshProfile(payload || {});
+    return {
+      status: "error",
+      message: detail.status === "error" ? detail.message : "remoteSsh.update: invalid profile",
+    };
+  }
+  const next = _remoteSshSnapshot(deps);
+  const idx = next.profiles.findIndex((p) => p.id === profile.id);
+  if (idx === -1) {
+    return { status: "error", message: `remoteSsh.update: profile id "${profile.id}" not found` };
+  }
+  // Preserve original createdAt if caller didn't supply one new.
+  const prev = next.profiles[idx];
+  if (Number.isFinite(prev.createdAt) && !Number.isFinite(payload.createdAt)) {
+    profile.createdAt = prev.createdAt;
+  }
+  // Preserve lastDeployedAt across cosmetic edits (label, autoStartCodexMonitor,
+  // connectOnLaunch). Only clear it when deploy target fields drifted — those
+  // changes mean the previous deploy is no longer valid for the new target,
+  // so the UI should re-warn "never deployed" until user runs Deploy again.
+  // Use deployTargetFingerprint to normalize port-22-vs-undefined and empty
+  // optional strings before comparing — naive prev[f] === profile[f] would
+  // false-flag "port drift" when prev had port:22 and the UI saveBtn omitted
+  // the default 22 from the payload.
+  const drift = deployTargetDrift(deployTargetFingerprint(prev), deployTargetFingerprint(profile));
+  if (drift === null) {
+    if (Number.isFinite(prev.lastDeployedAt) && !Number.isFinite(payload.lastDeployedAt)) {
+      profile.lastDeployedAt = prev.lastDeployedAt;
+    }
+    if (profile.detectedRemoteNodeBin === undefined) {
+      copyRemoteNodeDetection(profile, prev);
+    }
+  }
+  next.profiles[idx] = profile;
+  return { status: "ok", commit: { remoteSsh: next } };
+}
+
+// Stamp deploy completion onto a profile WITHOUT touching any other field.
+// Use this from the deploy IPC handler instead of remoteSsh.update with a
+// pre-deploy profile snapshot — deploy can take 30+ seconds, during which
+// the user may have edited the profile. Re-writing the whole profile from
+// the snapshot would clobber those edits (lost-update race).
+//
+// expectedTarget is an optional fingerprint of {host, port, identityFile,
+// remoteForwardPort, hostPrefix} captured by the caller at deploy start.
+// If the current profile's target fields drifted away from that fingerprint,
+// the deploy ran against an old target — we no-op rather than falsely claim
+// the new (drifted) configuration is "deployed". Caller learns from the
+// noop+targetDrift response and can prompt the user to redeploy.
+function remoteSshMarkDeployed(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "remoteSsh.markDeployed: payload must be an object" };
+  }
+  const { id, deployedAt, expectedTarget } = payload;
+  if (typeof id !== "string" || !id) {
+    return { status: "error", message: "remoteSsh.markDeployed.id must be a non-empty string" };
+  }
+  if (!Number.isFinite(deployedAt) || deployedAt <= 0) {
+    return { status: "error", message: "remoteSsh.markDeployed.deployedAt must be a positive finite number" };
+  }
+  const next = _remoteSshSnapshot(deps);
+  const idx = next.profiles.findIndex((p) => p.id === id);
+  if (idx === -1) {
+    // Profile was deleted mid-deploy — silently skip rather than error.
+    return { status: "ok", noop: true, reason: "profile_deleted" };
+  }
+  const current = next.profiles[idx];
+  if (expectedTarget && typeof expectedTarget === "object") {
+    // Normalize both sides through deployTargetFingerprint so port-22 vs
+    // undefined / empty-string vs missing don't false-flag drift. This also
+    // means the IPC caller's expectedTarget can be a raw profile-shaped
+    // object — fingerprint normalizes it the same way.
+    const drift = deployTargetDrift(
+      deployTargetFingerprint(current),
+      deployTargetFingerprint(expectedTarget)
+    );
+    if (drift) {
+      return {
+        status: "ok",
+        noop: true,
+        reason: "target_drift",
+        targetDrift: drift,
+        message: `remoteSsh.markDeployed: profile ${id}.${drift} changed during deploy; not stamping`,
+      };
+    }
+  }
+  // Only mutate deployment metadata — every other field stays as-is so
+  // concurrent user edits (label / autoStartCodexMonitor / connectOnLaunch)
+  // survive.
+  const updatedProfile = { ...current, lastDeployedAt: deployedAt };
+  const remoteNode = normalizeRemoteNodeDetection(payload.remoteNode || payload, deployedAt);
+  if (remoteNode) copyRemoteNodeDetection(updatedProfile, remoteNode);
+  const newProfiles = next.profiles.slice();
+  newProfiles[idx] = updatedProfile;
+  return { status: "ok", commit: { remoteSsh: { profiles: newProfiles } } };
+}
+
+function remoteSshMarkRemoteNode(payload, deps) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "remoteSsh.markRemoteNode: payload must be an object" };
+  }
+  const { id, expectedTarget } = payload;
+  if (typeof id !== "string" || !id) {
+    return { status: "error", message: "remoteSsh.markRemoteNode.id must be a non-empty string" };
+  }
+  const remoteNode = normalizeRemoteNodeDetection(payload);
+  if (!remoteNode) {
+    return { status: "error", message: "remoteSsh.markRemoteNode.nodeBin must be an absolute POSIX path" };
+  }
+  const next = _remoteSshSnapshot(deps);
+  const idx = next.profiles.findIndex((p) => p.id === id);
+  if (idx === -1) {
+    return { status: "ok", noop: true, reason: "profile_deleted" };
+  }
+  const current = next.profiles[idx];
+  if (expectedTarget && typeof expectedTarget === "object") {
+    const drift = deployTargetDrift(
+      deployTargetFingerprint(current),
+      deployTargetFingerprint(expectedTarget)
+    );
+    if (drift) {
+      return {
+        status: "ok",
+        noop: true,
+        reason: "target_drift",
+        targetDrift: drift,
+        message: `remoteSsh.markRemoteNode: profile ${id}.${drift} changed during detection; not stamping`,
+      };
+    }
+  }
+  const updatedProfile = { ...current };
+  copyRemoteNodeDetection(updatedProfile, remoteNode);
+  const newProfiles = next.profiles.slice();
+  newProfiles[idx] = updatedProfile;
+  return { status: "ok", commit: { remoteSsh: { profiles: newProfiles } } };
+}
+
+function remoteSshDeleteProfile(payload, deps) {
+  const id = typeof payload === "string"
+    ? payload
+    : (payload && typeof payload === "object" ? payload.id : null);
+  if (typeof id !== "string" || !id) {
+    return { status: "error", message: "remoteSsh.delete: id must be a non-empty string" };
+  }
+  const next = _remoteSshSnapshot(deps);
+  const idx = next.profiles.findIndex((p) => p.id === id);
+  if (idx === -1) {
+    // No-op rather than error — UI may have raced with a re-render.
+    return { status: "ok", noop: true };
+  }
+  next.profiles.splice(idx, 1);
+  return { status: "ok", commit: { remoteSsh: next } };
+}
+
+async function telegramApprovalSetToken(payload, deps = {}) {
+  const token = typeof payload === "string"
+    ? payload
+    : (payload && typeof payload === "object" ? payload.token : "");
+  const valid = validateTelegramBotToken(token);
+  if (valid.status !== "ok") return valid;
+  if (!deps || typeof deps.writeTelegramApprovalToken !== "function") {
+    return { status: "error", message: "telegramApproval.setToken requires writeTelegramApprovalToken dep" };
+  }
+  const result = await deps.writeTelegramApprovalToken(valid.token);
+  if (!result || result.status !== "ok") {
+    return result || { status: "error", message: "Telegram bot token write failed" };
+  }
+  return { status: "ok", tokenStored: true };
+}
+
+async function telegramApprovalDeleteTokenFile(_payload, deps = {}) {
+  if (!deps || typeof deps.deleteTelegramApprovalTokenFile !== "function") {
+    return { status: "error", message: "telegramApproval.deleteTokenFile requires deleteTelegramApprovalTokenFile dep" };
+  }
+  const result = await deps.deleteTelegramApprovalTokenFile();
+  return result || { status: "error", message: "Telegram token file delete returned no result" };
+}
+
+function telegramApprovalStatus(_payload, deps = {}) {
+  if (!deps || typeof deps.getTelegramApprovalStatus !== "function") {
+    return { status: "error", message: "telegramApproval.status requires getTelegramApprovalStatus dep" };
+  }
+  const status = deps.getTelegramApprovalStatus();
+  return { status: "ok", state: status || { status: "stopped" } };
+}
+
+function telegramApprovalTokenInfo(_payload, deps = {}) {
+  if (!deps || typeof deps.getTelegramApprovalTokenInfo !== "function") {
+    return { status: "error", message: "telegramApproval.tokenInfo requires getTelegramApprovalTokenInfo dep" };
+  }
+  const info = deps.getTelegramApprovalTokenInfo() || { configured: false, masked: "" };
+  return {
+    status: "ok",
+    configured: info.configured === true,
+    masked: typeof info.masked === "string" ? info.masked : "",
+  };
+}
+
+// v0.9.0 migration: native-vs-sidecar transport controller.
+// All telegramMigration.* commands lock on the same `tgApproval` domain as the
+// legacy approval commands so they can't race against token writes.
+function telegramMigrationSnapshot(_payload, deps = {}) {
+  if (!deps || !deps.telegramMigration) {
+    return { status: "error", message: "telegramMigration.snapshot requires controller dep" };
+  }
+  return { status: "ok", snapshot: deps.telegramMigration.getSnapshot() };
+}
+
+async function telegramMigrationDispatch(payload, deps = {}) {
+  if (!deps || !deps.telegramMigration) {
+    return { status: "error", message: "telegramMigration.dispatch requires controller dep" };
+  }
+  if (!payload || typeof payload.type !== "string") {
+    return { status: "error", message: "telegramMigration.dispatch requires event.type" };
+  }
+  if (!TELEGRAM_MIGRATION_RENDERER_EVENTS.has(payload.type)) {
+    return {
+      status: "error",
+      errorCode: "EVENT_NOT_ALLOWED",
+      message: `telegramMigration.dispatch event ${payload.type} is not renderer-callable`,
+      snapshot: deps.telegramMigration.getSnapshot(),
+    };
+  }
+  const res = await deps.telegramMigration.dispatch(payload);
+  return res && res.ok
+    ? { status: "ok", state: res.state, snapshot: deps.telegramMigration.getSnapshot() }
+    : {
+        status: "error",
+        errorCode: res ? res.errorCode : "UNKNOWN",
+        message: res && res.message,
+        snapshot: deps.telegramMigration.getSnapshot(),
+      };
+}
+
+telegramMigrationDispatch.lockKey = "tgApproval";
+telegramApprovalDeleteTokenFile.lockKey = "tgApproval";
+
+async function telegramApprovalSendTest(_payload, deps = {}) {
+  if (!deps || typeof deps.sendTelegramApprovalTest !== "function") {
+    return { status: "error", message: "telegramApproval.test requires sendTelegramApprovalTest dep" };
+  }
+  const result = await deps.sendTelegramApprovalTest();
+  return result || { status: "error", message: "Telegram approval test returned no result" };
+}
+
+function cleanupMessage(result) {
+  const summary = result && result.summary;
+  if (!summary) return "Integration cleanup finished";
+  const failed = Number(summary.failed || 0);
+  const affected = Number(summary.agentsAffected || 0);
+  const removed = Number(summary.entriesRemoved || 0);
+  return failed > 0
+    ? `Integration cleanup finished with ${failed} failure(s); removed ${removed} item(s) from ${affected} integration(s).`
+    : `Integration cleanup finished; removed ${removed} item(s) from ${affected} integration(s).`;
+}
+
+async function cleanupIntegrationsCommand(_payload, deps = {}) {
+  if (!deps || typeof deps.cleanupIntegrations !== "function") {
+    return { status: "error", message: "cleanupIntegrations requires cleanupIntegrations dep" };
+  }
+
+  const snapshot = deps.snapshot || {};
+  let agents = { ...((snapshot && snapshot.agents) || {}) };
+  let agentsChanged = false;
+
+  for (const agentId of MANAGED_CLEANUP_AGENT_IDS) {
+    const flagDeps = {
+      ...deps,
+      snapshot: { ...snapshot, agents },
+    };
+    const result = setAgentFlag({ agentId, flag: "enabled", value: false }, flagDeps);
+    if (!result || result.status !== "ok") {
+      return result || { status: "error", message: `Failed to disable ${agentId}` };
+    }
+    if (result.commit && result.commit.agents) {
+      agents = result.commit.agents;
+      agentsChanged = true;
+    }
+  }
+
+  let cleanup;
+  try {
+    cleanup = await deps.cleanupIntegrations({ source: "about", backup: true });
+  } catch (err) {
+    cleanup = {
+      status: "error",
+      message: err && err.message ? err.message : String(err),
+      summary: { agentsChecked: 0, agentsAffected: 0, entriesRemoved: 0, skipped: 0, failed: 1 },
+    };
+  }
+
+  const response = {
+    status: "ok",
+    cleanup,
+    message: cleanup.status === "error" ? cleanup.message : cleanupMessage(cleanup),
+  };
+  if (agentsChanged) response.commit = { agents };
+  return response;
+}
+
+// Share a domain lock across all four remoteSsh.* commands so concurrent
+// invocations against the same prefs field serialize. Without this, the
+// controller assigns each command its own lock by name, and two commands
+// (e.g. remoteSsh.update and remoteSsh.markDeployed) can both read the same
+// snapshot, compute their own commit, and stomp each other's writes.
+//
+// Concrete races this guards:
+//   - update + markDeployed: stamp can clobber a label edit committed
+//     between the read and write of update.
+//   - delete + markDeployed: markDeployed can resurrect a profile after
+//     delete committed.
+//   - add + markDeployed: less likely (different ids) but kept for
+//     defense-in-depth.
+remoteSshAddProfile.lockKey = "remoteSsh";
+remoteSshUpdateProfile.lockKey = "remoteSsh";
+remoteSshDeleteProfile.lockKey = "remoteSsh";
+remoteSshMarkDeployed.lockKey = "remoteSsh";
+remoteSshMarkRemoteNode.lockKey = "remoteSsh";
+telegramApprovalSetToken.lockKey = "tgApproval";
+telegramApprovalSendTest.lockKey = "tgApproval";
+cleanupIntegrationsCommand.lockKey = "agentIntegrationCleanup";
+
 const repairDoctorIssue = createRepairDoctorIssue({
   repairAgentIntegration,
   setBubbleCategoryEnabled,
@@ -504,6 +1129,7 @@ const commandRegistry = {
   removeTheme,
   installHooks,
   uninstallHooks,
+  cleanupIntegrations: cleanupIntegrationsCommand,
   repairAgentIntegration,
   repairLocalServer,
   repairDoctorIssue,
@@ -515,6 +1141,7 @@ const commandRegistry = {
   setAgentPermissionMode,
   setAllBubblesHidden,
   setBubbleCategoryEnabled,
+  "sessionCleanup.setTriple": setSessionCleanupTriple,
   setSessionAlias,
   setAnimationOverride,
   setSoundOverride,
@@ -523,6 +1150,18 @@ const commandRegistry = {
   importAnimationOverrides,
   setWideHitboxOverride,
   setThemeSelection,
+  "remoteSsh.add": remoteSshAddProfile,
+  "remoteSsh.update": remoteSshUpdateProfile,
+  "remoteSsh.delete": remoteSshDeleteProfile,
+  "remoteSsh.markDeployed": remoteSshMarkDeployed,
+  "remoteSsh.markRemoteNode": remoteSshMarkRemoteNode,
+  "telegramApproval.setToken": telegramApprovalSetToken,
+  "telegramApproval.deleteTokenFile": telegramApprovalDeleteTokenFile,
+  "telegramApproval.status": telegramApprovalStatus,
+  "telegramApproval.tokenInfo": telegramApprovalTokenInfo,
+  "telegramApproval.test": telegramApprovalSendTest,
+  "telegramMigration.snapshot": telegramMigrationSnapshot,
+  "telegramMigration.dispatch": telegramMigrationDispatch,
 };
 
 module.exports = {
@@ -530,6 +1169,7 @@ module.exports = {
   commandRegistry,
   ONESHOT_OVERRIDE_STATES,
   ANIMATION_OVERRIDES_EXPORT_VERSION,
+  MANAGED_CLEANUP_AGENT_IDS,
   // Exposed for tests
   requireBoolean,
   requireFiniteNumber,

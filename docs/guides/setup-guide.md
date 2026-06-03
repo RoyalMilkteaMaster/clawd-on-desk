@@ -1,16 +1,18 @@
 # Setup Guide
 
-[Back to README](../README.md)
+[Back to README](../../README.md)
 
 ## Agent Setup
 
 **Claude Code** — works out of the box. Hooks are auto-registered on launch. Versioned hooks (`PreCompact`, `PostCompact`, `StopFailure`) are registered only when Clawd can positively detect a compatible Claude Code version; if detection fails (common for packaged macOS launches), Clawd falls back to core hooks and removes stale incompatible versioned hooks automatically.
 
-**Codex CLI** — works out of the box. Clawd auto-registers official Codex hooks in `~/.codex/hooks.json` when Codex is installed, and enables `[features].codex_hooks = true` unless the user explicitly set it to `false`. The official hook path gives live state updates plus real Allow/Deny permission bubbles. JSONL polling of `~/.codex/sessions/` remains as a fallback for hook-disabled sessions and events Codex hooks do not cover.
+**Codex CLI** — works out of the box. Clawd auto-registers official Codex hooks in `~/.codex/hooks.json` when Codex is installed, and enables `[features].hooks = true` unless the user explicitly set hooks to `false`. The installer migrates the deprecated `[features].codex_hooks` key to `hooks` while preserving an explicit false value. The official hook path gives live state updates plus real Allow/Deny permission bubbles. JSONL polling of `~/.codex/sessions/` remains as a fallback for hook-disabled sessions and events Codex hooks do not cover.
 
-**Copilot CLI** — the one supported agent that still requires manual hook setup. See [copilot-setup.md](copilot-setup.md) for instructions.
+**Copilot CLI** — works out of the box. Clawd auto-registers hooks in `<COPILOT_HOME or ~/.copilot>/hooks/hooks.json` on launch (marker-based merge — your other hook entries and `hooks/*.json` files are preserved). Remote SSH installs are automatic via the in-app **Settings → Remote SSH → One-click deploy**. If `hooks.json` or `settings.json` has `disableAllHooks: true`, doctor reports a warning and skips the Fix button. See [copilot-setup.md](copilot-setup.md) for manual fallback and `COPILOT_HOME` notes.
 
 **Gemini CLI** — hooks live in `~/.gemini/settings.json`. Clawd auto-registers them on launch when Gemini is installed, or you can run `npm run install:gemini-hooks` manually.
+
+**Antigravity CLI (agy)** — hooks live in `~/.gemini/config/hooks.json`. Clawd auto-registers them on launch when Antigravity config exists, or you can run `npm run install:antigravity-hooks` manually. Clawd is a **state-only** integration for agy: it reflects working / idle / attention state on the pet but **does not show permission bubbles**. Every Allow / Deny / Always-allow choice happens in agy's own 5-option terminal menu — choose the menu item labeled "Persist to settings.json" when you want a permanent rule. The Clawd-on-top approach was abandoned after dogfooding showed it yielded 8-10 confirmations per task; PreToolUse hook is intentionally not registered.
 
 **Cursor Agent** — hooks live in `~/.cursor/hooks.json`. Clawd auto-registers them on launch when Cursor is installed, or you can run `npm run install:cursor-hooks` manually.
 
@@ -20,38 +22,60 @@
 
 **Kimi Code CLI (Kimi-CLI)** — hooks live in `~/.kimi/config.toml` (`[[hooks]]` entries). Clawd auto-registers them on launch when Kimi is installed, or you can run `npm run install:kimi-hooks` manually. Kimi is hook-only in Clawd: state updates and permission notifications come from hook events, not log polling. To make a permission-classification choice persist across restarts, set `CLAWD_KIMI_PERMISSION_MODE=explicit` (default) or `CLAWD_KIMI_PERMISSION_MODE=suspect` before running the installer — the value gets written into the `command` field for every Kimi hook so subsequent Clawd auto-syncs preserve it. Heads up: the auto-sync also rewrites the `command` field in-place if it diverges from the expected line, so manual edits to that field will be silently restored on the next launch.
 
+**Qwen Code** — hooks live in `~/.qwen/settings.json`. Clawd auto-registers them on launch when Qwen is installed, or you can run `npm run install:qwen-hooks` manually. Qwen Code support is hook-only: state updates and blocking `PermissionRequest` approvals come from Qwen hook events. If `disableAllHooks: true` is present in Qwen settings, Clawd can register entries but Qwen will not fire them until the flag is removed.
+
 **opencode** — uses a plugin entry in `~/.config/opencode/opencode.json`. Clawd auto-registers it on launch when opencode is installed, or you can run `node hooks/opencode-install.js` manually.
 
-## Remote SSH (Claude Code & Codex CLI)
+**Pi** — uses a global extension directory at `~/.pi/agent/extensions/clawd-on-desk`. Clawd auto-registers it on launch when Pi is installed, or you can run `npm run install:pi-extension` manually. Interactive Pi sessions report lifecycle and tool activity to Clawd, but Pi is state-only: Clawd does not show permission bubbles, does not call Pi terminal confirmation, and preserves Pi's default YOLO execution behavior.
 
-<img src="../assets/screenshot-remote-ssh.png" width="560" alt="Remote SSH — permission bubble from Raspberry Pi">
+**OpenClaw** — uses a plugin path under `~/.openclaw/openclaw.json`. Clawd auto-registers it only when an OpenClaw config already exists, or you can run `npm run install:openclaw-plugin` manually to let OpenClaw's CLI handle first-time setup. Phase 1 is state-only and targets local `openclaw tui --local` sessions.
+
+**Hermes Agent** — install Hermes from [hermes-agent.org](https://hermes-agent.org/) or [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Clawd shows Hermes in Settings by default, but startup auto-sync is no-op until Hermes is installed. Once Hermes exists (`%LOCALAPPDATA%\hermes` on Windows or `~/.hermes` on macOS/Linux), Clawd copies its plugin into Hermes' managed plugin directory and enables it through `hermes plugins enable clawd-on-desk`. You can force a manual sync with `npm run install:hermes-plugin`, or remove Clawd's Hermes plugin with `npm run uninstall:hermes-plugin`.
+
+**Hardware Buddy** — optional local approval companion support for the [Clawstick hardware repo](https://github.com/rullerzhou-afk/clawstick). Clawd does not bundle the Clawstick runtime in v0.8.1; install or checkout Clawstick separately, place it next to this repo as `../clawstick`, or set `CLAWD_HARDWARE_BUDDY_ROOT` to its path. Hardware Buddy is disabled by default; enable it from Settings when the BLE/fake backend is available. By default it sends state-only session snapshots, and permission replies stay behind the separate Hardware Buddy permission toggle.
+
+## Telegram Approval
+
+Clawd can optionally mirror supported permission bubbles to a dedicated Telegram
+bot, so you can Allow or Deny from Telegram while the local desktop bubble
+remains available. See [telegram-approval.md](telegram-approval.md) for setup,
+token ownership, supported agents, and fallback behavior.
+
+## Remote SSH (Claude Code, Codex CLI & Copilot CLI)
+
+<img src="../../assets/screenshot-remote-ssh.png" width="560" alt="Remote SSH — permission bubble from Raspberry Pi">
 
 Clawd can sense AI agent activity on remote servers via SSH reverse port forwarding. Hook events and permission requests travel through the SSH tunnel back to your local Clawd — no code changes needed on the Clawd side.
 
-**One-click deploy:**
+**Primary flow: in-app Settings → Remote SSH → One-click deploy**
+
+DMG / installer users add a profile under **Settings → Remote SSH** (host
+`user@remote-host`, optional private key, forward port), then click
+**One-click deploy**. Clawd opens and maintains the `ssh -R` reverse tunnel
+and deploys hooks to the remote. Full walkthrough, Doctor boundary, and
+troubleshooting (port conflicts, no Node.js, missing remote sessions, etc.)
+in the dedicated guide:
+
+**→ [docs/guides/guide-remote-ssh.md](guide-remote-ssh.md)**
+
+**How it works:**
+- **Claude Code** — command hooks on the remote server POST state changes to `localhost:23333`, which the SSH tunnel forwards back to your local Clawd. Permission bubbles work too — the HTTP round-trip goes through the tunnel.
+- **Codex CLI** — official hooks on the remote server POST state changes and permission requests through the same tunnel. If Codex hooks are unavailable or disabled on the remote install, use the fallback log monitor: `node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
+- **Copilot CLI** — one-click deploy writes `~/.copilot/hooks/hooks.json` on the remote (when Copilot CLI is installed, i.e. `~/.copilot/` exists). Hooks POST state and session titles through the same tunnel.
+
+Remote hooks run in `CLAWD_REMOTE` mode which skips PID collection (remote PIDs are meaningless locally). Terminal focus is not available for remote sessions.
+
+**Source-checkout fallback:** the older shell script is only needed when
+running from a source checkout (`npm start` debugging):
 
 ```bash
 bash scripts/remote-deploy.sh user@remote-host
 ```
 
-This copies hook files to the remote server, registers Claude Code hooks and Codex official hooks in remote mode, and prints SSH configuration instructions.
-
-**SSH configuration** (add to your local `~/.ssh/config`):
-
-```
-Host my-server
-    HostName remote-host
-    User user
-    RemoteForward 127.0.0.1:23333 127.0.0.1:23333
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-```
-
-**How it works:**
-- **Claude Code** — command hooks on the remote server POST state changes to `localhost:23333`, which the SSH tunnel forwards back to your local Clawd. Permission bubbles work too — the HTTP round-trip goes through the tunnel.
-- **Codex CLI** — official hooks on the remote server POST state changes and permission requests through the same tunnel. If Codex hooks are unavailable or disabled on the remote install, use the fallback log monitor: `node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
-
-Remote hooks run in `CLAWD_REMOTE` mode which skips PID collection (remote PIDs are meaningless locally). Terminal focus is not available for remote sessions.
+It copies hooks from the current source tree and prints manual SSH config
+suggestions (add `RemoteForward 127.0.0.1:23333 127.0.0.1:23333` to
+`~/.ssh/config`). DMG / installer users don't need a source checkout — use
+the in-app one-click deploy instead.
 
 > Thanks to [@Magic-Bytes](https://github.com/Magic-Bytes) for the original SSH tunneling idea ([#9](https://github.com/rullerzhou-afk/clawd-on-desk/issues/9)).
 
@@ -68,16 +92,19 @@ If you run Claude Code inside WSL while Clawd runs on the Windows host, hooks ca
 mkdir -p ~/.claude/hooks
 
 # Copy hook files from the Windows-side repo (adjust the /mnt/ path to your Clawd location)
-cp /mnt/d/animation/hooks/{server-config,json-utils,shared-process,clawd-hook,install,codex-hook,codex-install,codex-install-utils,codex-remote-monitor,codex-session-index,codex-subagent-fields}.js ~/.claude/hooks/
+cp /mnt/d/animation/hooks/{server-config,json-utils,shared-process,clawd-hook,install,codex-hook,codex-install,codex-install-utils,codex-remote-monitor,codex-session-index,codex-subagent-fields,copilot-hook,copilot-install}.js ~/.claude/hooks/
 
 # Register Claude hooks in remote mode
 node ~/.claude/hooks/install.js --remote
 
 # Register Codex official hooks in remote mode when Codex CLI is installed in WSL
 node ~/.claude/hooks/codex-install.js --remote
+
+# Register Copilot CLI hooks in remote mode when Copilot CLI is installed in WSL
+node ~/.claude/hooks/copilot-install.js --remote
 ```
 
-If you have SSH enabled in WSL, the one-click deploy script also works:
+If you have SSH enabled in WSL, the source-checkout fallback script also works:
 
 ```bash
 # From Windows (Git Bash / PowerShell):
@@ -123,17 +150,29 @@ node hooks/kiro-install.js
 # Kimi Code CLI (Kimi-CLI)
 node hooks/kimi-install.js
 
+# Qwen Code
+node hooks/qwen-code-install.js
+
 # Cursor Agent
 node hooks/cursor-install.js
 
 # Gemini CLI
 node hooks/gemini-install.js
 
+# Antigravity CLI (agy)
+node hooks/antigravity-install.js
+
 # CodeBuddy
 node hooks/codebuddy-install.js
 
 # opencode
 node hooks/opencode-install.js
+
+# Pi
+node hooks/pi-install.js
+
+# OpenClaw
+node hooks/openclaw-install.js
 ```
 
 > **Tip:** If the repo is cloned inside WSL (e.g. `~/clawd-on-desk`), hook scripts will automatically use WSL's Node.js path. If the repo is on a Windows drive (e.g. `/mnt/c/...`), make sure `node` is in WSL's `PATH`.

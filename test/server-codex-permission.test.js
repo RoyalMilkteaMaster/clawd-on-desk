@@ -80,6 +80,7 @@ function startServer(overrides = {}) {
     syncCursorHooksImpl: () => {},
     syncCodeBuddyHooksImpl: () => {},
     syncKiroHooksImpl: () => {},
+    syncQwenHooksImpl: () => {},
     syncCodexHooksImpl: () => {},
     syncOpencodePluginImpl: () => {},
     pendingPermissions,
@@ -175,9 +176,16 @@ describe("Codex official /permission path", () => {
     const res = await callPermission(handler, {
       agent_id: "codex",
       hook_source: "codex-official",
-      session_id: "codex:s1",
+      session_id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
       tool_name: "Bash",
       tool_input: { command: "whoami /all" },
+      cwd: "/repo",
+      source_pid: 456,
+      agent_pid: 456,
+      pid_chain: [789, 456],
+      model: "gpt-5.4",
+      codex_originator: "Codex Desktop",
+      codex_source: "vscode",
     });
 
     assert.strictEqual(res.statusCode, 204);
@@ -185,11 +193,40 @@ describe("Codex official /permission path", () => {
     assert.strictEqual(pendingPermissions.length, 0);
     assert.strictEqual(shown.length, 0);
     assert.deepStrictEqual(updates[0], [
-      "codex:s1",
+      "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
       "notification",
       "PermissionRequest",
-      { agentId: "codex", hookSource: "codex-official" },
+      {
+        agentId: "codex",
+        hookSource: "codex-official",
+        sourcePid: 456,
+        agentPid: 456,
+        pidChain: [789, 456],
+        cwd: "/repo",
+        model: "gpt-5.4",
+        codexOriginator: "Codex Desktop",
+        codexSource: "vscode",
+        transientPermissionEvent: true,
+      },
     ]);
+  });
+
+  it("marks native PermissionRequest notification sound muted when the Codex switch is off", async () => {
+    const { handler, updates } = startServer({
+      isCodexPermissionInterceptEnabled: () => false,
+      isCodexNativeNotificationSoundEnabled: () => false,
+    });
+    const res = await callPermission(handler, {
+      agent_id: "codex",
+      hook_source: "codex-official",
+      session_id: "codex:silent",
+      tool_name: "Bash",
+      tool_input: { command: "whoami /all" },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(updates.length, 1);
+    assert.strictEqual(updates[0][3].muteNotificationSound, true);
   });
 
   it("enqueues a real Codex approval bubble in intercept mode without suggestions or elicitation", async () => {

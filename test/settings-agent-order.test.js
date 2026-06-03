@@ -15,6 +15,7 @@ describe("settings agent order", () => {
     assert.strictEqual(getAgentEventSourceBadgeKey({ eventSource: "hook+log-poll" }), "eventSourceHook");
     assert.strictEqual(getAgentEventSourceBadgeKey({ eventSource: "log-poll" }), "eventSourceLogPoll");
     assert.strictEqual(getAgentEventSourceBadgeKey({ eventSource: "plugin-event" }), "eventSourcePlugin");
+    assert.strictEqual(getAgentEventSourceBadgeKey({ eventSource: "extension" }), "eventSourceExtension");
   });
 
   it("treats agents with detail rows as collapsible", () => {
@@ -33,10 +34,15 @@ describe("settings agent order", () => {
       { id: "copilot-cli", name: "Copilot CLI", capabilities: {} },
       { id: "opencode", name: "OpenCode", capabilities: { permissionApproval: true } },
       { id: "gemini-cli", name: "Gemini CLI", capabilities: { notificationHook: true } },
+      { id: "antigravity-cli", name: "Antigravity CLI", capabilities: {} },
       { id: "claude-code", name: "Claude Code", capabilities: { permissionApproval: true, notificationHook: true } },
       { id: "cursor-agent", name: "Cursor Agent", capabilities: {} },
+      { id: "openclaw", name: "OpenClaw", capabilities: {} },
+      { id: "hermes", name: "Hermes Agent", capabilities: {} },
       { id: "codex", name: "Codex CLI", capabilities: { interactiveBubble: true } },
       { id: "kimi-cli", name: "Kimi CLI", capabilities: { permissionApproval: true, notificationHook: true } },
+      { id: "qwen-code", name: "Qwen Code", capabilities: { permissionApproval: true, notificationHook: true } },
+      { id: "pi", name: "Pi", capabilities: {} },
     ]);
 
     assert.deepStrictEqual(sorted.map((agent) => agent.id), [
@@ -44,11 +50,16 @@ describe("settings agent order", () => {
       "codex",
       "gemini-cli",
       "kimi-cli",
+      "qwen-code",
       "opencode",
       "codebuddy",
+      "antigravity-cli",
       "cursor-agent",
       "copilot-cli",
       "kiro-cli",
+      "pi",
+      "openclaw",
+      "hermes",
     ]);
   });
 

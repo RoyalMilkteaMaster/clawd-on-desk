@@ -141,6 +141,12 @@ function formatAgentDiagnosticNotes(detail) {
     const suffix = detail.supplementary.detail ? ` (${detail.supplementary.detail})` : "";
     notes.push(`${key}=${value}${suffix}`);
   }
+  if (detail.codexHookTrust && typeof detail.codexHookTrust === "object") {
+    const key = detail.codexHookTrust.key || "codex_hook_trust";
+    const value = detail.codexHookTrust.value || "unknown";
+    const suffix = detail.codexHookTrust.detail ? ` (${detail.codexHookTrust.detail})` : "";
+    notes.push(`${key}=${value}${suffix}`);
+  }
   pushIfValue(notes, "kiro", formatKiroScan(detail.kiroScan));
   pushIfValue(notes, "hook issue", detail.hookCommandIssue);
   pushIfValue(notes, "opencode issue", detail.opencodeEntryIssue);

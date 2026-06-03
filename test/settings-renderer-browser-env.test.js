@@ -19,6 +19,7 @@ const PRELOAD_SETTINGS = path.join(SRC_DIR, "preload-settings.js");
 const MAIN_PROCESS = path.join(SRC_DIR, "main.js");
 const SETTINGS_IPC = path.join(SRC_DIR, "settings-ipc.js");
 const DOCTOR_IPC = path.join(SRC_DIR, "doctor-ipc.js");
+const { SUPPORTED_LANGS } = require("../src/i18n");
 const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-general.js"),
   path.join(SRC_DIR, "settings-tab-agents.js"),
@@ -26,7 +27,9 @@ const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-anim-map.js"),
   path.join(SRC_DIR, "settings-tab-anim-overrides.js"),
   path.join(SRC_DIR, "settings-tab-shortcuts.js"),
+  path.join(SRC_DIR, "settings-tab-telegram-approval.js"),
   path.join(SRC_DIR, "settings-tab-about.js"),
+  path.join(SRC_DIR, "settings-hardware-buddy-panel.js"),
 ];
 
 function createDeferred() {
@@ -220,6 +223,29 @@ class FakeElement {
     this.eventListeners[type].push(cb);
   }
 
+  dispatchEvent(event) {
+    const ev = event || {};
+    if (!ev.type) throw new Error("FakeElement.dispatchEvent requires an event type");
+    if (!ev.target) ev.target = this;
+    ev.currentTarget = this;
+    if (typeof ev.preventDefault !== "function") {
+      ev.preventDefault = function preventDefault() {
+        this.defaultPrevented = true;
+      };
+    }
+    if (typeof ev.stopPropagation !== "function") {
+      ev.stopPropagation = function stopPropagation() {
+        this.cancelBubble = true;
+      };
+    }
+    const listeners = this.eventListeners[ev.type] || [];
+    for (const listener of [...listeners]) listener(ev);
+    if (ev.bubbles !== false && !ev.cancelBubble && this.parentNode) {
+      return this.parentNode.dispatchEvent(ev);
+    }
+    return !ev.defaultPrevented;
+  }
+
   set innerHTML(_value) {
     for (const child of this.children) child.parentNode = null;
     this.children = [];
@@ -314,24 +340,44 @@ class FakeElement {
 
 function loadGeneralLanguageRowForTest({
   snapshot,
+  update = () => Promise.resolve({ status: "ok" }),
 } = {}) {
   const raf = createQueuedRaf();
   const body = new FakeElement("body");
   const content = new FakeElement("main");
   content.id = "content";
   body.appendChild(content);
+  const toastStack = new FakeElement("div");
+  toastStack.id = "toastStack";
+  body.appendChild(toastStack);
 
+  const documentListeners = new Map();
   const document = {
     body,
     createElement: (tagName) => new FakeElement(tagName),
     getElementById(id) {
       if (id === "content") return content;
+      if (id === "toastStack") return toastStack;
       return null;
+    },
+    addEventListener(type, cb) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(cb);
+    },
+    removeEventListener(type, cb) {
+      const listeners = documentListeners.get(type);
+      if (!listeners) return;
+      const index = listeners.indexOf(cb);
+      if (index !== -1) listeners.splice(index, 1);
     },
   };
 
+  const updateCalls = [];
   const settingsAPI = {
-    update: () => Promise.resolve({ status: "ok" }),
+    update: (key, value) => {
+      updateCalls.push({ key, value });
+      return update(key, value);
+    },
   };
   const context = {
     console,
@@ -342,6 +388,7 @@ function loadGeneralLanguageRowForTest({
     },
     document,
     requestAnimationFrame: (cb) => raf.requestAnimationFrame(cb),
+    setTimeout: () => 1,
     window: null,
     globalThis: null,
     settingsAPI,
@@ -399,14 +446,10 @@ function loadGeneralLanguageRowForTest({
   context.ClawdSettingsTabGeneral.init(core);
 
   let contentRenderCount = 0;
-  let languageTransitionSeenByRender = null;
   function renderLanguageOnly() {
     contentRenderCount++;
     core.ops.clearMountedControls();
     content.innerHTML = "";
-    languageTransitionSeenByRender = core.runtime.languageTransition
-      ? { ...core.runtime.languageTransition }
-      : null;
     content.appendChild(context.ClawdSettingsTabGeneral.__test.buildLanguageRow());
   }
   core.ops.installRenderHooks({ content: renderLanguageOnly });
@@ -415,9 +458,22 @@ function loadGeneralLanguageRowForTest({
     core,
     content,
     raf,
+    settingsAPI,
+    updateCalls,
     getContentRenderCount: () => contentRenderCount,
-    getLanguageTransitionSeenByRender: () => languageTransitionSeenByRender,
-    getSegmented: () => content.querySelector(".language-segmented"),
+    getLangPicker: () => content.querySelector(".language-picker"),
+    getLangTrigger: () => content.querySelector(".language-picker-trigger"),
+    getLangMenu: () => content.querySelector(".language-picker-menu"),
+    getLangValue: () => content.querySelector(".language-picker-value"),
+    getLangOptions: () => content.querySelectorAll(".language-picker-option"),
+    getDocumentListenerCount: (type) => {
+      const listeners = documentListeners.get(type);
+      return listeners ? listeners.length : 0;
+    },
+    getToastText: () => {
+      const toast = toastStack.querySelector(".toast");
+      return toast ? toast.textContent : "";
+    },
   };
 }
 
@@ -530,6 +586,7 @@ function makeGeneralSnapshot(overrides = {}) {
     lang: "en",
     size: 50,
     sessionHudEnabled: true,
+    sessionHudShowStateLabels: true,
     sessionHudShowElapsed: true,
     sessionHudCleanupDetached: true,
     soundMuted: false,
@@ -547,6 +604,108 @@ function makeGeneralSnapshot(overrides = {}) {
     updateBubbleAutoCloseSeconds: 12,
     ...overrides,
   };
+}
+
+function createKeyboardEventForTest(key) {
+  return {
+    type: "keydown",
+    key,
+    bubbles: true,
+    cancelBubble: false,
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    stopPropagation() {
+      this.cancelBubble = true;
+    },
+  };
+}
+
+function findAncestorByClass(el, className) {
+  let current = el;
+  while (current) {
+    if (current.classList && current.classList.contains(className)) return current;
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function loadThemeTabForTest({
+  themes,
+  settingsAPI = {},
+} = {}) {
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  content.id = "content";
+  body.appendChild(content);
+
+  const commands = [];
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+
+  const api = {
+    command: (name, payload) => {
+      commands.push({ name, payload });
+      return Promise.resolve({ status: "ok" });
+    },
+    ...settingsAPI,
+  };
+  const context = {
+    console,
+    navigator: { platform: "Win32" },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    document,
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    window: null,
+    globalThis: null,
+    settingsAPI: api,
+    ClawdSettingsSizeSlider: {
+      SIZE_UI_MIN: 1,
+      SIZE_UI_MAX: 100,
+      SIZE_TICK_VALUES: [25, 50, 75, 100],
+      SIZE_SLIDER_THUMB_DIAMETER: 18,
+      prefsSizeToUi: (value) => value,
+      clampSizeUi: (value) => value,
+      sizeUiToPct: (value) => value,
+      getSizeSliderAnchorPx: () => 0,
+      createSizeSliderController: () => ({}),
+    },
+    ClawdSettingsI18n: {
+      STRINGS: loadSettingsI18nForTest(),
+      CONTRIBUTORS: [],
+      MAINTAINERS: [],
+    },
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-theme.js"), "utf8"), context);
+
+  const core = context.ClawdSettingsCore;
+  core.state.snapshot = { lang: "en" };
+  core.state.activeTab = "theme";
+  core.runtime.themeList = Array.isArray(themes) ? themes : [];
+  context.ClawdSettingsTabTheme.init(core);
+  core.tabs.theme.render(content, core);
+
+  return { content, commands };
 }
 
 function loadAgentsTabForTest({
@@ -614,10 +773,13 @@ function loadAgentsTabForTest({
           rowCodexPermissionModeDesc: "Permission mode desc",
           codexPermissionModeNative: "Native",
           codexPermissionModeIntercept: "Intercept",
+          rowCodexNativeNotificationSound: "Native sound",
+          rowCodexNativeNotificationSoundDesc: "Native sound desc",
           badgePermissionBubble: "Permission bubble",
           eventSourceHook: "Hook",
           eventSourceLogPoll: "Log poll",
           eventSourcePlugin: "Plugin",
+          eventSourceExtension: "Extension",
           collapsibleExpand: "Expand",
           collapsibleCollapse: "Collapse",
           toastSaveFailed: "Failed: ",
@@ -734,12 +896,152 @@ function loadAnimMapTabForTest({
   };
 }
 
+function loadTelegramApprovalTabForTest({
+  snapshot,
+  settingsAPI = {},
+  confirm = () => true,
+} = {}) {
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  content.id = "content";
+  body.appendChild(content);
+  const updates = [];
+  const commands = [];
+  const renderRequests = [];
+
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+  const api = {
+    update: (key, value) => {
+      updates.push({ key, value });
+      return Promise.resolve({ status: "ok" });
+    },
+    command: (name, payload) => {
+      commands.push({ name, payload });
+      if (name === "telegramApproval.status") {
+        return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+      }
+      if (name === "telegramApproval.tokenInfo") {
+        return Promise.resolve({ status: "ok", configured: false, masked: "" });
+      }
+      return Promise.resolve({ status: "ok" });
+    },
+    ...settingsAPI,
+  };
+  const context = {
+    console,
+    document,
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    window: null,
+    globalThis: null,
+    settingsAPI: api,
+    confirm,
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-hardware-buddy-panel.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-telegram-approval.js"), "utf8"), context);
+
+  const core = {
+    state: {
+      snapshot: snapshot || {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      activeTab: "telegram-approval",
+    },
+    runtime: {},
+    helpers: {
+      t: (key) => key,
+      buildSection: (_title, rows) => {
+        const section = document.createElement("section");
+        for (const row of rows) section.appendChild(row);
+        return section;
+      },
+      setSwitchVisual: (el, checked, options = {}) => {
+        el.classList.toggle("on", !!checked);
+        el.classList.toggle("pending", !!options.pending);
+        el.setAttribute("aria-checked", checked ? "true" : "false");
+      },
+      // Mirror the real buildCollapsibleGroup just enough that header content,
+      // title/summary, and children all end up in the DOM tree; collapsed
+      // behaviour is exercised by the real component's own tests.
+      buildCollapsibleGroup: ({ id, title = "", desc = "", summary = null, headerContent, children = [], className = "" } = {}) => {
+        const group = document.createElement("div");
+        group.className = `collapsible-group${className ? ` ${className}` : ""}`;
+        if (id) group.dataset.groupId = id;
+        const header = document.createElement("div");
+        header.className = "collapsible-group-header";
+        if (headerContent) {
+          header.appendChild(headerContent);
+        } else {
+          const text = document.createElement("div");
+          text.className = "collapsible-group-text";
+          const label = document.createElement("span");
+          label.className = "row-label";
+          label.textContent = title;
+          text.appendChild(label);
+          if (desc) {
+            const description = document.createElement("span");
+            description.className = "row-desc";
+            description.textContent = desc;
+            text.appendChild(description);
+          }
+          header.appendChild(text);
+        }
+        if (summary) {
+          const summaryWrap = document.createElement("div");
+          summaryWrap.className = "collapsibleSummary collapsible-group-summary";
+          if (typeof summary === "string") summaryWrap.textContent = summary;
+          else summaryWrap.appendChild(summary);
+          header.appendChild(summaryWrap);
+        }
+        group.appendChild(header);
+        const body = document.createElement("div");
+        body.className = "collapsible-group-body";
+        for (const child of children) body.appendChild(child);
+        group.appendChild(body);
+        return group;
+      },
+    },
+    ops: {
+      requestRender: (payload) => {
+        renderRequests.push(payload || {});
+      },
+      showToast: () => {},
+    },
+    tabs: {},
+  };
+  context.ClawdSettingsTabTelegramApproval.init(core);
+  function render() {
+    content.innerHTML = "";
+    core.tabs["telegram-approval"].render(content, core);
+  }
+  render();
+
+  return { core, content, updates, commands, render, renderRequests };
+}
+
 function loadAnimOverridesTabForTest({
   runtime,
   modalRoot,
   settingsAPI = {},
   opsOverrides = {},
   readersOverrides = {},
+  helpersOverrides = {},
 }) {
   const document = {
     body: new FakeElement("body"),
@@ -779,10 +1081,17 @@ function loadAnimOverridesTabForTest({
     runtime,
     helpers: {
       t: (key) => key,
+      createDisclosureChevron: (className) => {
+        const chevron = document.createElement("span");
+        chevron.className = className;
+        chevron.setAttribute("aria-hidden", "true");
+        return chevron;
+      },
       attachActivation: (el, invoke) => {
         if (typeof invoke === "function") el.addEventListener("click", () => invoke());
         return el;
       },
+      ...helpersOverrides,
     },
     ops: {
       selectTab: () => {},
@@ -835,6 +1144,7 @@ function createAnimOverrideCard(overrides = {}) {
     fallbackTargetState: null,
     wideHitboxEnabled: false,
     wideHitboxOverridden: false,
+    wideHitboxThemeDefault: false,
     aspectRatioWarning: null,
     ...overrides,
   };
@@ -869,13 +1179,16 @@ describe("settings renderer browser environment", () => {
       "settings-anim-overrides-merge.js",
       "settings-ui-core.js",
       "settings-agent-order.js",
+      "settings-hardware-buddy-panel.js",
       "settings-tab-general.js",
       "settings-tab-agents.js",
       "settings-tab-theme.js",
       "settings-tab-anim-map.js",
       "settings-tab-anim-overrides.js",
       "settings-tab-shortcuts.js",
+      "settings-tab-telegram-approval.js",
       "settings-tab-about.js",
+      "settings-tab-remote-ssh.js",
       "settings-doctor-modal.js",
       "settings-renderer.js",
     ];
@@ -929,6 +1242,827 @@ describe("settings renderer browser environment", () => {
     }
   });
 
+  it("keeps Telegram approval drafts local across toggles and rerenders", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "IDLE", transport: "off", ownerSnapshot: {} },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    // Wait for tokenInfo + status to land so the switch is enabled.
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    // Token is configured → token row is collapsed (no input). Only the
+    // recipient input is rendered, at index 0.
+    const inputs = harness.content.querySelectorAll("input");
+    const allowedInput = inputs[0];
+    allowedInput.value = "987654321";
+    allowedInput.dispatchEvent({ type: "input" });
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_TEST_NATIVE"),
+      "turning on should use the native migration test flow",
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    harness.core.state.snapshot = {
+      ...harness.core.state.snapshot,
+      tgApproval: {
+        enabled: true,
+        allowedTgUserId: "555555555",
+        targetSessionKey: "telegram:555555555",
+      },
+    };
+    harness.render();
+
+    assert.equal(harness.content.querySelectorAll("input")[0].value, "987654321");
+  });
+
+  it("preserves notifyOnComplete=false through a Telegram approval disable save", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: false,
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: false,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: false,
+        completionOutputMode: "full",
+        r3DirectSendEnabled: false,
+      },
+    }]);
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning off should dispatch USER_DISABLE",
+    );
+  });
+
+  it("preserves notifyOnComplete=true through a Telegram recipient save", async () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: true,
+          completionOutputMode: "off",
+          r3DirectSendEnabled: true,
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const input = harness.content.querySelectorAll("input")[0];
+    input.value = "987654321";
+    input.dispatchEvent({ type: "input" });
+    const saveButton = harness.content.querySelectorAll("button")
+      .find((button) => button.textContent === "telegramApprovalSaveRecipient");
+    saveButton.dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: true,
+        allowedTgUserId: "987654321",
+        targetSessionKey: "987654321",
+        notifyOnComplete: true,
+        completionOutputMode: "off",
+        r3DirectSendEnabled: true,
+      },
+    }]);
+  });
+
+  it("dispatches USER_DISABLE when the enabled switch is turned off (zombie-switch fix)", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    // The legacy switch still writes tgApproval.enabled = false…
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: false,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: false,
+        completionOutputMode: "full",
+        r3DirectSendEnabled: false,
+      },
+    }]);
+    // …and turning OFF must ALSO stop the native transport, otherwise the poller
+    // + completion notifications keep running (the zombie-switch bug).
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning the switch off should dispatch USER_DISABLE",
+    );
+  });
+
+  it("requires confirmation before enabling full Telegram completion output", async () => {
+    const confirmCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: true,
+          completionOutputMode: "off",
+        },
+      },
+      confirm: (message) => {
+        confirmCalls.push(message);
+        return false;
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const select = harness.content.querySelector(".tg-approval-output-select");
+    assert.deepStrictEqual(select.children.map((option) => option.value), ["off", "full"]);
+    select.value = "full";
+    select.dispatchEvent({ type: "change" });
+
+    assert.deepStrictEqual(confirmCalls, ["telegramApprovalCompletionOutputFullConfirm"]);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.equal(select.value, "off");
+
+    const confirmed = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: true,
+          completionOutputMode: "off",
+        },
+      },
+      confirm: () => true,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    confirmed.render();
+
+    const confirmedSelect = confirmed.content.querySelector(".tg-approval-output-select");
+    confirmedSelect.value = "full";
+    confirmedSelect.dispatchEvent({ type: "change" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(confirmed.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: true,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: true,
+        completionOutputMode: "full",
+        r3DirectSendEnabled: false,
+      },
+    }]);
+  });
+
+  it("toggles Telegram Direct Send paste-only mode without changing the approval transport", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: false,
+          completionOutputMode: "full",
+          r3DirectSendEnabled: false,
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_ACTIVE",
+                transport: "native",
+                ownerSnapshot: { nativePolling: true },
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "running",
+                transport: "native",
+                configured: true,
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".tg-approval-direct-send-row .switch");
+    assert.equal(sw.getAttribute("aria-checked"), "false");
+    sw.dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: false,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: false,
+        completionOutputMode: "full",
+        r3DirectSendEnabled: true,
+      },
+    }]);
+    assert.equal(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"),
+      false,
+      "direct-send toggle should not start or stop the Telegram transport",
+    );
+  });
+
+  it("shows native-active Telegram approval as enabled even when the legacy flag is false", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_ACTIVE",
+                transport: "native",
+                ownerSnapshot: { nativePolling: true },
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "running",
+                transport: "native",
+                configured: true,
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok", snapshot: { state: "IDLE", transport: "off" } });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".switch");
+    assert.equal(sw.getAttribute("aria-checked"), "true");
+
+    sw.dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning off native-active approval should dispatch USER_DISABLE",
+    );
+  });
+
+  it("uses native running status while migration snapshot is still loading", async () => {
+    const commandCalls = [];
+    const never = new Promise(() => {});
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return never;
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "running",
+                transport: "native",
+                enabled: true,
+                configured: true,
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".switch");
+    assert.equal(sw.getAttribute("aria-checked"), "true");
+    assert.equal(sw.classList.contains("disabled"), false);
+
+    sw.dispatchEvent({ type: "click" });
+
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning off native-running approval should not wait for the migration snapshot",
+    );
+  });
+
+  it("turning the Telegram approval switch on starts the native migration test", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "IDLE", transport: "off", ownerSnapshot: {} },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.equal(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_TEST_NATIVE"),
+      true,
+      "turning the switch on should dispatch the native test flow",
+    );
+    assert.equal(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      false,
+      "turning the switch on should not dispatch USER_DISABLE",
+    );
+  });
+
+  it("does not show Telegram approval enabled for broken native setup debt", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "NEEDS_SETUP", transport: "native", ownerSnapshot: {} },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                transport: "native",
+                configured: true,
+                reason: "native-inactive",
+                message: "Native Telegram approval is not active",
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".switch");
+    assert.equal(sw.getAttribute("aria-checked"), "false");
+
+    sw.dispatchEvent({ type: "click" });
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_TEST_NATIVE"),
+      "turning on from broken native setup should retry the native test flow",
+    );
+  });
+
+  it("disables the independent Telegram approval test while native migration is testing", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "TESTING_NATIVE", ownerSnapshot: { nativePolling: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "starting",
+                transport: "native",
+                configured: true,
+                reason: "native-testing",
+                message: "Native Telegram approval test is already in progress",
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const testButton = harness.content.querySelectorAll("button")
+      .find((button) => button.textContent === "telegramApprovalSendTest");
+    assert.equal(testButton.disabled, true);
+    assert.match(testButton.title, /Native Telegram approval test/);
+
+    testButton.dispatchEvent({ type: "click" });
+    assert.equal(commandCalls.some((call) => call.name === "telegramApproval.test"), false);
+  });
+
+  it("disables Telegram approval test until runtime status is ready", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                configured: false,
+                reason: "invalid-config",
+                message: "Telegram target session key is not configured",
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+    const buttons = harness.content.querySelectorAll("button");
+    const testButton = buttons.find((button) => button.textContent === "telegramApprovalSendTest");
+    assert.equal(testButton.disabled, true);
+    assert.match(testButton.title, /target session key/);
+
+    testButton.dispatchEvent({ type: "click" });
+    assert.equal(commandCalls.some((call) => call.name === "telegramApproval.test"), false);
+  });
+
+  it("repaints Telegram approval after forced status refresh overlaps pending status", async () => {
+    const staleStatus = createDeferred();
+    const updatedStatus = createDeferred();
+    const statusResponses = [staleStatus, updatedStatus];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") {
+            const next = statusResponses.shift();
+            assert.ok(next, "unexpected Telegram status request");
+            return next.promise;
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+
+    // The send-test button is the last button on the tab; click it to force
+    // a status refresh that overlaps the in-flight initial status request.
+    const buttons = harness.content.querySelectorAll("button");
+    buttons[buttons.length - 1].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+    const beforeStatusResolve = harness.renderRequests.length;
+
+    staleStatus.resolve({
+      status: "ok",
+      state: {
+        status: "stopped",
+        configured: false,
+        reason: "missing-token",
+        message: "Telegram bot token is not configured",
+        tokenStored: false,
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(harness.renderRequests.length, beforeStatusResolve + 1);
+
+    harness.render();
+    updatedStatus.resolve({
+      status: "ok",
+      state: {
+        status: "running",
+        configured: true,
+        reason: "",
+        message: "",
+        tokenStored: true,
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(harness.renderRequests.length, beforeStatusResolve + 2);
+  });
+
+  it("wires the native migration delete-token button to a real command", async () => {
+    const commandCalls = [];
+    const toastMessages = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_ACTIVE",
+                runtimeStatus: { status: "running" },
+                ownerSnapshot: { sidecarRunning: false, nativePolling: true },
+                migrationInfo: {},
+                nativeVerifiedAt: 123,
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: true } });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          if (name === "telegramApproval.deleteTokenFile") {
+            return Promise.resolve({ status: "ok", deleted: true });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.ops.showToast = (message, options = {}) => {
+      toastMessages.push({ message, options });
+    };
+
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const deleteButton = harness.content
+      .querySelectorAll("button")
+      .find((button) => button.textContent === "Delete legacy token file");
+    assert.ok(deleteButton, "delete legacy token button should render for NATIVE_ACTIVE");
+
+    deleteButton.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(
+      commandCalls.some((call) => call.name === "telegramApproval.deleteTokenFile"),
+      true,
+    );
+    assert.equal(
+      toastMessages.some((toast) => /deleted/i.test(toast.message)),
+      true,
+    );
+  });
+
   it("wires Clawd Doctor through Settings with Step 2 connection actions", () => {
     const html = fs.readFileSync(SETTINGS_HTML, "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
@@ -958,19 +2092,139 @@ describe("settings renderer browser environment", () => {
     assert.ok(doctorModalSource.includes('commandAction.type !== "restart-clawd"'));
     assert.ok(doctorModalSource.includes("repairFeedback"));
     assert.ok(doctorModalSource.includes("lastRepairFeedback"));
+    assert.ok(doctorModalSource.includes("actionNotice"));
+    assert.ok(doctorModalSource.includes("actionNoticeTimer"));
+    assert.ok(doctorModalSource.includes("checkExpansionOverrides"));
+    assert.ok(doctorModalSource.includes("checksLoading"));
+    assert.ok(doctorModalSource.includes("connectionRunId"));
+    assert.ok(doctorModalSource.includes("repairRunId"));
+    assert.ok(doctorModalSource.includes("modalEntering"));
+    assert.ok(doctorModalSource.includes("clearModalEnteringTimer"));
+    assert.ok(doctorModalSource.includes("startModalEntering"));
+    assert.ok(doctorModalSource.includes("showActionNotice"));
+    assert.ok(doctorModalSource.includes("if (state.modalOpen)"));
     assert.ok(doctorModalSource.includes("core.ops.showToast"));
     assert.ok(!doctorModalSource.includes("core.helpers.showToast"));
     assert.ok(doctorModalSource.includes("agentDetailText"));
     assert.ok(doctorModalSource.includes("startConnectionTest"));
     assert.ok(doctorModalSource.includes("stopConnectionCountdown();"));
+    assert.ok(doctorModalSource.includes('class="doctor-title-row"'));
+    assert.ok(doctorModalSource.includes("renderLocalServerCheck"));
+    assert.ok(doctorModalSource.includes("doctor-local-server-main"));
+    assert.ok(doctorModalSource.includes('class="doctor-check-summary" title='));
+    assert.ok(doctorModalSource.includes('const fullDetail = detail && cls !== "pass"'));
+    assert.ok(doctorModalSource.includes("renderAgentIntegrationCheck"));
+    assert.ok(doctorModalSource.includes("doctor-agent-collapsible"));
+    assert.ok(doctorModalSource.includes("doctor-agent-chevron"));
+    assert.ok(/doctor-agent-chevron[\s\S]*doctor-check-label[\s\S]*doctor-check-summary[\s\S]*doctor-check-status/.test(doctorModalSource));
+    assert.ok(doctorModalSource.includes("doctor-agent-body"));
+    assert.ok(doctorModalSource.includes("doctor-agent-body-inner"));
+    assert.ok(doctorModalSource.includes('data-action="toggle-check"'));
+    assert.ok(doctorModalSource.includes('button.setAttribute("aria-expanded"'));
+    assert.ok(doctorModalSource.includes('row.classList.toggle("expanded"'));
+    assert.ok(doctorModalSource.includes('body.setAttribute("aria-hidden"'));
+    assert.ok(doctorModalSource.includes('" inert"'));
+    assert.ok(doctorModalSource.includes('body.setAttribute("inert", "")'));
+    assert.ok(doctorModalSource.includes("body.removeAttribute(\"inert\")"));
+    assert.ok(doctorModalSource.includes("checkNeedsAttention"));
+    assert.ok(doctorModalSource.includes("formatAgentIntegrationSummary"));
+    assert.ok(doctorModalSource.includes("formatAgentAttentionNames"));
+    assert.ok(doctorModalSource.includes("AGENT_ATTENTION_NAME_LIMIT"));
+    assert.ok(doctorModalSource.includes("doctorAgentSummaryNeedsAttention"));
+    assert.ok(doctorModalSource.includes("+${hidden}"));
+    assert.ok(doctorModalSource.includes("doctorAgentSummaryOk"));
+    assert.ok(doctorModalSource.includes("doctorAgentSummaryAttention"));
+    assert.ok(doctorModalSource.includes("doctorAgentSummarySkipped"));
+    assert.ok(doctorModalSource.includes("AGENT_WARNING_STATUSES"));
+    assert.ok(doctorModalSource.includes("AGENT_INFO_STATUSES"));
+    assert.ok(doctorModalSource.includes("renderCheckSkeleton"));
+    assert.ok(doctorModalSource.includes("doctor-check-skeleton"));
+    assert.ok(doctorModalSource.includes("doctor-skeleton-line"));
+    assert.ok(doctorModalSource.includes("doctor-connection-progress"));
+    assert.ok(doctorModalSource.includes("const runId = ++state.connectionRunId"));
+    assert.ok(doctorModalSource.includes("if (runId !== state.connectionRunId) return;"));
+    assert.ok(doctorModalSource.includes("state.connectionTesting = false"));
+    assert.ok(doctorModalSource.includes("state.connectionTest = null"));
+    assert.ok(doctorModalSource.includes('state.checksLoading = true'));
+    assert.ok(doctorModalSource.includes('state.checksLoading = false'));
+    assert.ok(doctorModalSource.includes("formatCheckedDateTime"));
+    assert.ok(doctorModalSource.includes('year: "numeric"'));
+    assert.ok(doctorModalSource.includes('month: "2-digit"'));
+    assert.ok(doctorModalSource.includes('day: "2-digit"'));
+    assert.ok(doctorModalSource.includes("renderLastChecked"));
+    assert.ok(doctorModalSource.includes("doctorLastCheckedAt"));
+    assert.ok(doctorModalSource.includes("result.generatedAt"));
+    assert.ok(doctorModalSource.includes("doctor-last-checked"));
+    assert.ok(doctorModalSource.includes("const opening = !state.modalOpen"));
+    assert.ok(doctorModalSource.includes("const entering = state.modalEntering"));
+    assert.ok(doctorModalSource.includes("doctor-modal-entering"));
+    assert.ok(doctorModalSource.includes("renderModalBody(core, result, { entering })"));
+    assert.ok(doctorModalSource.includes("renderActionNotice"));
+    assert.ok(doctorModalSource.includes("doctor-action-notice-icon"));
+    assert.ok(doctorModalSource.includes("doctor-action-notice-text"));
+    assert.ok(doctorModalSource.includes("doctor-action-bar"));
+    assert.ok(doctorModalSource.includes("clearActionNoticeTimer();"));
+    assert.ok(doctorModalSource.includes("state.repairFeedback = {};"));
+    assert.ok(doctorModalSource.includes("state.repairingKey = null;"));
+    assert.ok(doctorModalSource.includes("const runId = ++state.repairRunId"));
+    assert.ok(doctorModalSource.includes("if (runId !== state.repairRunId) return;"));
+    assert.ok(doctorModalSource.includes("doctor-privacy"));
+    assert.ok(!doctorModalSource.includes("doctorPrivacyShort"));
+    assert.ok(!i18nSource.includes("doctorPrivacyShort"));
+    assert.ok(!doctorModalSource.includes("doctor-privacy-inline"));
     assert.ok(css.includes(".doctor-agent-detail"));
     assert.ok(css.includes(".doctor-connection-panel"));
     assert.ok(css.includes(".doctor-fix-button"));
     assert.ok(css.includes(".doctor-fix-confirm"));
-    assert.ok(css.includes(".doctor-privacy-inline"));
-    assert.ok(doctorModalSource.includes("doctorPrivacyShort"));
+    assert.ok(!css.includes(".doctor-privacy-inline"));
     assert.ok(css.includes(".doctor-repair-feedback"));
     assert.ok(css.includes(".doctor-repair-summary"));
+    assert.ok(css.includes(".doctor-title-row"));
+    assert.ok(css.includes(".doctor-check-row-compact"));
+    assert.ok(css.includes(".doctor-local-server-main"));
+    assert.ok(css.includes(".doctor-agent-toggle"));
+    assert.ok(css.includes(".doctor-agent-chevron"));
+    assert.ok(css.includes(".doctor-agent-collapsible.expanded"));
+    assert.ok(css.includes(".doctor-agent-body"));
+    assert.ok(css.includes(".doctor-agent-body-inner"));
+    assert.ok(css.includes(".doctor-action-bar"));
+    assert.ok(css.includes(".doctor-action-notice"));
+    assert.ok(!css.includes(".doctor-action-notice::after"));
+    assert.ok(css.includes(".doctor-action-notice-icon"));
+    assert.ok(/@media \(prefers-color-scheme:\s*dark\)\s*\{[\s\S]*\.doctor-action-notice\.ok[\s\S]*color:\s*#8ce99a;[\s\S]*\.doctor-action-notice\.error[\s\S]*color:\s*#fca5a5;/.test(css));
+    assert.ok(css.includes("@keyframes doctor-notice-in"));
+    assert.ok(/\.doctor-modal\s*\{[\s\S]*width:\s*min\(728px,\s*100%\);[\s\S]*max-height:\s*calc\(100vh - 32px\);/.test(css));
+    assert.ok(/\.doctor-modal\s*\{[\s\S]*gap:\s*8px;[\s\S]*padding:\s*14px;/.test(css));
+    assert.ok(css.includes(".doctor-modal-entering"));
+    assert.ok(css.includes("@keyframes doctor-modal-in"));
+    assert.ok(css.includes(".doctor-last-checked"));
+    assert.ok(/\.doctor-overall\s*\{[\s\S]*flex-wrap:\s*wrap;/.test(css));
+    assert.ok(/\.doctor-check-list\s*\{[\s\S]*gap:\s*6px;/.test(css));
+    assert.ok(/\.doctor-check-row\s*\{[\s\S]*padding:\s*8px 10px;/.test(css));
+    assert.ok(/\.doctor-check-detail\s*\{[\s\S]*margin:\s*5px 0 0 17px;/.test(css));
+    assert.ok(css.includes("--doctor-pass"));
+    assert.ok(css.includes("--doctor-warning"));
+    assert.ok(css.includes("--doctor-critical"));
+    assert.ok(css.includes("--doctor-critical-rgb: 220, 38, 38;"));
+    assert.ok(css.includes(".doctor-check-skeleton"));
+    assert.ok(css.includes("@keyframes doctor-skeleton-sheen"));
+    assert.ok(css.includes(".doctor-connection-panel.testing"));
+    assert.ok(css.includes(".doctor-connection-progress"));
+    assert.ok(/\.doctor-action-bar\s*\{[\s\S]*align-items:\s*center;/.test(css));
+    assert.ok(/\.doctor-action-notice-slot\s*\{[\s\S]*min-height:\s*24px;/.test(css));
+    assert.ok(/\.doctor-check-row\.pass\s*\{[\s\S]*border-left-color:\s*rgba\(var\(--doctor-pass-rgb\),\s*0\.72\);/.test(css));
+    assert.ok(/\.doctor-check-row\.warning\s*\{[\s\S]*border-left-color:\s*rgba\(var\(--doctor-warning-rgb\),\s*0\.78\);/.test(css));
+    assert.ok(/\.doctor-check-row\.critical\s*\{[\s\S]*border-left-color:\s*rgba\(var\(--doctor-critical-rgb\),\s*0\.78\);/.test(css));
+    assert.ok(/\.doctor-agent-toggle\s*\{[\s\S]*grid-template-columns:\s*auto auto auto minmax\(0,\s*1fr\) auto;/.test(css));
+    assert.ok(/\.doctor-agent-body\s*\{[\s\S]*grid-template-rows:\s*0fr;[\s\S]*transition:[\s\S]*grid-template-rows 0\.24s cubic-bezier/.test(css));
+    assert.ok(/\.doctor-agent-collapsible\.expanded \.doctor-agent-body\s*\{[\s\S]*grid-template-rows:\s*1fr;/.test(css));
+    assert.ok(/\.doctor-check-row\s*\{[\s\S]*border-left-width:\s*3px;/.test(css));
+    assert.ok(/\.doctor-check-status\s*\{[\s\S]*border-radius:\s*999px;/.test(css));
+    assert.ok(/\.doctor-close:hover\s*\{[\s\S]*background:\s*rgba\(217,\s*119,\s*87,\s*0\.1\);[\s\S]*transform:\s*scale\(1\.04\);/.test(css));
+    assert.ok(/\.doctor-close:focus-visible\s*\{[\s\S]*outline:\s*2px solid var\(--accent\);/.test(css));
+    assert.ok(/\.doctor-agent-toggle:focus-visible\s*\{[\s\S]*outline:\s*2px solid var\(--accent\);/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.doctor-modal-entering[\s\S]*animation:\s*none;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.doctor-action-bar\s*\{[\s\S]*flex-direction:\s*column;/.test(css));
     // Regression guard: agent list must not introduce its own scroll viewport.
     // The outer .doctor-check-list owns scrolling so users get a single scrollbar.
     // [^}]*? keeps the match scoped to this rule body so unrelated max-height
@@ -1003,9 +2257,22 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("doctorFixApplied"));
     assert.ok(i18nSource.includes("doctorFixConfirmCodexDetail"));
     assert.ok(i18nSource.includes("doctorRestartConfirmDetail"));
-    assert.ok(i18nSource.includes("doctorPrivacyShort"));
+    assert.ok(i18nSource.includes("doctorPrivacy"));
+    assert.ok(i18nSource.includes("doctorLastCheckedAt"));
+    assert.ok(i18nSource.includes("doctorAgentSummaryOk"));
+    assert.ok(i18nSource.includes("doctorAgentSummaryAttention"));
+    assert.ok(i18nSource.includes("doctorAgentSummaryNeedsAttention"));
+    assert.ok(i18nSource.includes("doctorAgentSummarySkipped"));
     assert.ok(i18nSource.includes("doctorConnectionHttpVerified"));
     assert.ok(i18nSource.includes("doctorOpenLog"));
+    assert.ok(i18nSource.includes('doctorOpenLogOpened: "Debug log opened"'));
+    assert.ok(i18nSource.includes('doctorOpenLogOpened: "已打开调试日志"'));
+    assert.ok(i18nSource.includes('doctorOpenLogOpened: "디버그 로그를 열었습니다"'));
+    assert.ok(i18nSource.includes('doctorOpenLogOpened: "デバッグログを開きました"'));
+    assert.ok(!i18nSource.includes('doctorOpenLogOpened: "Debug log opened."'));
+    assert.ok(!i18nSource.includes('doctorOpenLogOpened: "已打开调试日志。"'));
+    assert.ok(!i18nSource.includes('doctorOpenLogOpened: "디버그 로그를 열었습니다."'));
+    assert.ok(!i18nSource.includes('doctorOpenLogOpened: "デバッグログを開きました。"'));
   });
 
   it("does not animate the size bubble's horizontal position", () => {
@@ -1047,83 +2314,129 @@ describe("settings renderer browser environment", () => {
     assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.switch,[\s\S]*\.switch::after\s*\{[\s\S]*transition:\s*none;/.test(css));
   });
 
-  it("animates the Settings language segmented control with a sliding active pill", () => {
+  it("renders the Settings language picker as a dropdown over all supported langs", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
 
-    assert.ok(generalSource.includes("const LANGUAGE_OPTIONS = [\"en\", \"zh\", \"ko\", \"ja\"];"));
-    assert.ok(generalSource.includes("language-segmented"));
-    assert.ok(generalSource.includes("runtime.languageTransition"));
-    assert.ok(!generalSource.includes("language-segmented-transitioning"));
-    assert.ok(generalSource.includes('segmented.style.setProperty("--language-active-index", String(fromIndex));'));
-    assert.ok(generalSource.includes("requestAnimationFrame(() => {"));
-    assert.ok(generalSource.includes("segmented.getBoundingClientRect();"));
-    assert.ok(generalSource.includes('segmented.style.setProperty("--language-active-index", String(currentIndex));'));
-    assert.ok(coreSource.includes("languageTransition: null"));
-    assert.ok(coreSource.includes("const previousLang = getLang();"));
-    assert.ok(coreSource.includes('Object.prototype.hasOwnProperty.call(changes, "lang")'));
-    assert.ok(coreSource.includes('runtime.languageTransition = state.activeTab === "general" && previousLang !== nextLang'));
-    assert.ok(/\.language-segmented\s*\{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\);/.test(css));
-    assert.ok(css.includes("language-segmented intentionally overrides .segmented display"));
-    assert.ok(/\.language-segmented::before\s*\{[\s\S]*transform:\s*translateX\(calc\(var\(--language-active-index\)\s*\*\s*100%\)\);[\s\S]*transition:\s*transform 0\.24s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\);/.test(css));
-    assert.ok(/\.language-segmented button\.active\s*\{[\s\S]*background:\s*transparent;[\s\S]*box-shadow:\s*none;/.test(css));
-    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-segmented::before\s*\{[\s\S]*transition:\s*none;/.test(css));
+    assert.ok(new RegExp(
+      String.raw`const LANGUAGE_OPTIONS = \[` +
+      SUPPORTED_LANGS.map((lang) => String.raw`"${lang}"`).join(String.raw`,\s*`) +
+      String.raw`\];`
+    ).test(generalSource));
+    assert.ok(generalSource.includes(`class="language-picker"`));
+    assert.ok(generalSource.includes(`aria-haspopup="listbox"`));
+    assert.ok(generalSource.includes(`role="listbox"`));
+    assert.ok(generalSource.includes(`aria-hidden="true"`));
+    assert.ok(generalSource.includes(`role", "option"`));
+    assert.ok(!generalSource.includes(`<select class="language-select"`));
+    assert.ok(!generalSource.includes("language-segmented"));
+    assert.ok(!generalSource.includes("runtime.languageTransition"));
+    assert.ok(!generalSource.includes("--language-active-index"));
+    assert.ok(!coreSource.includes("languageTransition"));
+    assert.ok(/\.language-picker-menu\s*\{[\s\S]*box-shadow:/.test(css));
+    assert.ok(/\.language-picker-option:hover,[\s\S]*\.language-picker-option:focus-visible\s*\{[\s\S]*background:/.test(css));
+    assert.ok(/\.language-picker-option\.selected\s*\{[\s\S]*color:\s*var\(--accent\);/.test(css));
+    assert.ok(/@media \(prefers-color-scheme:\s*dark\)\s*\{[\s\S]*\.language-picker-menu/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-picker-trigger,[\s\S]*\.language-picker-chevron,[\s\S]*\.language-picker-menu[\s\S]*transition:\s*none;/.test(css));
+    assert.ok(!css.includes(".language-segmented"));
   });
 
-  it("uses and clears the General tab language slide transition during render", () => {
+  it("populates the language picker with current selection and propagates click changes", () => {
     const harness = loadGeneralLanguageRowForTest({
       snapshot: { lang: "en" },
     });
 
     harness.core.ops.requestRender({ content: true });
     assert.strictEqual(harness.getContentRenderCount(), 1);
-    assert.strictEqual(harness.getSegmented().style.getPropertyValue("--language-active-index"), "0");
+    const picker = harness.getLangPicker();
+    const trigger = harness.getLangTrigger();
+    assert.ok(picker, "language picker should be rendered");
+    assert.ok(trigger, "language picker trigger should be rendered");
+    assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "true");
+    const options = harness.getLangOptions();
+    assert.strictEqual(options.length, SUPPORTED_LANGS.length);
+    for (let i = 0; i < SUPPORTED_LANGS.length; i++) {
+      assert.strictEqual(options[i].dataset.lang, SUPPORTED_LANGS[i]);
+      assert.strictEqual(options[i].tabIndex, -1);
+    }
+    assert.strictEqual(options[0].attributes["aria-selected"], "true");
+
+    trigger.dispatchEvent({ type: "click" });
+    assert.strictEqual(picker.classList.contains("open"), true);
+    assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "false");
+    assert.strictEqual(options[0].tabIndex, 0);
+    options[1].dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(
+      harness.updateCalls,
+      [{ key: "lang", value: "zh" }],
+      "clicking a language option should call settingsAPI.update with the new lang"
+    );
+    assert.strictEqual(picker.classList.contains("open"), false);
+    assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "true");
+    for (const option of options) assert.strictEqual(option.tabIndex, -1);
+    assert.strictEqual(harness.getLangValue().textContent, "Chinese");
+
+    trigger.dispatchEvent({ type: "click" });
+    options[1].dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(
+      harness.updateCalls,
+      [{ key: "lang", value: "zh" }],
+      "clicking the already displayed pending language should not submit a duplicate update"
+    );
+
+    trigger.dispatchEvent({ type: "click" });
+    options[0].dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(
+      harness.updateCalls,
+      [{ key: "lang", value: "zh" }],
+      "clicking back to the committed language while pending should not submit a duplicate update"
+    );
+    assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(options[0].attributes["aria-selected"], "true");
 
     harness.core.ops.applyChanges({
       changes: { lang: "zh" },
       snapshot: { lang: "zh" },
     });
-
-    const segmented = harness.getSegmented();
     assert.strictEqual(harness.getContentRenderCount(), 2);
-    assert.deepStrictEqual(
-      harness.getLanguageTransitionSeenByRender(),
-      { from: "en", to: "zh" },
-      "General render should consume the previous and next language pair"
-    );
-    assert.strictEqual(
-      segmented.style.getPropertyValue("--language-active-index"),
-      "0",
-      "language pill should start at the previous language before rAF"
-    );
-    assert.strictEqual(harness.core.runtime.languageTransition, null);
-    const buttons = segmented.querySelectorAll("button");
-    assert.strictEqual(buttons[1].classList.contains("active"), true);
-
-    harness.raf.flush();
-    assert.strictEqual(
-      segmented.style.getPropertyValue("--language-active-index"),
-      "1",
-      "language pill should move to the new language on rAF"
-    );
+    assert.strictEqual(harness.getLangValue().textContent, "Chinese");
+    assert.strictEqual(harness.getLangOptions()[1].attributes["aria-selected"], "true");
   });
 
-  it("does not keep a stale language slide transition when language changes off the General tab", () => {
-    const core = loadSettingsCoreForTest({});
-    core.state.activeTab = "agents";
-    core.state.snapshot = { lang: "en" };
-
-    core.ops.applyChanges({
-      changes: { lang: "zh" },
-      snapshot: { lang: "zh" },
+  it("supports keyboard language selection and reverts when saving fails", async () => {
+    const harness = loadGeneralLanguageRowForTest({
+      snapshot: { lang: "en" },
+      update: () => Promise.resolve({ status: "error", message: "synthetic failure" }),
     });
 
-    assert.strictEqual(
-      core.runtime.languageTransition,
-      null,
-      "language changes outside General should not animate later when returning to General"
-    );
+    harness.core.ops.requestRender({ content: true });
+    const trigger = harness.getLangTrigger();
+    trigger.dispatchEvent(createKeyboardEventForTest("ArrowDown"));
+    assert.strictEqual(harness.getLangPicker().classList.contains("open"), true);
+    const options = harness.getLangOptions();
+    options[1].dispatchEvent(createKeyboardEventForTest("Enter"));
+    await Promise.resolve();
+
+    assert.deepStrictEqual(harness.updateCalls, [{ key: "lang", value: "zh" }]);
+    assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(harness.getToastText(), "Failed: synthetic failure");
+  });
+
+  it("cleans up language picker document listeners across re-renders", () => {
+    const harness = loadGeneralLanguageRowForTest({
+      snapshot: { lang: "en" },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    assert.strictEqual(harness.getDocumentListenerCount("click"), 1);
+    assert.strictEqual(harness.getDocumentListenerCount("keydown"), 1);
+
+    harness.core.ops.requestRender({ content: true });
+    assert.strictEqual(harness.getDocumentListenerCount("click"), 1);
+    assert.strictEqual(harness.getDocumentListenerCount("keydown"), 1);
   });
 
   it("exposes aggregate and split bubble controls in the General tab", () => {
@@ -1140,6 +2453,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(generalSource.includes("state.mountedControls.bubblePolicyControls"));
     assert.ok(generalSource.includes("state.mountedControls.bubblePolicySummary"));
     assert.ok(generalSource.includes("confirmDisableUpdateBubbles"));
+    assert.ok(generalSource.indexOf("buildBubblePolicyRow()") < generalSource.indexOf('key: "bubbleFollowPet"'));
     assert.ok(generalSource.includes("category === \"update\" && next === 0"));
     assert.ok(generalSource.includes("notificationBubbleAutoCloseSeconds"));
     assert.ok(generalSource.includes("updateBubbleAutoCloseSeconds"));
@@ -1156,6 +2470,327 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("rowBubblePolicy"));
     assert.ok(i18nSource.includes("bubbleUpdateWarning"));
     assert.ok(i18nSource.includes("bubbleSecondsPrefix"));
+  });
+
+  it("registers the Session cleanup group with three number rows, atomic reset, and i18n keys", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    const uiCoreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const actionsSource = fs.readFileSync(path.join(SRC_DIR, "settings-actions.js"), "utf8");
+
+    // Group is mounted top-level in the General tab (not nested under HUD).
+    assert.ok(generalSource.includes("buildSessionCleanupGroup()"));
+    assert.ok(generalSource.includes('id: "general:session-cleanup"'));
+
+    // All three numeric prefs map to their own number input row.
+    assert.ok(generalSource.includes('key: "sessionStaleMs"'));
+    assert.ok(generalSource.includes('key: "workingStaleMs"'));
+    assert.ok(generalSource.includes('key: "detachedIdleStaleMs"'));
+    assert.ok(generalSource.includes("buildNumberInputRow"));
+    assert.ok(generalSource.includes("SESSION_CLEANUP_NUMBER_KEYS"));
+
+    // Reset button goes through the atomic command path.
+    assert.ok(generalSource.includes('"sessionCleanup.setTriple"'));
+    assert.ok(generalSource.includes("SESSION_CLEANUP_DEFAULTS"));
+    assert.ok(generalSource.includes('"actionResetSessionCleanup"'));
+
+    // patchInPlace covers the new keys in BOTH the existence guard and the sync loop.
+    assert.ok(generalSource.match(/SESSION_CLEANUP_NUMBER_KEYS\.has\(key\)[\s\S]+sessionCleanupControls\.get\(key\)\.syncFromSnapshot\(\)/));
+
+    // ui-core registers the helper and the mountedControls bag.
+    assert.ok(uiCoreSource.includes("buildNumberInputRow"));
+    assert.ok(uiCoreSource.includes("sessionCleanupControls: new Map()"));
+    assert.ok(uiCoreSource.includes("state.mountedControls.sessionCleanupControls.clear()"));
+
+    // The command is registered in settings-actions.
+    assert.ok(actionsSource.includes('"sessionCleanup.setTriple": setSessionCleanupTriple'));
+
+    // i18n keys present in all five languages.
+    for (const key of [
+      "rowSessionCleanupGroup",
+      "rowSessionCleanupGroupDesc",
+      "rowStaleSession",
+      "rowStaleSessionDesc",
+      "rowStaleWorking",
+      "rowStaleWorkingDesc",
+      "rowStaleDetached",
+      "rowStaleDetachedDesc",
+      "unitMinutes",
+      "unitSeconds",
+      "valueDisabled",
+      "actionResetSessionCleanup",
+    ]) {
+      const matches = i18nSource.match(new RegExp(`\\b${key}:`, "g"));
+      assert.ok(matches && matches.length >= 5, `${key} should appear in all 5 language tables (saw ${matches ? matches.length : 0})`);
+    }
+  });
+
+  it("uses collapsible option lists for Session HUD and sound controls", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    assert.ok(generalSource.includes("function buildSessionHudOptionsList("));
+    assert.ok(generalSource.includes("session-hud-option-list"));
+    assert.ok(generalSource.includes("function buildSoundGroup("));
+    assert.ok(generalSource.includes("function buildSoundEnabledRow("));
+    assert.ok(generalSource.includes('id: "general:sound"'));
+    assert.ok(generalSource.includes("sound-option-list"));
+    assert.ok(generalSource.includes("state.mountedControls.soundSummary"));
+    assert.ok(generalSource.includes('sw.setAttribute("aria-label", t("rowSoundEnabled"));'));
+    assert.ok(generalSource.includes("toggleSound"));
+    assert.ok(generalSource.includes("syncVolumePreview"));
+    assert.ok(!/key:\s*"soundMuted",[\s\S]{0,120}descKey:\s*"rowSoundDesc"/.test(generalSource));
+    assert.ok(generalSource.includes('state.transientUiState.generalSwitches.set("soundMuted"'));
+    assert.ok(generalSource.includes("if (!result || result.status !== \"ok\" || result.noop)"));
+    assert.ok(generalSource.includes("sessionHudSummaryLabels"));
+    assert.ok(generalSource.includes('key: "sessionHudShowStateLabels"'));
+    assert.ok(generalSource.includes("session-hud-summary-control"));
+    assert.ok(/\.settings-option-list\s*\{[\s\S]*display:\s*grid;[\s\S]*gap:\s*8px;/.test(css));
+    assert.ok(/\.settings-option-list \.settings-option-item\s*\{[\s\S]*background:\s*color-mix\(in srgb,\s*var\(--panel-bg\) 78%,\s*transparent\);/.test(css));
+    assert.ok(/\.session-hud-collapsible \.collapsible-summary-chip,[\s\S]*\.sound-collapsible \.collapsible-summary-chip\s*\{[\s\S]*max-width:\s*min\(280px,\s*100%\);/.test(css));
+    assert.ok(/\.session-hud-collapsible \.collapsible-group-summary\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*max-width:\s*none;/.test(css));
+    assert.ok(/\.sound-collapsible \.collapsible-group-summary\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*max-width:\s*none;/.test(css));
+    assert.ok(/\.bubble-policy-collapsible \.collapsible-group-summary\s*\{[^}]*flex:\s*0 0 auto;[^}]*flex-wrap:\s*nowrap;[^}]*max-width:\s*none;[^}]*\}/.test(css));
+    assert.ok(!/\.session-hud-collapsible \.collapsible-group-summary\s*\{[^}]*flex-wrap:\s*nowrap;/.test(css));
+    assert.ok(!/\.sound-collapsible \.collapsible-group-summary\s*\{[^}]*flex-wrap:\s*nowrap;/.test(css));
+    assert.ok(/\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(3,\s*max-content\);/.test(css));
+    assert.ok(/\.session-hud-summary-control\.compact\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*width:\s*auto;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-collapsible \.collapsible-group-header\s*\{[\s\S]*flex-wrap:\s*wrap;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-collapsible \.collapsible-group-summary\s*\{[\s\S]*flex:\s*0 0 calc\(100% - 22px\);[\s\S]*margin-left:\s*22px;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[\s\S]*width:\s*min\(238px,\s*100%\);/.test(css));
+    assert.ok(/\.collapsible-group-text \.row-label\s*\{[\s\S]*text-overflow:\s*ellipsis;[\s\S]*white-space:\s*nowrap;/.test(css));
+    assert.ok(/\.collapsible-group-text \.row-desc\s*\{[\s\S]*white-space:\s*normal;[\s\S]*-webkit-line-clamp:\s*2;/.test(css));
+    assert.ok(/\.sound-summary-control\s*\{[\s\S]*display:\s*inline-flex;/.test(css));
+    assert.ok(/\.sound-summary-control\s*\{[\s\S]*min-width:\s*max-content;/.test(css));
+    assert.ok(/\.sound-summary-control \.collapsible-summary-chip\s*\{[\s\S]*max-width:\s*none;/.test(css));
+    assert.ok(/\.sound-summary-control \.collapsible-summary-chip\s*\{[\s\S]*flex:\s*0 0 auto;/.test(css));
+    assert.ok(/\.sound-collapsible \.collapsible-group-text \.row-desc\s*\{[\s\S]*white-space:\s*normal;[\s\S]*-webkit-line-clamp:\s*2;/.test(css));
+    assert.ok(i18nSource.includes("rowSoundEnabled"));
+  });
+
+  it("places Hardware Buddy on the Remote Approval tab instead of General", () => {
+    const generalHarness = loadGeneralTabForTest({ snapshot: makeGeneralSnapshot() });
+    generalHarness.renderContent();
+
+    const sections = generalHarness.content.querySelectorAll(".section");
+    const sectionTitles = sections.map((section) => section.querySelector(".section-title").textContent);
+    assert.deepStrictEqual(sectionTitles, ["Appearance", "Session management", "Startup", "Bubbles"]);
+    assert.strictEqual(generalHarness.content.querySelector(".hardware-buddy-collapsible"), null);
+
+    const remoteHarness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: false,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: false,
+        },
+      },
+    });
+    const telegramCard = remoteHarness.content.querySelector(".tg-approval-channel-card");
+    const hardwareBuddy = remoteHarness.content.querySelector(".hardware-buddy-collapsible");
+    assert.ok(hardwareBuddy, "Hardware Buddy panel should render");
+    assert.ok(telegramCard, "Telegram approval card should render");
+    assert.ok(remoteHarness.content.children.indexOf(telegramCard) < remoteHarness.content.children.indexOf(hardwareBuddy));
+    assert.strictEqual(hardwareBuddy.dataset.groupId, "remote-approval.hardware-buddy");
+  });
+
+  it("renders Hardware Buddy with the same remote approval channel header style", () => {
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: true,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: true,
+        },
+      },
+    });
+    harness.core.runtime.hardwareBuddyStatus = {
+      started: true,
+      connected: true,
+      secure: true,
+      lastStatus: { data: { name: "Clawstick" } },
+    };
+    harness.render();
+
+    const hardwareBuddy = harness.content.querySelector(".hardware-buddy-collapsible");
+    const header = hardwareBuddy.querySelector(".hardware-buddy-channel-header");
+    const badge = header.querySelector(".hardware-buddy-channel-badge");
+    const replyBadge = hardwareBuddy.querySelector(".hardware-buddy-reply-badge");
+    const testButton = hardwareBuddy.querySelector(".hardware-buddy-test-button");
+    assert.strictEqual(header.querySelector(".tg-approval-channel-name").textContent, "hardwareBuddyTitle");
+    assert.strictEqual(badge.querySelectorAll("span")[1].textContent, "hardwareBuddyStatus_secure");
+    assert.ok(badge.classList.contains("tg-approval-badge-running"));
+    assert.strictEqual(replyBadge.textContent, "hardwareBuddyRepliesOn");
+    assert.strictEqual(hardwareBuddy.querySelector(".hardware-buddy-repo-button"), null);
+    assert.strictEqual(testButton.textContent, "hardwareBuddyTestButton");
+    assert.strictEqual(hardwareBuddy.querySelector(".hardware-buddy-summary-control"), null);
+    assert.strictEqual(hardwareBuddy.querySelector(".hardware-buddy-quick-command-row"), null);
+    assert.strictEqual(hardwareBuddy.textContent.includes("hardwareBuddyQuickCommands"), false);
+    assert.ok(/\.remote-approval-channel-card\.collapsible-group\s*\{[\s\S]*margin:\s*8px 0 14px;/.test(css));
+    assert.ok(/\.tg-approval-channel-header\s*\{[\s\S]*justify-content:\s*space-between;/.test(css));
+    assert.ok(/\.hardware-buddy-status-control\s*\{[\s\S]*display:\s*inline-flex;/.test(css));
+    assert.ok(/\.hardware-buddy-test-button\s*\{[\s\S]*border:\s*1px solid var\(--accent\);/.test(css));
+  });
+
+  it("sends a Hardware Buddy test approval from the settings panel", async () => {
+    const calls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: true,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: true,
+        },
+      },
+      settingsAPI: {
+        testHardwareBuddyApproval: () => {
+          calls.push("test");
+          return Promise.resolve({ status: "ok", decision: "allow" });
+        },
+      },
+    });
+    harness.core.runtime.hardwareBuddyStatus = {
+      started: true,
+      connected: true,
+      secure: true,
+      lastStatus: { data: { name: "Clawstick" } },
+    };
+    harness.render();
+
+    const button = harness.content.querySelector(".hardware-buddy-test-button");
+    assert.strictEqual(button.disabled, false);
+    button.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(calls, ["test"]);
+    assert.equal(harness.renderRequests[harness.renderRequests.length - 1].content, true);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepStrictEqual(harness.core.runtime.hardwareBuddyTest.result, {
+      status: "ok",
+      decision: "allow",
+    });
+  });
+
+  it("renders Hardware Buddy test error codes and clears stale results when config changes", () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: true,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: true,
+        },
+      },
+      settingsAPI: {
+        testHardwareBuddyApproval: () => Promise.resolve({ status: "error", code: "timeout" }),
+      },
+    });
+    harness.core.runtime.hardwareBuddyStatus = {
+      started: true,
+      connected: true,
+      secure: true,
+      lastStatus: { data: { name: "Clawstick" } },
+    };
+    harness.core.runtime.hardwareBuddyTest = {
+      pending: false,
+      result: { status: "error", code: "timeout", message: "raw english fallback" },
+      contextKey: "",
+    };
+    harness.core.helpers.t = (key) => key === "hardwareBuddyTestErr_timeout" ? "timeout translated" : key;
+    harness.render();
+
+    let desc = harness.content.querySelector(".hardware-buddy-test-row .row-desc");
+    assert.strictEqual(desc.textContent, "timeout translated");
+
+    harness.core.state.snapshot.hardwareBuddy.enabled = false;
+    harness.render();
+
+    desc = harness.content.querySelector(".hardware-buddy-test-row .row-desc");
+    assert.strictEqual(harness.core.runtime.hardwareBuddyTest.result, null);
+    assert.strictEqual(desc.textContent, "hardwareBuddyTestDisabled");
+  });
+
+  it("does not render Hardware Buddy Quick Command controls", () => {
+    const calls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: false,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: false,
+          quickCommandsEnabled: true,
+        },
+      },
+      settingsAPI: {
+        getQuickCommandPresets: () => {
+          calls.push("presets");
+          return Promise.resolve({
+            enabled: true,
+            presets: [{ id: "plan_first", label: "先列计划" }],
+          });
+        },
+        sendQuickCommand: (payload) => {
+          calls.push(payload);
+          return Promise.resolve({ status: "ok", quickCommand: { id: payload.id } });
+        },
+      },
+    });
+    harness.core.runtime.quickCommandPresets = {
+      enabled: true,
+      presets: [
+        { id: "plan_first", label: "先列计划" },
+        { id: "show_diff", label: "show diff" },
+      ],
+    };
+    harness.render();
+
+    assert.strictEqual(harness.content.querySelector(".hardware-buddy-quick-command-row"), null);
+    assert.strictEqual(harness.content.querySelector(".hardware-buddy-quick-command-button"), null);
+    assert.strictEqual(harness.content.textContent.includes("hardwareBuddyQuickCommands"), false);
+    assert.strictEqual(harness.content.textContent.includes("先列计划"), false);
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it("adds hover affordance to General size and volume sliders", () => {
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.ok(/\.size-slider:hover::-webkit-slider-thumb\s*\{[\s\S]*transform:\s*scale\(1\.08\);/.test(css));
+    assert.ok(/\.volume-slider:hover::-webkit-slider-thumb\s*\{[\s\S]*transform:\s*scale\(1\.08\);/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.size-slider:hover::-webkit-slider-thumb,[\s\S]*\.volume-slider:hover::-webkit-slider-thumb\s*\{[\s\S]*transform:\s*none;/.test(css));
   });
 
   it("describes notification bubble seconds as an auto-close upper bound instead of a guaranteed visible duration", () => {
@@ -1266,6 +2901,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: false,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -1294,11 +2930,24 @@ describe("settings renderer browser environment", () => {
     harness.renderContent();
 
     const master = harness.getSwitch("sessionHudEnabled");
+    const labels = harness.getSwitch("sessionHudShowStateLabels");
     const elapsed = harness.getSwitch("sessionHudShowElapsed");
     const cleanup = harness.getSwitch("sessionHudCleanupDetached");
+    const summary = harness.core.state.mountedControls.sessionHudSummary.element;
+    const optionList = harness.content.querySelector(".session-hud-option-list");
     assert.ok(master);
+    assert.ok(labels);
     assert.ok(elapsed);
     assert.ok(cleanup);
+    assert.ok(optionList);
+    assert.ok(optionList.children.every((child) => child.classList.contains("settings-option-item")));
+    assert.strictEqual(harness.getSwitchMeta("sessionHudEnabled").row.querySelector(".row-desc"), null);
+    assert.strictEqual(summary.children.length, 1);
+    assert.strictEqual(summary.children[0].textContent, "HUD: off");
+    assert.strictEqual(summary.classList.contains("compact"), true);
+    assert.strictEqual(labels.classList.contains("disabled"), true);
+    assert.strictEqual(labels.attributes["aria-disabled"], "true");
+    assert.strictEqual(labels.tabIndex, -1);
     assert.strictEqual(elapsed.classList.contains("disabled"), true);
     assert.strictEqual(elapsed.attributes["aria-disabled"], "true");
     assert.strictEqual(elapsed.tabIndex, -1);
@@ -1315,15 +2964,24 @@ describe("settings renderer browser environment", () => {
       "Session HUD master broadcasts should patch mounted controls instead of rebuilding General"
     );
     assert.strictEqual(harness.getSwitch("sessionHudEnabled"), master);
+    assert.strictEqual(harness.getSwitch("sessionHudShowStateLabels"), labels);
     assert.strictEqual(harness.getSwitch("sessionHudShowElapsed"), elapsed);
     assert.strictEqual(harness.getSwitch("sessionHudCleanupDetached"), cleanup);
     assert.strictEqual(master.classList.contains("on"), true);
     assert.strictEqual(master.classList.contains("pending"), false);
+    assert.strictEqual(labels.classList.contains("disabled"), false);
+    assert.strictEqual(labels.attributes["aria-disabled"], undefined);
+    assert.strictEqual(labels.tabIndex, 0);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
     assert.strictEqual(elapsed.attributes["aria-disabled"], undefined);
     assert.strictEqual(elapsed.tabIndex, 0);
     assert.strictEqual(cleanup.classList.contains("disabled"), false);
     assert.strictEqual(cleanup.tabIndex, 0);
+    assert.strictEqual(summary.children.length, 3);
+    assert.strictEqual(summary.classList.contains("compact"), false);
+    assert.strictEqual(summary.children[0].textContent, "Labels: on");
+    assert.strictEqual(summary.children[1].textContent, "Time: on");
+    assert.strictEqual(summary.children[2].textContent, "Auto-clear: on");
 
     assert.ok(
       elapsed.eventListeners.click && elapsed.eventListeners.click.length > 0,
@@ -1335,12 +2993,202 @@ describe("settings renderer browser environment", () => {
     assert.deepStrictEqual(updateCalls, [{ key: "sessionHudShowElapsed", value: false }]);
   });
 
+  it("groups sound and volume into one collapsible control with in-place summary updates", () => {
+    const initialSnapshot = makeGeneralSnapshot({
+      soundMuted: false,
+      soundVolume: 0.5,
+    });
+    const harness = loadGeneralTabForTest({ snapshot: initialSnapshot });
+    harness.renderContent();
+
+    const soundSwitch = harness.getSwitch("soundMuted");
+    const summary = harness.core.state.mountedControls.soundSummary.element;
+    const volumeControl = harness.core.state.mountedControls.soundVolume;
+    const volumeSlider = volumeControl.row.querySelector(".volume-slider");
+    const optionList = harness.content.querySelector(".sound-option-list");
+    assert.ok(soundSwitch);
+    assert.ok(summary);
+    assert.ok(volumeControl);
+    assert.ok(volumeSlider);
+    assert.ok(optionList);
+    assert.ok(optionList.children.every((child) => child.classList.contains("settings-option-item")));
+    assert.strictEqual(harness.getSwitchMeta("soundMuted").row.querySelector(".row-desc"), null);
+    assert.strictEqual(summary.children.length, 2);
+    assert.strictEqual(summary.children[0].textContent, "on · 50%");
+    assert.ok(summary.children[1].classList.contains("sound-header-switch"));
+    assert.strictEqual(summary.children[1].attributes["aria-label"], "Enable sound effects");
+
+    volumeSlider.value = "75";
+    for (const listener of volumeSlider.eventListeners.input || []) listener();
+    assert.strictEqual(summary.children[0].textContent, "on · 75%");
+
+    const beforeRenderCount = harness.getContentRenderCount();
+    harness.core.ops.applyChanges({
+      changes: { soundVolume: 0.25 },
+      snapshot: { ...initialSnapshot, soundVolume: 0.25 },
+    });
+
+    assert.strictEqual(harness.getContentRenderCount(), beforeRenderCount);
+    assert.strictEqual(harness.core.state.mountedControls.soundSummary.element, summary);
+    assert.strictEqual(volumeSlider.value, "25");
+    assert.strictEqual(volumeSlider.style.getPropertyValue("--volume-fill"), "25%");
+    assert.strictEqual(summary.children[0].textContent, "on · 25%");
+
+    harness.core.ops.applyChanges({
+      changes: { soundMuted: true },
+      snapshot: { ...initialSnapshot, soundMuted: true, soundVolume: 0.25 },
+    });
+
+    assert.strictEqual(harness.getContentRenderCount(), beforeRenderCount);
+    assert.strictEqual(harness.getSwitch("soundMuted"), soundSwitch);
+    assert.strictEqual(soundSwitch.classList.contains("on"), false);
+    assert.strictEqual(summary.children[1].classList.contains("on"), false);
+    assert.strictEqual(volumeSlider.disabled, true);
+    assert.strictEqual(summary.children[0].textContent, "off · 25%");
+  });
+
+  it("lets the sound summary switch toggle sound without opening the collapsible group", async () => {
+    const updateCalls = [];
+    const initialSnapshot = makeGeneralSnapshot({
+      soundMuted: false,
+      soundVolume: 1,
+    });
+    const harness = loadGeneralTabForTest({
+      snapshot: initialSnapshot,
+      settingsAPI: {
+        update: (key, value) => {
+          updateCalls.push({ key, value });
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.renderContent();
+
+    const summary = harness.core.state.mountedControls.soundSummary;
+    const headerSwitch = summary.headerSwitch;
+    const soundGroup = harness.content.querySelector(".sound-collapsible");
+    assert.ok(headerSwitch);
+    assert.ok(soundGroup.classList.contains("collapsed"));
+
+    let stopped = false;
+    let prevented = false;
+    headerSwitch.eventListeners.click[0]({
+      stopPropagation: () => { stopped = true; },
+      preventDefault: () => { prevented = true; },
+    });
+    assert.strictEqual(headerSwitch.classList.contains("pending"), true);
+    assert.strictEqual(harness.getSwitch("soundMuted").classList.contains("pending"), true);
+    assert.strictEqual(summary.element.children[0].textContent, "off · 100%");
+    headerSwitch.eventListeners.click[0]({
+      stopPropagation: () => {},
+      preventDefault: () => {},
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(updateCalls, [{ key: "soundMuted", value: true }]);
+    assert.strictEqual(stopped, true);
+    assert.strictEqual(prevented, true);
+    assert.ok(soundGroup.classList.contains("collapsed"));
+    assert.strictEqual(headerSwitch.classList.contains("on"), false);
+    assert.strictEqual(headerSwitch.classList.contains("pending"), false);
+    assert.strictEqual(summary.element.children[0].textContent, "off · 100%");
+  });
+
+  it("keeps the sound child switch and summary in sync while the update is pending", async () => {
+    const updateCalls = [];
+    let resolveUpdate = null;
+    const initialSnapshot = makeGeneralSnapshot({
+      soundMuted: false,
+      soundVolume: 1,
+    });
+    const harness = loadGeneralTabForTest({
+      snapshot: initialSnapshot,
+      settingsAPI: {
+        update: (key, value) => {
+          updateCalls.push({ key, value });
+          return new Promise((resolve) => {
+            resolveUpdate = resolve;
+          });
+        },
+      },
+    });
+    harness.renderContent();
+
+    const summary = harness.core.state.mountedControls.soundSummary;
+    const headerSwitch = summary.headerSwitch;
+    const childSwitch = harness.getSwitch("soundMuted");
+    let stopped = false;
+    let prevented = false;
+    childSwitch.eventListeners.click[0]({
+      stopPropagation: () => { stopped = true; },
+      preventDefault: () => { prevented = true; },
+    });
+
+    assert.deepStrictEqual(updateCalls, [{ key: "soundMuted", value: true }]);
+    assert.strictEqual(stopped, true);
+    assert.strictEqual(prevented, true);
+    assert.strictEqual(childSwitch.classList.contains("on"), false);
+    assert.strictEqual(childSwitch.classList.contains("pending"), true);
+    assert.strictEqual(headerSwitch.classList.contains("on"), false);
+    assert.strictEqual(headerSwitch.classList.contains("pending"), true);
+    assert.strictEqual(summary.element.children[0].textContent, "off · 100%");
+
+    resolveUpdate({ status: "ok" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(childSwitch.classList.contains("on"), false);
+    assert.strictEqual(childSwitch.classList.contains("pending"), false);
+    assert.strictEqual(headerSwitch.classList.contains("on"), false);
+    assert.strictEqual(headerSwitch.classList.contains("pending"), false);
+    assert.strictEqual(summary.element.children[0].textContent, "off · 100%");
+    assert.strictEqual(harness.core.state.transientUiState.generalSwitches.has("soundMuted"), false);
+  });
+
+  it("restores the sound summary switch when a toggle is a noop", async () => {
+    const updateCalls = [];
+    const initialSnapshot = makeGeneralSnapshot({
+      soundMuted: false,
+      soundVolume: 1,
+    });
+    const harness = loadGeneralTabForTest({
+      snapshot: initialSnapshot,
+      settingsAPI: {
+        update: (key, value) => {
+          updateCalls.push({ key, value });
+          return Promise.resolve({ status: "ok", noop: true });
+        },
+      },
+    });
+    harness.renderContent();
+
+    const summary = harness.core.state.mountedControls.soundSummary;
+    const headerSwitch = summary.headerSwitch;
+    const childSwitch = harness.getSwitch("soundMuted");
+    headerSwitch.eventListeners.click[0]({
+      stopPropagation: () => {},
+      preventDefault: () => {},
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(updateCalls, [{ key: "soundMuted", value: true }]);
+    assert.strictEqual(headerSwitch.classList.contains("on"), true);
+    assert.strictEqual(headerSwitch.classList.contains("pending"), false);
+    assert.strictEqual(childSwitch.classList.contains("on"), true);
+    assert.strictEqual(childSwitch.classList.contains("pending"), false);
+    assert.strictEqual(summary.element.children[0].textContent, "on · 100%");
+    assert.strictEqual(harness.core.state.transientUiState.generalSwitches.has("soundMuted"), false);
+  });
+
   it("patches Claude hook management child switch state without rebuilding General content", async () => {
     const updateCalls = [];
     const initialSnapshot = {
       lang: "en",
       size: 50,
       sessionHudEnabled: true,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -1406,6 +3254,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: true,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -1467,11 +3316,14 @@ describe("settings renderer browser environment", () => {
     harness.renderContent();
 
     const master = harness.getSwitch("sessionHudEnabled");
+    const labels = harness.getSwitch("sessionHudShowStateLabels");
     const elapsed = harness.getSwitch("sessionHudShowElapsed");
     const cleanup = harness.getSwitch("sessionHudCleanupDetached");
     assert.ok(master);
+    assert.ok(labels);
     assert.ok(elapsed);
     assert.ok(cleanup);
+    assert.strictEqual(labels.classList.contains("disabled"), false);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
     assert.strictEqual(cleanup.classList.contains("disabled"), false);
 
@@ -1483,9 +3335,13 @@ describe("settings renderer browser environment", () => {
 
     assert.strictEqual(harness.getContentRenderCount(), beforeRenderCount);
     assert.strictEqual(harness.getSwitch("sessionHudEnabled"), master);
+    assert.strictEqual(harness.getSwitch("sessionHudShowStateLabels"), labels);
     assert.strictEqual(harness.getSwitch("sessionHudShowElapsed"), elapsed);
     assert.strictEqual(harness.getSwitch("sessionHudCleanupDetached"), cleanup);
     assert.strictEqual(master.classList.contains("on"), false);
+    assert.strictEqual(labels.classList.contains("disabled"), true);
+    assert.strictEqual(labels.attributes["aria-disabled"], "true");
+    assert.strictEqual(labels.tabIndex, -1);
     assert.strictEqual(elapsed.classList.contains("disabled"), true);
     assert.strictEqual(elapsed.attributes["aria-disabled"], "true");
     assert.strictEqual(elapsed.tabIndex, -1);
@@ -1679,13 +3535,26 @@ describe("settings renderer browser environment", () => {
     assert.ok(coreSource.includes("defaultCollapsed = false"));
     assert.ok(coreSource.includes('header.setAttribute("aria-expanded"'));
     assert.ok(coreSource.includes("collapsibleSummary"));
-    assert.ok(css.includes(".collapsible-group-header"));
-    assert.ok(css.includes(".collapsible-group-chevron"));
+    assert.ok(coreSource.includes("function createDisclosureChevron("));
+    assert.ok(coreSource.includes('createDisclosureChevron("collapsible-group-chevron")'));
+    assert.ok(coreSource.includes('svg.setAttribute("viewBox", "0 0 20 20")'));
+    assert.ok(coreSource.includes('path.setAttribute("d", "M8 5l5 5-5 5")'));
+    assert.ok(!coreSource.includes('chevron.textContent = "\\u25B8";'));
+    assert.ok(!coreSource.includes("chevron.innerHTML"));
+    assert.ok(/\.collapsible-group-header\s*\{[\s\S]*gap:\s*4px;/.test(css));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*center;[\s\S]*width:\s*18px;[\s\S]*height:\s*18px;[\s\S]*opacity:\s*0\.72;/.test(css));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);[\s\S]*transition:[\s\S]*transform 0\.22s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\),[\s\S]*color 0\.16s ease,[\s\S]*opacity 0\.16s ease/.test(css));
+    assert.ok(/\.collapsible-group-chevron svg,\s*\.anim-override-chevron svg\s*\{[\s\S]*width:\s*16px;[\s\S]*height:\s*16px;[\s\S]*overflow:\s*visible;/.test(css));
+    assert.ok(/\.collapsible-group-chevron path,\s*\.anim-override-chevron path\s*\{[\s\S]*fill:\s*none;[\s\S]*stroke:\s*currentColor;[\s\S]*stroke-width:\s*2\.2;[\s\S]*stroke-linecap:\s*round;[\s\S]*stroke-linejoin:\s*round;/.test(css));
+    assert.ok(/\.collapsible-group-header:hover\s+\.collapsible-group-chevron\s*\{[\s\S]*color:\s*var\(--text-secondary\);[\s\S]*opacity:\s*0\.95;/.test(css));
+    assert.ok(/\.collapsible-group\.collapsed\s+\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);/.test(css));
+    assert.ok(/\.collapsible-group:not\(\.collapsed\)\s+\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(90deg\);[\s\S]*color:\s*var\(--accent\);[\s\S]*opacity:\s*1;/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.collapsible-group-chevron,[\s\S]*\.anim-override-chevron,[\s\S]*transition:\s*none;/.test(css));
     assert.ok(i18nSource.includes("collapsibleExpand"));
     assert.ok(i18nSource.includes("collapsibleCollapse"));
   });
 
-  it("groups Theme cards and exposes Codex Pet import actions in Settings", () => {
+  it("groups Theme cards and exposes theme import actions in Settings", () => {
     const tabSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-theme.js"), "utf8");
     const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
     const settingsIpcSource = fs.readFileSync(SETTINGS_IPC, "utf8");
@@ -1698,22 +3567,112 @@ describe("settings renderer browser environment", () => {
     assert.ok(tabSource.includes("themeGroupImportedCodexPets"));
     assert.ok(tabSource.includes("themeGroupUserThemes"));
     assert.ok(tabSource.includes("handleImportCodexPetZip"));
-    assert.ok(tabSource.includes("handleOpenCodexPetsFolder"));
+    assert.ok(tabSource.includes("handleImportUserThemeZip"));
+    assert.ok(!tabSource.includes("themeOpenCodexPetsFolder"));
+    assert.ok(!tabSource.includes("handleOpenCodexPetsFolder"));
+    assert.ok(tabSource.includes("handleOpenUserThemesFolder"));
+    assert.ok(tabSource.includes("handleRefreshThemes"));
     assert.ok(tabSource.includes("handleRemoveCodexPet"));
     assert.ok(tabSource.includes("themeUninstallPetLabel"));
+    assert.ok(tabSource.includes('footer.className = "theme-card-footer";'));
+    assert.ok(tabSource.includes('if (!theme.active) indicator.setAttribute("aria-hidden", "true");'));
+    assert.ok(!tabSource.includes("if (theme.active || canDelete || canRemoveCodexPet)"));
     assert.ok(coreSource.includes("codexPetZipImportPending"));
+    assert.ok(coreSource.includes("userThemeZipImportPending"));
     assert.ok(coreSource.includes("codexPetRemovalPendingThemeId"));
+    assert.ok(preloadSource.includes("openUserThemesDir"));
+    assert.ok(preloadSource.includes("importUserThemeZip"));
     assert.ok(preloadSource.includes("openCodexPetsDir"));
     assert.ok(preloadSource.includes("importCodexPetZip"));
     assert.ok(preloadSource.includes("removeCodexPet"));
+    assert.ok(settingsIpcSource.includes('handle("settings:open-user-themes-dir"'));
+    assert.ok(settingsIpcSource.includes('handle("settings:import-user-theme-zip"'));
     assert.ok(settingsIpcSource.includes('handle("settings:open-codex-pets-dir"'));
     assert.ok(settingsIpcSource.includes('handle("settings:import-codex-pet-zip"'));
     assert.ok(settingsIpcSource.includes('handle("settings:remove-codex-pet"'));
     assert.ok(css.includes(".theme-section-title"));
+    assert.ok(css.includes(".theme-action-group"));
+    assert.ok(css.includes(".theme-action-buttons"));
     assert.ok(css.includes(".theme-uninstall-btn"));
+    assert.ok(/\.theme-card-footer\s*\{[^}]*min-height:\s*26px;[^}]*margin-top:\s*auto;[^}]*\}/.test(css));
+    assert.ok(/\.theme-card-check\s*\{[^}]*white-space:\s*nowrap;[^}]*\}/.test(css));
     assert.ok(i18nSource.includes("themeImportPetZip"));
+    assert.ok(i18nSource.includes("themeImportUserThemeZip"));
+    assert.ok(i18nSource.includes("themeImportUserThemeZipHint"));
+    assert.ok(i18nSource.includes("themeOpenUserThemesFolder"));
+    assert.ok(i18nSource.includes("toastUserThemeZipImportOk"));
     assert.ok(i18nSource.includes("toastCodexPetZipImportOk"));
     assert.ok(i18nSource.includes("toastCodexPetRemoveOk"));
+
+    const strings = loadSettingsI18nForTest();
+    assert.strictEqual(strings.en.themeActionGroupCodexPets, "Codex Pets");
+    assert.strictEqual(strings.en.themeActionGroupUserThemes, "User themes");
+    assert.strictEqual(strings.en.themeImportPetZip, "Import Codex Pet package (.zip)");
+    assert.strictEqual(strings.en.themeImportUserThemeZip, "Import Clawd theme package (.zip)");
+    assert.ok(strings.en.themeImportUserThemeZipHint.includes("theme.json"));
+    assert.strictEqual(strings.en.themeOpenUserThemesFolder, "Open themes folder");
+    assert.strictEqual(strings.en.themeRefreshThemes, "Refresh themes");
+    assert.strictEqual(strings.zh.themeImportPetZip, "导入 Codex Pet 包（.zip）");
+    assert.strictEqual(strings.zh.themeActionGroupCodexPets, "Codex Pets");
+    assert.strictEqual(strings.zh.themeImportUserThemeZip, "导入 Clawd 主题包（.zip）");
+    assert.ok(strings.zh.themeImportUserThemeZipHint.includes("theme.json"));
+    assert.strictEqual(strings.zh.themeOpenUserThemesFolder, "打开主题文件夹");
+  });
+
+  it("keeps Theme card footers reserved without leaking button keyboard events to card activation", async () => {
+    const { content, commands } = loadThemeTabForTest({
+      themes: [
+        { id: "clawd", name: "Clawd", builtin: true, active: true },
+        { id: "calico", name: "Calico", builtin: true, active: false },
+        { id: "pet-active", name: "Pet Active", managedCodexPet: true, active: true },
+        { id: "pet-inactive", name: "Pet Inactive", managedCodexPet: true, active: false },
+        { id: "user-theme", name: "User Theme", active: false },
+      ],
+    });
+
+    const cards = content.querySelectorAll(".theme-card");
+    assert.strictEqual(cards.length, 5);
+    for (const card of cards) {
+      assert.ok(card.querySelector(".theme-card-footer"));
+    }
+
+    const activeChecks = cards
+      .filter((card) => card.getAttribute("aria-checked") === "true")
+      .map((card) => card.querySelector(".theme-card-check"));
+    const inactiveChecks = cards
+      .filter((card) => card.getAttribute("aria-checked") === "false")
+      .map((card) => card.querySelector(".theme-card-check"));
+    assert.ok(activeChecks.length > 0);
+    assert.ok(inactiveChecks.length > 0);
+    for (const indicator of activeChecks) {
+      assert.strictEqual(indicator.getAttribute("aria-hidden"), undefined);
+      assert.ok(indicator.textContent);
+    }
+    for (const indicator of inactiveChecks) {
+      assert.strictEqual(indicator.getAttribute("aria-hidden"), "true");
+      assert.strictEqual(indicator.textContent, "");
+    }
+
+    const deleteButton = content.querySelector(".theme-delete-btn");
+    const inactiveUninstallButton = content.querySelectorAll(".theme-uninstall-btn")
+      .find((button) => {
+        const card = findAncestorByClass(button, "theme-card");
+        return card && card.getAttribute("aria-checked") === "false";
+      });
+    assert.ok(deleteButton);
+    assert.ok(inactiveUninstallButton);
+
+    const deleteKeydown = createKeyboardEventForTest("Enter");
+    deleteButton.dispatchEvent(deleteKeydown);
+    const uninstallKeydown = createKeyboardEventForTest(" ");
+    inactiveUninstallButton.dispatchEvent(uninstallKeydown);
+    await Promise.resolve();
+
+    assert.strictEqual(deleteKeydown.cancelBubble, true);
+    assert.strictEqual(uninstallKeydown.cancelBubble, true);
+    assert.strictEqual(deleteKeydown.defaultPrevented, false);
+    assert.strictEqual(uninstallKeydown.defaultPrevented, false);
+    assert.deepStrictEqual(commands, []);
   });
 
   it("animates collapsible Settings groups with measured height instead of instant hidden jumps", () => {
@@ -1904,6 +3863,67 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(permissionsSwitch.element.classList.contains("disabled"), true);
     assert.strictEqual(permissionsSwitch.element.attributes["aria-disabled"], "true");
     assert.strictEqual(permissionsSwitch.element.attributes.tabindex, "-1");
+  });
+
+  it("enables the Codex native sound switch only in Native permission mode", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+            nativeNotificationSoundEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:codex": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const soundSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "codex" && meta.flag === "nativeNotificationSoundEnabled");
+    assert.ok(soundSwitch, "Codex native sound switch should be mounted");
+    assert.strictEqual(soundSwitch.element.classList.contains("disabled"), true);
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+            nativeNotificationSoundEnabled: true,
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+            nativeNotificationSoundEnabled: true,
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(soundSwitch.element.classList.contains("disabled"), false);
+    assert.strictEqual(soundSwitch.element.attributes["aria-disabled"], "false");
+    assert.strictEqual(soundSwitch.element.attributes.tabindex, "0");
   });
 
   it("slides the Codex permission mode pill when mode broadcasts patch in place", () => {
@@ -2167,6 +4187,25 @@ describe("settings renderer browser environment", () => {
       overridesSource.includes("resetBtn.disabled = !slot.hasStoredOverride;"),
       "sound override row reset must stay enabled when prefs still contain a stale sound override entry"
     );
+  });
+
+  it("uses the shared SVG chevron treatment for Animation Overrides rows", () => {
+    const overridesSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-overrides.js"), "utf8");
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+
+    assert.ok(!overridesSource.includes('chevron.textContent = "\\u25B8";'));
+    assert.ok(!overridesSource.includes("chevron.innerHTML"));
+    assert.ok(overridesSource.includes('helpers.createDisclosureChevron("anim-override-chevron")'));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*center;[\s\S]*width:\s*18px;[\s\S]*height:\s*18px;[\s\S]*opacity:\s*0\.72;/.test(css));
+    assert.ok(/\.collapsible-group-chevron,\s*\.anim-override-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);[\s\S]*transition:[\s\S]*transform 0\.22s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\),[\s\S]*color 0\.16s ease,[\s\S]*opacity 0\.16s ease/.test(css));
+    assert.ok(/\.collapsible-group-chevron svg,\s*\.anim-override-chevron svg\s*\{[\s\S]*width:\s*16px;[\s\S]*height:\s*16px;[\s\S]*overflow:\s*visible;/.test(css));
+    assert.ok(/\.collapsible-group-chevron path,\s*\.anim-override-chevron path\s*\{[\s\S]*fill:\s*none;[\s\S]*stroke:\s*currentColor;[\s\S]*stroke-width:\s*2\.2;[\s\S]*stroke-linecap:\s*round;[\s\S]*stroke-linejoin:\s*round;/.test(css));
+    assert.ok(/\.anim-override-row > summary:hover \.anim-override-chevron\s*\{[\s\S]*color:\s*var\(--text-secondary\);[\s\S]*opacity:\s*0\.95;/.test(css));
+    assert.ok(/\.anim-override-row\[open\]\s*>\s*summary\s+\.anim-override-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(90deg\);[\s\S]*color:\s*var\(--accent\);[\s\S]*opacity:\s*1;/.test(css));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.anim-override-chevron,[\s\S]*transition:\s*none;/.test(css));
+    assert.ok(/\.anim-override-thumb\s*\{[\s\S]*transform:\s*translateX\(-3px\);/.test(css));
+    assert.ok(/\.anim-override-summary-text\s*\{[\s\S]*transform:\s*translateX\(-3px\);/.test(css));
+    assert.ok(!/\.anim-override-summary-change\s*\{[\s\S]*translateX\(-3px\)/.test(css));
   });
 
   it("uses captured poster previews for trusted scripted animation override SVGs", () => {
@@ -2482,6 +4521,24 @@ describe("settings renderer browser environment", () => {
     );
   });
 
+  it("does not treat an empty hitbox override group as a reset-all override", () => {
+    const core = loadSettingsCoreForTest({});
+    core.state.snapshot = {
+      themeOverrides: {
+        cloudling: {
+          hitbox: {
+            wide: {},
+          },
+        },
+      },
+    };
+
+    assert.strictEqual(core.readers.hasAnyThemeOverride("cloudling"), false);
+
+    core.state.snapshot.themeOverrides.cloudling.hitbox.wide["cloudling-thinking.svg"] = true;
+    assert.strictEqual(core.readers.hasAnyThemeOverride("cloudling"), true);
+  });
+
   it("keeps current Animation Overrides data visible while theme override refresh is pending", () => {
     const deferred = createDeferred();
     const core = loadSettingsCoreForTest({
@@ -2602,6 +4659,91 @@ describe("settings renderer browser environment", () => {
     const placeholders = parent.querySelectorAll(".placeholder-desc");
     assert.ok(placeholders.length > 0);
     assert.strictEqual(placeholders[0].textContent, "animOverridesLoading");
+  });
+
+  it("renders Animation Overrides theme actions in two intentional rows", () => {
+    const runtime = createAnimOverridesRuntime(createAnimOverrideCard());
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+
+    core.tabs.animOverrides.render(parent, core);
+
+    const meta = parent.querySelector(".anim-override-meta");
+    assert.ok(meta);
+    assert.deepStrictEqual(
+      meta.querySelectorAll(".anim-override-meta-label").map((label) => label.textContent),
+      ["animOverridesCurrentTheme: Cloudling", "animOverridesReplacementConfig"]
+    );
+
+    const primary = meta.querySelector(".anim-override-meta-primary-actions");
+    const secondary = meta.querySelector(".anim-override-meta-secondary-actions");
+    assert.deepStrictEqual(
+      primary.querySelectorAll("button").map((button) => button.textContent),
+      ["animOverridesOpenThemeTab", "animOverridesOpenAssets"]
+    );
+    assert.deepStrictEqual(
+      secondary.querySelectorAll("button").map((button) => button.textContent),
+      ["animOverridesImport", "animOverridesExport", "animOverridesResetAll"]
+    );
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    assert.match(
+      css,
+      /\.anim-override-meta\s*\{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\) auto;/
+    );
+    assert.match(
+      css,
+      /\.anim-override-meta-actions\s*\{[\s\S]*align-items:\s*center;[\s\S]*justify-content:\s*flex-end;/
+    );
+    assert.match(
+      css,
+      /@media \(max-width:\s*640px\)\s*\{[\s\S]*\.anim-override-meta-actions\s*\{[\s\S]*justify-content:\s*flex-start;/
+    );
+
+    const strings = loadSettingsI18nForTest();
+    assert.strictEqual(strings.en.animOverridesReplacementConfig, "Animation override settings");
+    assert.strictEqual(strings.zh.animOverridesReplacementConfig, "动画覆盖设置");
+    assert.strictEqual(strings.ko.animOverridesReplacementConfig, "애니메이션 덮어쓰기 설정");
+    assert.strictEqual(strings.ja.animOverridesReplacementConfig, "アニメーション上書き設定");
+    assert.strictEqual(strings.en.animOverridesImport, "Import config…");
+    assert.strictEqual(strings.zh.animOverridesImport, "导入配置…");
+    assert.strictEqual(strings.ko.animOverridesImport, "설정 가져오기…");
+    assert.strictEqual(strings.ja.animOverridesImport, "設定をインポート…");
+    assert.strictEqual(strings.en.animOverridesExport, "Export config…");
+    assert.strictEqual(strings.zh.animOverridesExport, "导出配置…");
+    assert.strictEqual(strings.ko.animOverridesExport, "설정 내보내기…");
+    assert.strictEqual(strings.ja.animOverridesExport, "設定をエクスポート…");
+    assert.strictEqual(strings.en.animOverridesResetAll, "Restore theme defaults");
+    assert.strictEqual(strings.zh.animOverridesResetAll, "恢复主题默认");
+    assert.strictEqual(strings.ko.animOverridesResetAll, "테마 기본값으로 복원");
+    assert.strictEqual(strings.ja.animOverridesResetAll, "テーマのデフォルトに戻す");
+    assert.match(
+      css,
+      /@media \(max-width:\s*640px\)\s*\{[\s\S]*\.anim-override-meta\s*\{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/
+    );
+  });
+
+  it("does not build Animation Overrides theme actions on the Sounds subtab", () => {
+    const runtime = createAnimOverridesRuntime(createAnimOverrideCard(), { animOverridesSubtab: "sounds" });
+    const modalRoot = new FakeElement("div");
+    let activationCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      helpersOverrides: {
+        attachActivation: (el, invoke) => {
+          activationCount += 1;
+          if (typeof invoke === "function") el.addEventListener("click", () => invoke());
+          return el;
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+
+    core.tabs.animOverrides.render(parent, core);
+
+    assert.strictEqual(parent.querySelector(".anim-override-meta"), null);
+    assert.strictEqual(activationCount, 1, "only the Sounds directory button should be wired");
   });
 
   it("uses specific fade timing labels and gives the slider label enough room", () => {
@@ -2743,6 +4885,134 @@ describe("settings renderer browser environment", () => {
     );
   });
 
+  it("updates Animation Overrides reset affordances after the first timing commit", async () => {
+    const card = createAnimOverrideCard({
+      transition: { in: 150, out: 150 },
+      transitionThemeDefault: { in: 150, out: 150 },
+      hasTransitionOverride: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const payloads = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (_name, payload) => {
+          payloads.push(payload);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          Object.assign(runtime.animationOverridesData.cards[0], {
+            transition: { in: 160, out: 150 },
+            transitionThemeDefault: { in: 150, out: 150 },
+            hasTransitionOverride: true,
+          });
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    let contentRenderCount = 0;
+    const renderContent = () => {
+      contentRenderCount++;
+      parent.innerHTML = "";
+      core.tabs.animOverrides.render(parent, core);
+    };
+    core.ops.requestRender = ({ content = false, modal = false } = {}) => {
+      if (content) renderContent();
+      if (modal && typeof core.renderHooks.modal === "function") core.renderHooks.modal();
+    };
+    renderContent();
+
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.ok(range);
+    assert.ok(resetButton);
+    assert.strictEqual(resetButton.disabled, true);
+    assert.strictEqual(parent.querySelector(".anim-override-badge-dot"), null);
+
+    range.value = "160";
+    for (const listener of range.eventListeners.input || []) listener();
+    for (const listener of range.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(payloads.length, 1);
+    assert.strictEqual(payloads[0].transitionThemeDefault.in, 150);
+    assert.strictEqual(payloads[0].transitionThemeDefault.out, 150);
+    assert.strictEqual(contentRenderCount, 1, "timing-only commits should keep the content DOM mounted");
+    assert.strictEqual(resetButton.disabled, false, "first timing commit should enable the slot reset button");
+    assert.ok(parent.querySelector(".anim-override-badge-dot"), "first timing commit should show the changed badge");
+  });
+
+  it("clears Animation Overrides reset affordances when timing returns to the theme default", async () => {
+    const card = createAnimOverrideCard({
+      transition: { in: 160, out: 150 },
+      transitionThemeDefault: { in: 150, out: 150 },
+      hasTransitionOverride: true,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const payloads = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (_name, payload) => {
+          payloads.push(payload);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          Object.assign(runtime.animationOverridesData.cards[0], {
+            transition: { in: 150, out: 150 },
+            transitionThemeDefault: { in: 150, out: 150 },
+            hasTransitionOverride: false,
+          });
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+      readersOverrides: {
+        readThemeOverrideMap: () => ({
+          states: {
+            thinking: {
+              transition: { in: 160, out: 150 },
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.ok(range);
+    assert.ok(resetButton);
+    assert.strictEqual(resetButton.disabled, false);
+    assert.ok(parent.querySelector(".anim-override-badge-dot"));
+
+    range.value = "150";
+    for (const listener of range.eventListeners.input || []) listener();
+    for (const listener of range.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(payloads.length, 1);
+    assert.strictEqual(payloads[0].transition.in, 150);
+    assert.strictEqual(payloads[0].transition.out, 150);
+    assert.strictEqual(payloads[0].transitionThemeDefault.in, 150);
+    assert.strictEqual(payloads[0].transitionThemeDefault.out, 150);
+    assert.strictEqual(resetButton.disabled, true, "returning to default timing should disable slot reset");
+    assert.strictEqual(parent.querySelector(".anim-override-badge-dot"), null);
+  });
+
   it("keeps sequential fade timing commits from reverting the previous side", async () => {
     const card = createAnimOverrideCard();
     const runtime = createAnimOverridesRuntime(card);
@@ -2864,6 +5134,611 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
 
     assert.strictEqual(commandCount, 1);
+  });
+
+  it("renders the wide hitbox control as a scoped toggle instead of a full-row label", () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const row = parent.querySelector(".anim-override-toggle-row");
+    const input = parent.querySelectorAll("input").find((candidate) => candidate.type === "checkbox");
+    const title = parent.querySelector(".anim-override-toggle-title");
+
+    assert.ok(row, "expanded animation override row should render a wide-hitbox toggle row");
+    assert.strictEqual(row.tagName, "DIV");
+    assert.strictEqual(input.getAttribute("aria-label"), "animOverridesWideHitboxToggle");
+    assert.ok(title);
+    assert.strictEqual((title.eventListeners.click || []).length, 0);
+  });
+
+  it("uses null to clear wide hitbox overrides that match the theme default and avoids rebuilding content", async () => {
+    const card = createAnimOverrideCard({
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: false,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const payloads = [];
+    let fetchCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (_name, payload) => {
+          payloads.push(payload);
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          fetchCount++;
+          Object.assign(runtime.animationOverridesData.cards[0], fetchCount === 1
+            ? {
+                wideHitboxEnabled: true,
+                wideHitboxOverridden: true,
+                wideHitboxThemeDefault: false,
+              }
+            : {
+                wideHitboxEnabled: false,
+                wideHitboxOverridden: false,
+                wideHitboxThemeDefault: false,
+              });
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    let contentRenderCount = 0;
+    const renderContent = () => {
+      contentRenderCount++;
+      parent.innerHTML = "";
+      core.tabs.animOverrides.render(parent, core);
+    };
+    core.ops.requestRender = ({ content = false, modal = false } = {}) => {
+      if (content) renderContent();
+      if (modal && typeof core.renderHooks.modal === "function") core.renderHooks.modal();
+    };
+    renderContent();
+
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    assert.ok(toggle, "expanded animation override row should render a wide-hitbox checkbox");
+
+    toggle.checked = true;
+    for (const listener of toggle.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+    let resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.ok(parent.querySelector(".anim-override-badge-dot"), "wide-hitbox commit should update the summary changed badge in place");
+    assert.strictEqual(resetButton.disabled, false, "wide-hitbox commit should enable reset affordance in place");
+
+    toggle.checked = false;
+    for (const listener of toggle.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+    resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.strictEqual(parent.querySelector(".anim-override-badge-dot"), null, "theme-default hitbox commit should clear the changed badge in place");
+    assert.strictEqual(resetButton.disabled, true, "theme-default hitbox commit should disable reset affordance in place");
+
+    assert.strictEqual(payloads.length, 2);
+    assert.strictEqual(payloads[0].enabled, true);
+    assert.strictEqual(payloads[1].enabled, null);
+    assert.strictEqual(contentRenderCount, 1, "wide-hitbox toggle commits should not rebuild the content pane");
+  });
+
+  it("shows the wide hitbox reset chip for stale overrides that already match the theme default", () => {
+    const card = createAnimOverrideCard({
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: true,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const resetChip = parent.querySelectorAll("button")
+      .find((button) => button.textContent === "animOverridesWideHitboxResetToTheme");
+    assert.ok(resetChip, "wide-hitbox reset chip should render for stale no-op overrides");
+    assert.strictEqual(resetChip.hidden, false);
+    assert.strictEqual(resetChip.disabled, false);
+  });
+
+  it("shows a fallback error detail when wide hitbox saves fail without a message", async () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const toasts = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => Promise.resolve({ status: "error" }),
+      },
+      opsOverrides: {
+        showToast: (message) => toasts.push(message),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    toggle.checked = true;
+    for (const listener of toggle.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.ok(toasts.some((message) => String(message).includes("unknown error")));
+  });
+
+  it("preserves pending wide hitbox state across full Animation Overrides rerenders", async () => {
+    const card = createAnimOverrideCard({
+      wideHitboxEnabled: false,
+      wideHitboxOverridden: false,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    let resolveCommand;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => new Promise((resolve) => {
+          resolveCommand = resolve;
+        }),
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          Object.assign(runtime.animationOverridesData.cards[0], {
+            wideHitboxEnabled: true,
+            wideHitboxOverridden: true,
+            wideHitboxThemeDefault: false,
+          });
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    const renderContent = () => {
+      parent.innerHTML = "";
+      core.tabs.animOverrides.render(parent, core);
+    };
+    core.ops.requestRender = ({ content = false, modal = false } = {}) => {
+      if (content) renderContent();
+      if (modal && typeof core.renderHooks.modal === "function") core.renderHooks.modal();
+    };
+    renderContent();
+
+    let toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    assert.ok(toggle, "expanded animation override row should render a wide-hitbox checkbox");
+
+    toggle.checked = true;
+    for (const listener of toggle.eventListeners.change || []) listener();
+
+    renderContent();
+
+    toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    const resetChip = parent.querySelectorAll("button")
+      .find((button) => button.textContent === "animOverridesWideHitboxResetToTheme");
+    let resetButton = parent.querySelectorAll("button")
+      .find((button) => button.textContent === "animOverridesReset");
+    assert.ok(toggle, "wide-hitbox checkbox should still exist after rerender");
+    assert.strictEqual(toggle.checked, true, "pending wide-hitbox toggles should stay on across rerenders");
+    assert.strictEqual(toggle.disabled, true, "pending wide-hitbox toggles should stay disabled across rerenders");
+    assert.ok(resetChip, "wide-hitbox reset chip should still exist after rerender");
+    assert.strictEqual(resetChip.hidden, false, "pending wide-hitbox rerenders should keep the reset chip visible");
+    assert.strictEqual(resetChip.disabled, true, "pending wide-hitbox rerenders should keep the reset chip disabled");
+    assert.ok(resetButton, "pending wide-hitbox rerenders should keep the slot reset button mounted");
+    assert.strictEqual(resetButton.disabled, true, "slot reset should stay disabled while a wide-hitbox edit is pending");
+
+    resolveCommand({ status: "ok" });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    resetButton = parent.querySelectorAll("button")
+      .find((button) => button.textContent === "animOverridesReset");
+    assert.strictEqual(toggle.checked, true);
+    assert.strictEqual(toggle.disabled, false);
+    assert.strictEqual(resetButton.disabled, false);
+  });
+
+  it("blocks wide hitbox edits while a same-card timing edit is pending", async () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const calls = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (name, payload) => {
+          calls.push({ name, payload });
+          return new Promise(() => {});
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    range.value = "260";
+    for (const listener of range.eventListeners.change || []) listener();
+
+    assert.strictEqual(toggle.disabled, true, "wide-hitbox toggle should be blocked while timing is pending");
+    toggle.checked = true;
+    for (const listener of toggle.eventListeners.change || []) listener();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(
+      calls.map((call) => call.name),
+      ["setAnimationOverride"],
+      "blocked wide-hitbox changes should not enqueue a second override command"
+    );
+  });
+
+  it("blocks slot reset while a same-card timing edit is pending", async () => {
+    const card = createAnimOverrideCard({
+      hasTransitionOverride: true,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const calls = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (name, payload) => {
+          calls.push({ name, payload });
+          return new Promise(() => {});
+        },
+      },
+      readersOverrides: {
+        readThemeOverrideMap: () => ({
+          states: {
+            thinking: {
+              transition: { in: 120, out: 180 },
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    range.value = "260";
+    for (const listener of range.eventListeners.change || []) listener();
+
+    assert.strictEqual(resetButton.disabled, true, "slot reset should be blocked while timing is pending");
+    for (const listener of resetButton.eventListeners.click || []) listener();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(
+      calls.map((call) => call.name),
+      ["setAnimationOverride"],
+      "blocked slot reset should not enqueue a reset command"
+    );
+  });
+
+  it("blocks timing edits while a same-card wide hitbox edit is pending", async () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const calls = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (name, payload) => {
+          calls.push({ name, payload });
+          return new Promise(() => {});
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    toggle.checked = true;
+    for (const listener of toggle.eventListeners.change || []) listener();
+
+    assert.strictEqual(range.disabled, true, "timing slider should be blocked while wide-hitbox is pending");
+    range.value = "260";
+    for (const listener of range.eventListeners.change || []) listener();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(
+      calls.map((call) => call.name),
+      ["setWideHitboxOverride"],
+      "blocked timing changes should not enqueue a second override command"
+    );
+  });
+
+  it("reconciles acknowledged pending wide hitbox edits during Animation Overrides render", () => {
+    const card = createAnimOverrideCard({
+      wideHitboxEnabled: true,
+      wideHitboxOverridden: true,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    runtime.pendingWideHitboxOverrideEdits = new Map([[
+      card.id,
+      {
+        seq: 1,
+        currentFile: card.currentFile,
+        themeDefault: false,
+        effectiveEnabled: true,
+        commandEnabled: true,
+      },
+    ]]);
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    const resetButton = parent.querySelectorAll("button")
+      .find((button) => button.textContent === "animOverridesReset");
+    assert.strictEqual(runtime.pendingWideHitboxOverrideEdits.size, 0);
+    assert.strictEqual(toggle.disabled, false);
+    assert.strictEqual(resetButton.disabled, false);
+  });
+
+  it("treats hitbox-only overrides as overridden for summary badges and reset actions", () => {
+    const card = createAnimOverrideCard({
+      wideHitboxEnabled: true,
+      wideHitboxOverridden: true,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      readersOverrides: {
+        hasAnyThemeOverride: () => true,
+        readThemeOverrideMap: () => ({
+          hitbox: {
+            wide: {
+              "cloudling-thinking.svg": true,
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const summaryDot = parent.querySelector(".anim-override-badge-dot");
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+
+    assert.ok(summaryDot, "hitbox-only overrides should still show the overridden summary badge");
+    assert.ok(resetButton, "expanded row should render a reset button");
+    assert.strictEqual(resetButton.disabled, false, "hitbox-only overrides should enable the reset button");
+  });
+
+  it("clears hitbox-only overrides when resetting an animation override slot", async () => {
+    const card = createAnimOverrideCard({
+      wideHitboxEnabled: true,
+      wideHitboxOverridden: true,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const calls = [];
+    let resolveAnimationReset;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (name, payload) => {
+          calls.push({ name, payload });
+          if (name === "setAnimationOverride") {
+            return new Promise((resolve) => {
+              resolveAnimationReset = resolve;
+            });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => Promise.resolve(runtime.animationOverridesData),
+      },
+      readersOverrides: {
+        readThemeOverrideMap: () => ({
+          hitbox: {
+            wide: {
+              "cloudling-thinking.svg": true,
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.ok(resetButton, "expanded row should render a reset button");
+    const resetPromises = (resetButton.eventListeners.click || []).map((listener) => listener());
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const toggleWhileResetPending = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    const resetChipWhileResetPending = parent.querySelectorAll("button")
+      .find((button) => button.textContent === "animOverridesWideHitboxResetToTheme");
+    assert.strictEqual(toggleWhileResetPending.disabled, true, "slot reset should block wide-hitbox toggles while pending");
+    assert.strictEqual(resetChipWhileResetPending.disabled, true, "slot reset should block wide-hitbox reset chips while pending");
+
+    resolveAnimationReset({ status: "ok" });
+    await Promise.all(resetPromises);
+
+    assert.deepStrictEqual(
+      calls.map((call) => call.name),
+      ["setAnimationOverride", "setWideHitboxOverride"]
+    );
+    assert.strictEqual(calls[1].payload.enabled, null);
+    assert.strictEqual(runtime.pendingWideHitboxOverrideEdits.size, 0);
+    assert.strictEqual(runtime.pendingAnimationOverrideResets.size, 0);
+  });
+
+  it("clears hitbox overrides for the pre-reset replacement file when resetting a slot", async () => {
+    const replacementFile = "replacement-thinking.svg";
+    const baseFile = "cloudling-thinking.svg";
+    const card = createAnimOverrideCard({
+      currentFile: replacementFile,
+      wideHitboxEnabled: true,
+      wideHitboxOverridden: true,
+      wideHitboxThemeDefault: false,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const calls = [];
+    let resolveAnimationReset;
+    let fetchCount = 0;
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (name, payload) => {
+          calls.push({ name, payload });
+          if (name === "setAnimationOverride") {
+            return new Promise((resolve) => {
+              resolveAnimationReset = resolve;
+            });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+      opsOverrides: {
+        fetchAnimationOverridesData: () => {
+          fetchCount++;
+          if (fetchCount === 1) {
+            Object.assign(runtime.animationOverridesData.cards[0], {
+              currentFile: baseFile,
+              wideHitboxEnabled: true,
+              wideHitboxOverridden: false,
+              wideHitboxThemeDefault: true,
+            });
+          }
+          return Promise.resolve(runtime.animationOverridesData);
+        },
+      },
+      readersOverrides: {
+        readThemeOverrideMap: () => ({
+          states: {
+            thinking: {
+              file: replacementFile,
+            },
+          },
+          hitbox: {
+            wide: {
+              [replacementFile]: true,
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+    assert.ok(resetButton, "expanded row should render a reset button");
+    const resetPromises = (resetButton.eventListeners.click || []).map((listener) => listener());
+    await Promise.resolve();
+    await Promise.resolve();
+
+    resolveAnimationReset({ status: "ok" });
+    await Promise.all(resetPromises);
+
+    assert.deepStrictEqual(
+      calls.map((call) => call.name),
+      ["setAnimationOverride", "setWideHitboxOverride"]
+    );
+    assert.strictEqual(calls[1].payload.file, replacementFile);
+    assert.strictEqual(calls[1].payload.enabled, null);
+    assert.strictEqual(runtime.pendingWideHitboxOverrideEdits.size, 0);
+    assert.strictEqual(runtime.pendingAnimationOverrideResets.size, 0);
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    assert.strictEqual(toggle.checked, true, "base file wide-hitbox default should be restored after reset");
+    assert.strictEqual(toggle.disabled, false);
+  });
+
+  it("clears pending timing edits when animation override commands reject", async () => {
+    const card = createAnimOverrideCard();
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const toasts = [];
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: () => Promise.reject(new Error("ipc failed")),
+      },
+      opsOverrides: {
+        showToast: (message) => toasts.push(message),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const range = parent.querySelectorAll("input").find((input) => input.type === "range");
+    const toggle = parent.querySelectorAll("input").find((input) => input.type === "checkbox");
+    range.value = "260";
+    for (const listener of range.eventListeners.change || []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.strictEqual(runtime.pendingAnimationOverrideEdits.size, 0);
+    assert.strictEqual(toggle.disabled, false, "wide-hitbox toggle should unlock after a rejected timing command");
+    assert.ok(toasts.some((message) => String(message).includes("ipc failed")));
+  });
+
+  it("treats reaction-only overrides as overridden for summary badges and reset actions", () => {
+    const card = createAnimOverrideCard({
+      id: "reaction:clickLeft",
+      slotType: "reaction",
+      reactionKey: "clickLeft",
+      stateKey: undefined,
+      supportsDuration: true,
+      durationMs: 1600,
+      hasDurationOverride: true,
+    });
+    const runtime = createAnimOverridesRuntime(card);
+    const modalRoot = new FakeElement("div");
+    const { core } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      readersOverrides: {
+        hasAnyThemeOverride: () => true,
+        readThemeOverrideMap: () => ({
+          reactions: {
+            clickLeft: {
+              durationMs: 1600,
+            },
+          },
+        }),
+      },
+    });
+    const parent = new FakeElement("main");
+    core.tabs.animOverrides.render(parent, core);
+
+    const summaryDot = parent.querySelector(".anim-override-badge-dot");
+    const resetButton = parent.querySelectorAll("button").find((button) => button.textContent === "animOverridesReset");
+
+    assert.ok(summaryDot, "reaction-only overrides should show the overridden summary badge");
+    assert.ok(resetButton, "expanded row should render a reset button");
+    assert.strictEqual(resetButton.disabled, false, "reaction-only overrides should enable the reset button");
   });
 
   it("does not keep reset-slot null timing values as pending slider edits", async () => {
@@ -3061,6 +5936,81 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(modalRenderCount, 0, "modal render happens after the async fetch settles");
   });
 
+  it("routes default-matching timing broadcasts through applyChanges in place", () => {
+    const core = loadSettingsCoreForTest({
+      getAnimationOverridesData: () => Promise.resolve({
+        theme: { id: "cloudling", name: "Cloudling" },
+        assets: [],
+        sections: [],
+        cards: [{
+          id: "state:thinking",
+          slotType: "state",
+          stateKey: "thinking",
+          transition: { in: 150, out: 150 },
+          transitionThemeDefault: { in: 150, out: 150 },
+          hasTransitionOverride: false,
+        }],
+        sounds: [],
+      }),
+    });
+    core.state.activeTab = "animOverrides";
+    core.state.snapshot = {
+      theme: "cloudling",
+      themeOverrides: {
+        cloudling: {
+          states: {
+            thinking: {
+              transition: { in: 160, out: 150 },
+            },
+          },
+        },
+      },
+    };
+    core.runtime.animationOverridesData = {
+      theme: { id: "cloudling", name: "Cloudling" },
+      assets: [],
+      sections: [],
+      cards: [{
+        id: "state:thinking",
+        slotType: "state",
+        stateKey: "thinking",
+        transition: { in: 160, out: 150 },
+        transitionThemeDefault: { in: 150, out: 150 },
+        hasTransitionOverride: true,
+      }],
+      sounds: [],
+    };
+    core.runtime.animOverridesSubtab = "animations";
+    core.runtime.assetPicker.state = null;
+    core.runtime.pendingAnimationOverrideEdits.set("state:thinking", {
+      seq: 1,
+      slotType: "state",
+      stateKey: "thinking",
+      transition: { in: 150, out: 150 },
+      transitionThemeDefault: { in: 150, out: 150 },
+    });
+
+    let contentRenderCount = 0;
+    core.ops.installRenderHooks({
+      sidebar: () => {},
+      content: () => {
+        contentRenderCount++;
+      },
+      modal: () => {},
+    });
+
+    const nextSnapshot = {
+      theme: "cloudling",
+      themeOverrides: {},
+    };
+    core.ops.applyChanges({
+      changes: { themeOverrides: nextSnapshot.themeOverrides },
+      snapshot: nextSnapshot,
+    });
+
+    assert.strictEqual(contentRenderCount, 0, "default timing ack should avoid rebuilding content");
+  });
+
   it("does not patch mixed-key Animation Overrides broadcasts in place", () => {
     const card = createAnimOverrideCard();
     const runtime = createAnimOverridesRuntime(card);
@@ -3126,6 +6076,7 @@ describe("settings renderer browser environment", () => {
       seq: 1,
     });
     core.state.mountedControls.animOverrideTimingSliders.set("state:thinking:transition.in", { row: {} });
+    core.runtime.pendingAnimationOverrideResets = new Set(["state:thinking"]);
 
     core.ops.applyChanges({
       changes: { theme: "calico" },
@@ -3137,6 +6088,7 @@ describe("settings renderer browser environment", () => {
     });
 
     assert.strictEqual(core.runtime.pendingAnimationOverrideEdits.size, 0);
+    assert.strictEqual(core.runtime.pendingAnimationOverrideResets.size, 0);
     assert.strictEqual(core.state.mountedControls.animOverrideTimingSliders.size, 0);
   });
 

@@ -10,10 +10,14 @@ describe("installer default path exports", () => {
     const codex = require("../hooks/codex-install");
     const cursor = require("../hooks/cursor-install");
     const gemini = require("../hooks/gemini-install");
+    const antigravity = require("../hooks/antigravity-install");
     const codebuddy = require("../hooks/codebuddy-install");
     const kiro = require("../hooks/kiro-install");
     const kimi = require("../hooks/kimi-install");
+    const qwen = require("../hooks/qwen-code-install");
     const opencode = require("../hooks/opencode-install");
+    const pi = require("../hooks/pi-install");
+    const hermes = require("../hooks/hermes-install");
 
     assert.strictEqual(claude.DEFAULT_PARENT_DIR, path.join(home, ".claude"));
     assert.strictEqual(claude.DEFAULT_CONFIG_PATH, path.join(home, ".claude", "settings.json"));
@@ -28,6 +32,9 @@ describe("installer default path exports", () => {
     assert.strictEqual(gemini.DEFAULT_PARENT_DIR, path.join(home, ".gemini"));
     assert.strictEqual(gemini.DEFAULT_CONFIG_PATH, path.join(home, ".gemini", "settings.json"));
 
+    assert.strictEqual(antigravity.DEFAULT_PARENT_DIR, path.join(home, ".gemini", "config"));
+    assert.strictEqual(antigravity.DEFAULT_CONFIG_PATH, path.join(home, ".gemini", "config", "hooks.json"));
+
     assert.strictEqual(codebuddy.DEFAULT_PARENT_DIR, path.join(home, ".codebuddy"));
     assert.strictEqual(codebuddy.DEFAULT_CONFIG_PATH, path.join(home, ".codebuddy", "settings.json"));
 
@@ -37,7 +44,16 @@ describe("installer default path exports", () => {
     assert.strictEqual(kimi.DEFAULT_PARENT_DIR, path.join(home, ".kimi"));
     assert.strictEqual(kimi.DEFAULT_CONFIG_PATH, path.join(home, ".kimi", "config.toml"));
 
+    assert.strictEqual(qwen.DEFAULT_PARENT_DIR, path.join(home, ".qwen"));
+    assert.strictEqual(qwen.DEFAULT_CONFIG_PATH, path.join(home, ".qwen", "settings.json"));
+
     assert.strictEqual(opencode.DEFAULT_PARENT_DIR, path.join(home, ".config", "opencode"));
     assert.strictEqual(opencode.DEFAULT_CONFIG_PATH, path.join(home, ".config", "opencode", "opencode.json"));
+
+    assert.strictEqual(pi.DEFAULT_PARENT_DIR, path.join(home, ".pi", "agent"));
+    assert.strictEqual(pi.DEFAULT_EXTENSION_DIR, path.join(home, ".pi", "agent", "extensions", "clawd-on-desk"));
+
+    assert.strictEqual(hermes.DEFAULT_PARENT_DIR, path.join(home, ".hermes"));
+    assert.strictEqual(hermes.DEFAULT_PLUGIN_DIR, path.join(home, ".hermes", "plugins", "clawd-on-desk"));
   });
 });

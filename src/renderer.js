@@ -3,9 +3,12 @@
 // Reactions are triggered via IPC from main (relayed from hit window).
 
 const container = document.getElementById("pet-container");
+const clipLayer = document.getElementById("pet-clip");
 let clawdEl = document.getElementById("clawd");
 let pendingNext = null;
 const LOW_POWER_IDLE_PAUSE_MS = 5000;
+const SWAP_LOAD_FALLBACK_MS = 3000;
+const SWAP_VISIBILITY_RESCUE_BUFFER_MS = 750;
 const LOW_POWER_PAUSE_STYLE_ID = "clawd-low-power-pause-svg";
 const LOW_POWER_PAUSE_STATES = new Set(["idle", "mini-idle", "dozing"]);
 const LOW_POWER_BOUNDARY_EPSILON_MS = 80;
@@ -34,6 +37,7 @@ function initWithConfig(cfg) {
   _miniViewBox = tc.miniModeViewBox || null;
   _fileViewBoxes = tc.fileViewBoxes || {};
   _dragSvg = tc.dragSvg || null;
+  _dragSvgs = tc.dragSvgs || {};
   _idleFollowSvg = tc.idleFollowSvg || "clawd-idle-follow.svg";
   _glyphFlipDefs = tc.glyphFlips || { "pixel-z": 4, "pixel-z-small": 3 };
 
@@ -99,6 +103,15 @@ function getCurrentSvgRoot() {
   } catch {
     return null;
   }
+}
+
+function setCurrentScriptedSvgLowPowerPaused(paused) {
+  const target = clawdEl;
+  if (!target || target.tagName !== "OBJECT") return;
+  try {
+    const fn = target.contentWindow && target.contentWindow.__clawdSetLowPowerPaused;
+    if (typeof fn === "function") fn(!!paused);
+  } catch {}
 }
 
 function shouldPauseForLowPower() {
@@ -201,6 +214,7 @@ function pauseCurrentSvgForLowPower({ waitForBoundary = false } = {}) {
   try {
     if (typeof root.pauseAnimations === "function") root.pauseAnimations();
   } catch {}
+  setCurrentScriptedSvgLowPowerPaused(true);
   setLowPowerSvgPaused(true);
 }
 
@@ -218,6 +232,7 @@ function resumeCurrentSvgForLowPower() {
       if (typeof root.unpauseAnimations === "function") root.unpauseAnimations();
     } catch {}
   }
+  setCurrentScriptedSvgLowPowerPaused(false);
   setLowPowerSvgPaused(false);
 }
 
@@ -331,6 +346,8 @@ let _imgCacheBustSeq = 0;
 let _miniViewBox = null;
 let _fileViewBoxes = {};
 let _dragSvg;
+let _dragSvgs;
+let currentDragSvg = null;
 let _idleFollowSvg;
 let _glyphFlipDefs;
 let _objectScaleCSS;
@@ -428,10 +445,40 @@ window.electronAPI.onMiniModeChange((enabled, edge, options) => {
   } else {
     removeGlyphFlipCompensation(clawdEl);
   }
+  if (!enabled) applyMiniClip(null);
   if (shouldUseCloudlingPointerBridge(currentState, currentDisplayedSvg) && lastCloudlingPointerPayload) {
     applyCloudlingPointerBridge(lastCloudlingPointerPayload);
   }
 });
+
+// Multi-monitor seam clip: in mini mode at an internal seam, main sends the
+// fraction of the window width that falls on the local display. We clip the
+// rest away so the half that physically crosses onto the neighbouring
+// monitor renders nothing there — the local display keeps the half-body peek.
+//
+// The clip is applied to #pet-clip, which (unlike #pet-container) never
+// carries transform: scaleX(-1). A clip-path on the flipped container would
+// be mirrored too, so a left-edge clip would land on the wrong half; the
+// unflipped wrapper keeps `inset()` in screen space for both edges.
+function applyMiniClip(info) {
+  if (!clipLayer) return;
+  if (!info || !Number.isFinite(info.fraction)) {
+    clipLayer.style.clipPath = "";
+    return;
+  }
+  const f = Math.max(0, Math.min(1, info.fraction));
+  if (info.edge === "left") {
+    // Local display lies to the RIGHT of the seam — keep [f, 1], clip the left.
+    clipLayer.style.clipPath = `inset(0 0 0 ${f * 100}%)`;
+  } else {
+    // Local display lies to the LEFT of the seam — keep [0, f], clip the right.
+    clipLayer.style.clipPath = `inset(0 ${(1 - f) * 100}% 0 0)`;
+  }
+}
+
+if (window.electronAPI && typeof window.electronAPI.onMiniClip === "function") {
+  window.electronAPI.onMiniClip(applyMiniClip);
+}
 
 // Counter-flip asymmetric pixel-art glyphs (Zzz) inside SVG defs so they
 // render correctly when the container has scaleX(-1). Only the glyph shape
@@ -566,7 +613,7 @@ function getAssetUrl(file) {
 }
 
 // --- IPC-triggered reactions (from hit window via main relay) ---
-window.electronAPI.onStartDragReaction(() => startDragReaction());
+window.electronAPI.onStartDragReaction((direction) => startDragReaction(direction));
 window.electronAPI.onEndDragReaction(() => endDragReaction());
 window.electronAPI.onPlayClickReaction((svg, duration) => playReaction(svg, duration));
 
@@ -601,26 +648,29 @@ function cancelReaction() {
 }
 
 // --- Drag reaction (loops while dragging) ---
-function startDragReaction() {
-  if (isDragReacting) return;
+function startDragReaction(direction) {
   if (dndEnabled) return;
-  if (!_dragSvg) return;
+  const dragSvg = (direction && _dragSvgs[direction]) || _dragSvg;
+  if (!dragSvg) return;
+  if (isDragReacting && currentDragSvg === dragSvg) return;
 
-  if (isReacting) {
+  if (!isDragReacting && isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
   }
 
   isDragReacting = true;
+  currentDragSvg = dragSvg;
   detachEyeTracking();
   resumeCurrentSvgForLowPower();
   window.electronAPI.pauseCursorPolling();
-  swapToFile(_dragSvg, null);
+  swapToFile(dragSvg, null);
 }
 
 function endDragReaction() {
   if (!isDragReacting) return;
   isDragReacting = false;
+  currentDragSvg = null;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -629,6 +679,8 @@ let currentDisplayedSvg = getObjectSvgName(clawdEl);
 let currentDisplayedAssetUrl = null;
 let pendingSvgFile = null; // tracks the SVG currently being loaded (for dedup)
 let pendingAssetUrl = null;
+let activeSwapToken = 0;
+let swapVisibilityRescueTimer = null;
 currentIdleSvg = currentDisplayedSvg;
 
 /**
@@ -647,7 +699,75 @@ function fadeOutAndRemove(el, durationMs) {
   }, durationMs);
 }
 
-function swapToFile(file, state, useObjectChannel) {
+function getPetMediaElements() {
+  return [...container.querySelectorAll("object, img.clawd-img")];
+}
+
+function isVisiblyOpaque(el) {
+  if (!el || !el.isConnected) return false;
+  let opacity = 1;
+  try {
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    opacity = Number.parseFloat((style && style.opacity) || el.style.opacity || "1");
+  } catch {
+    opacity = Number.parseFloat(el.style.opacity || "1");
+  }
+  return !Number.isFinite(opacity) || opacity > 0.05;
+}
+
+function hasVisiblePetElement() {
+  return getPetMediaElements().some(isVisiblyOpaque);
+}
+
+function forceVisiblePetElement(el) {
+  if (!el || !el.isConnected) return false;
+  el.style.transition = "none";
+  el.style.opacity = "1";
+  return true;
+}
+
+function clearSwapVisibilityRescueTimer() {
+  if (swapVisibilityRescueTimer) {
+    clearTimeout(swapVisibilityRescueTimer);
+    swapVisibilityRescueTimer = null;
+  }
+}
+
+function getSwapVisibilityRescueDelay(file) {
+  const fadeInMs = (_transitions[file] && _transitions[file].in) || 0;
+  return Math.max(SWAP_LOAD_FALLBACK_MS + SWAP_VISIBILITY_RESCUE_BUFFER_MS, fadeInMs + SWAP_VISIBILITY_RESCUE_BUFFER_MS);
+}
+
+function scheduleSwapVisibilityRescue(token, file, state) {
+  clearSwapVisibilityRescueTimer();
+  const timer = setTimeout(() => {
+    if (swapVisibilityRescueTimer === timer) swapVisibilityRescueTimer = null;
+    if (token !== activeSwapToken) return;
+    if (hasVisiblePetElement()) return;
+
+    if (pendingNext && pendingSvgFile === file) {
+      forceImageChannelReload(file, state);
+      return;
+    }
+
+    if (forceVisiblePetElement(clawdEl)) return;
+    forceImageChannelReload(file, state);
+  }, getSwapVisibilityRescueDelay(file));
+  swapVisibilityRescueTimer = timer;
+}
+
+function forceImageChannelReload(file, state, allowImageFallback = true) {
+  if (!allowImageFallback) return false;
+  if (!file) return false;
+  if (hasVisiblePetElement()) return false;
+  console.warn("Clawd: animation stayed invisible; reloading through the image channel:", file);
+  swapToFile(file, state, false, { allowImageFallback: false });
+  return true;
+}
+
+function swapToFile(file, state, useObjectChannel, options = {}) {
+  const swapToken = ++activeSwapToken;
+  const allowImageFallback = options.allowImageFallback !== false;
   if (pendingNext) {
     if (pendingNext.tagName === "OBJECT") releaseObject(pendingNext);
     else releaseImg(pendingNext);
@@ -670,6 +790,7 @@ function swapToFile(file, state, useObjectChannel) {
 
     const swap = () => {
       if (pendingNext !== next) return;
+      if (swapToken === activeSwapToken) clearSwapVisibilityRescueTimer();
       const fadeInMs = (_transitions[file] && _transitions[file].in) || 0;
       const fadeOutMs = (currentDisplayedSvg && _transitions[currentDisplayedSvg] && _transitions[currentDisplayedSvg].out) || 0;
 
@@ -709,6 +830,7 @@ function swapToFile(file, state, useObjectChannel) {
     next.data = url;
     container.appendChild(next);
     pendingNext = next;
+    scheduleSwapVisibilityRescue(swapToken, file, state);
     setTimeout(() => {
       if (pendingNext !== next) return;
       try {
@@ -717,11 +839,12 @@ function swapToFile(file, state, useObjectChannel) {
           pendingNext = null;
           pendingSvgFile = null;
           pendingAssetUrl = null;
+          forceImageChannelReload(file, state, allowImageFallback);
           return;
         }
       } catch {}
       swap();
-    }, 3000);
+    }, SWAP_LOAD_FALLBACK_MS);
   } else {
     // Img channel: <img> for pure playback (all formats)
     const next = document.createElement("img");
@@ -733,6 +856,7 @@ function swapToFile(file, state, useObjectChannel) {
 
     const swap = () => {
       if (pendingNext !== next) return;
+      if (swapToken === activeSwapToken) clearSwapVisibilityRescueTimer();
       const fadeInMs = (_transitions[file] && _transitions[file].in) || 0;
       const fadeOutMs = (currentDisplayedSvg && _transitions[currentDisplayedSvg] && _transitions[currentDisplayedSvg].out) || 0;
 
@@ -775,11 +899,12 @@ function swapToFile(file, state, useObjectChannel) {
     next.src = `${url}${url.includes("?") ? "&" : "?"}_t=${cacheBust}`;
     container.appendChild(next);
     pendingNext = next;
+    scheduleSwapVisibilityRescue(swapToken, file, state);
     // Timeout fallback for images that fail to load
     setTimeout(() => {
       if (pendingNext !== next) return;
       swap();
-    }, 3000);
+    }, SWAP_LOAD_FALLBACK_MS);
   }
 }
 
@@ -1166,6 +1291,72 @@ if (window.electronAPI && typeof window.electronAPI.onCloudlingPointer === "func
 
 // --- Sound playback (IPC from main, receives { url, volume } from theme) ---
 const _audioCache = {};
+const AUDIO_WARMUP_STALE_MS = 10000;
+const AUDIO_WARMUP_DELAY_MS = 50;
+const AUDIO_WARMUP_VOLUME = 0.001;
+let _lastAudioWarmupAt = 0;
+
+function reportSoundPlaybackError(phase, err) {
+  const message = err && err.message ? err.message : String(err || "unknown");
+  if (window.electronAPI && typeof window.electronAPI.reportSoundPlaybackError === "function") {
+    window.electronAPI.reportSoundPlaybackError({ phase, message });
+    return;
+  }
+  try { console.warn(`Clawd sound ${phase} failed:`, message); } catch {}
+}
+
+function cacheAudio(url) {
+  if (typeof url !== "string" || !url) return null;
+  let audio = _audioCache[url];
+  const created = !audio;
+  if (!audio) {
+    audio = new Audio(url);
+    audio.preload = "auto";
+    _audioCache[url] = audio;
+  }
+  if (created) {
+    try { audio.load(); } catch {}
+  }
+  return audio;
+}
+
+function normalizeSoundUrls(payload) {
+  const raw = Array.isArray(payload)
+    ? payload
+    : (payload && Array.isArray(payload.urls) ? payload.urls : []);
+  return raw.filter((url) => typeof url === "string" && url);
+}
+
+function warmAudioOutput(url, { force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - _lastAudioWarmupAt < AUDIO_WARMUP_STALE_MS) {
+    return Promise.resolve();
+  }
+  if (!url) return Promise.resolve();
+  _lastAudioWarmupAt = now;
+
+  const primer = new Audio(url);
+  primer.preload = "auto";
+  primer.volume = AUDIO_WARMUP_VOLUME;
+  return primer.play()
+    .then(() => new Promise((resolve) => {
+      setTimeout(() => {
+        try { primer.pause(); } catch {}
+        resolve();
+      }, AUDIO_WARMUP_DELAY_MS);
+    }))
+    .catch((err) => {
+      reportSoundPlaybackError("warmup", err);
+    });
+}
+
+if (window.electronAPI && typeof window.electronAPI.onPreloadSounds === "function") {
+  window.electronAPI.onPreloadSounds((payload) => {
+    const urls = normalizeSoundUrls(payload);
+    urls.forEach((url) => cacheAudio(url));
+  });
+}
+
 window.electronAPI.onPlaySound((payload) => {
   const url = typeof payload === "string" ? payload : payload && payload.url;
   const volume = typeof payload === "object" && payload && typeof payload.volume === "number"
@@ -1177,14 +1368,14 @@ window.electronAPI.onPlaySound((payload) => {
   // for no benefit since the URL will never be requested again. Only cache
   // real playback URLs.
   const isPreview = url.includes("_t=");
-  let audio = !isPreview ? _audioCache[url] : null;
-  if (!audio) {
-    audio = new Audio(url);
-    if (!isPreview) _audioCache[url] = audio;
-  }
-  audio.volume = volume;
-  audio.currentTime = 0;
-  audio.play().catch(() => {});
+  const audio = isPreview ? new Audio(url) : cacheAudio(url);
+  if (!audio) return;
+  if (isPreview) audio.preload = "auto";
+  warmAudioOutput(url).then(() => {
+    audio.volume = volume;
+    audio.currentTime = 0;
+    audio.play().catch((err) => reportSoundPlaybackError("play", err));
+  });
 });
 // Same-extension override replacement overwrites the file on disk without
 // changing the URL, so the cached Audio object keeps its old buffered data.

@@ -457,7 +457,11 @@ function createSettingsController({
         if (persisted.status !== "ok") return persisted;
       }
     }
-    return { status: "ok", message: result.message };
+    // Pass through command-produced metadata (noop / reason / targetDrift /
+    // anything a future command needs the IPC layer to see). Strip `commit`
+    // since that's a controller-internal payload, not for callers.
+    const { commit: _commit, ...meta } = result;
+    return { ...meta, status: "ok", message: result.message };
   }
 
   function getSnapshot() {

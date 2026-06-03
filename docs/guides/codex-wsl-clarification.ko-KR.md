@@ -1,6 +1,6 @@
 # Codex + WSL 현황 정리
 
-최종 확인 날짜: 2026-04-26
+최종 확인 날짜: 2026-05-08
 
 이 문서는 자주 뒤섞여서 전달되는 세 가지 질문을 분리해서 설명합니다.
 
@@ -13,7 +13,7 @@
 ## TL;DR
 
 - OpenAI는 Codex의 WSL2 실행을 공식적으로 안내합니다.
-- OpenAI의 현재 Hooks 문서는 Codex hooks를 `[features].codex_hooks = true` feature flag로 활성화한다고 설명합니다.
+- 현재 Codex CLI는 hooks를 `[features].hooks = true` feature flag로 활성화합니다. 이전 버전과 일부 문서에서 쓰던 `[features].codex_hooks` 키는 deprecated 되었습니다.
 - Clawd는 이제 Codex official hooks를 기본 경로로 사용하고, `~/.codex/sessions` JSONL 폴링을 fallback으로 유지합니다.
 - Windows native Codex hooks는 2026-04-26에 로컬에서 검증되었습니다. Windows hook command는 PowerShell의 `&` 호출 연산자를 사용해야 합니다.
 - Clawd가 Windows에서 실행되고 Codex가 기본 Linux home을 쓰는 WSL 안에서 실행되면, Clawd는 `/home/<user>/.codex/sessions`를 자동으로 읽지 못합니다.
@@ -51,12 +51,14 @@ OpenAI 문서는 다음도 함께 명시합니다.
 
 ### Codex hooks는 feature flag 뒤에 있습니다
 
-OpenAI의 Hooks 문서는 현재 hooks를 다음 feature flag로 활성화한다고 설명합니다.
+현재 Codex CLI는 hooks를 다음 feature flag로 활성화합니다.
 
 ```toml
 [features]
-codex_hooks = true
+hooks = true
 ```
+
+이전 버전과 일부 문서는 `codex_hooks` 키를 사용했지만, 최신 Codex CLI는 이 키를 deprecated로 안내합니다.
 
 같은 문서는 `hooks.json`, 공통 입력 필드, `PermissionRequest`, `tool_input.description`, 그리고 현재 지원하지 않는 `PermissionRequest` decision 필드가 fail-closed 되는 동작도 설명합니다.
 
@@ -64,7 +66,7 @@ codex_hooks = true
 
 - <https://developers.openai.com/codex/hooks>
 
-Clawd의 Codex installer는 `~/.codex/hooks.json`를 쓰고, 사용자가 `codex_hooks = false`를 명시하지 않은 경우 이 feature flag를 켭니다. 사용자가 false로 꺼 둔 경우에는 경고만 출력하고 강제로 바꾸지 않습니다.
+Clawd의 Codex installer는 `~/.codex/hooks.json`를 쓰고, 사용자가 hooks를 명시적으로 끄지 않은 경우 이 feature flag를 켭니다. deprecated된 `codex_hooks` 키가 있으면 `hooks`로 마이그레이션하되, 사용자가 명시한 false 값은 유지합니다.
 
 ### WSL과 Windows는 기본적으로 `.codex`를 공유하지 않습니다
 
@@ -167,10 +169,10 @@ Fallback monitor에서 `~`는 현재 실행 중인 프로세스의 `os.homedir()
 
 ## 4. 현재 가장 정확한 결론
 
-2026-04-26 기준으로 가장 정확한 결론은 다음과 같습니다.
+2026-05-08 기준으로 가장 정확한 결론은 다음과 같습니다.
 
 1. OpenAI는 Codex의 WSL2 실행을 공식적으로 지원합니다.
-2. OpenAI는 Codex hooks를 `codex_hooks` feature flag로 문서화하고 있습니다.
+2. 현재 Codex CLI는 `hooks` feature flag를 사용하며, `codex_hooks`는 deprecated 되었습니다.
 3. Clawd는 Codex official hooks를 기본 경로로 사용하고 JSONL 폴링을 fallback으로 유지합니다.
 4. Clawd는 현재 호스트 머신의 `.codex` home에 hooks를 동기화하고 fallback logs를 폴링합니다.
 5. 따라서 Codex가 WSL2 안에서 Linux 기본 `~/.codex`를 사용하면 Windows Clawd는 그 세션을 기본값으로 자동 감지하지 못합니다.

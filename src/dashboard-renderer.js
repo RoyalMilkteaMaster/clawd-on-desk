@@ -6,10 +6,13 @@ const AGENT_LABELS = {
   "copilot-cli": "Copilot",
   "cursor-agent": "Cursor Agent",
   "gemini-cli": "Gemini",
+  "antigravity-cli": "Antigravity",
   "kiro-cli": "Kiro",
   "kimi-cli": "Kimi",
   opencode: "opencode",
   codebuddy: "CodeBuddy",
+  pi: "Pi",
+  openclaw: "OpenClaw",
 };
 
 let snapshot = { sessions: [], groups: [], orderedIds: [] };
@@ -272,15 +275,60 @@ function createCard(session, now) {
   actions.className = "actions";
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = t("dashboardJumpTerminal");
-  button.disabled = !session.sourcePid;
-  button.addEventListener("click", () => {
+  const focusTargetType = session.focusTarget && session.focusTarget.type;
+  button.textContent = focusTargetType === "codex-thread"
+    ? t("dashboardOpenCodexSession")
+    : t("dashboardJumpTerminal");
+  button.disabled = session.canFocus !== true;
+  button.addEventListener("click", async () => {
     window.dashboardAPI.focusSession(session.id);
+    // Best-effort ack alongside focus. Most remote-Codex sessions have
+    // canFocus=false (no terminal-jump target) and reach ack through the
+    // Mark-read button instead, but local Codex Stop sessions can land
+    // here so we ack on focus too.
+    if (window.dashboardAPI && typeof window.dashboardAPI.ackCompletion === "function") {
+      try { await window.dashboardAPI.ackCompletion(session.id); }
+      catch (err) { console.warn("ack completion threw:", err); }
+    }
   });
   actions.appendChild(button);
+
+  if (session.requiresCompletionAck === true) {
+    actions.appendChild(createMarkReadButton(session));
+  }
+
   card.appendChild(actions);
 
   return card;
+}
+
+function createMarkReadButton(session) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "mark-read-button";
+  button.textContent = t("dashboardMarkRead");
+  button.title = t("dashboardMarkReadTitle");
+  button.setAttribute("aria-label", t("dashboardMarkReadTitle"));
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    if (!session || !session.id || !window.dashboardAPI || typeof window.dashboardAPI.ackCompletion !== "function") return;
+    button.disabled = true;
+    try {
+      const result = await window.dashboardAPI.ackCompletion(session.id);
+      if (!result || (result.status !== "ok" && result.status !== "noop")) {
+        // Failure path: re-enable so the user can try again. Successful
+        // ack keeps the button disabled — the next forced snapshot will
+        // strip requiresCompletionAck and the button disappears on
+        // re-render.
+        button.disabled = false;
+        console.warn("ack completion failed:", result && result.message);
+      }
+    } catch (err) {
+      button.disabled = false;
+      console.warn("ack completion threw:", err);
+    }
+  });
+  return button;
 }
 
 function deriveGroups(currentSnapshot) {

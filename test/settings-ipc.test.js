@@ -5,6 +5,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const zlib = require("node:zlib");
 
 const { registerSettingsIpc } = require("../src/settings-ipc");
 
@@ -47,6 +48,68 @@ function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "clawd-settings-ipc-"));
 }
 
+function makeZip(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name, "utf8");
+    const raw = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data || "");
+    const method = entry.method == null ? 0 : entry.method;
+    const flags = entry.flags == null ? 0x0800 : entry.flags;
+    const compressed = method === 8 ? zlib.deflateRawSync(raw) : raw;
+    const declaredUncompressedSize = entry.uncompressedSize == null ? raw.length : entry.uncompressedSize;
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(0, 10);
+    local.writeUInt32LE(0, 14);
+    local.writeUInt32LE(compressed.length, 18);
+    local.writeUInt32LE(declaredUncompressedSize, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, name, compressed);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(0, 12);
+    central.writeUInt32LE(0, 16);
+    central.writeUInt32LE(compressed.length, 20);
+    central.writeUInt32LE(declaredUncompressedSize, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, name);
+
+    offset += local.length + name.length + compressed.length;
+  }
+
+  const centralOffset = offset;
+  const central = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(central.length, 12);
+  eocd.writeUInt32LE(centralOffset, 16);
+  eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, central, eocd]);
+}
+
 function createHarness(overrides = {}) {
   const calls = [];
   const ipcMain = new FakeIpcMain();
@@ -71,6 +134,7 @@ function createHarness(overrides = {}) {
     getSoundUrl: () => null,
     listThemesWithMetadata: () => [],
     getThemeMetadata: (themeId) => ({ name: themeId }),
+    ensureUserThemesDir: () => path.join(os.tmpdir(), "clawd-user-themes"),
   };
   const codexPetMain = overrides.codexPetMain || {
     decorateThemeMetadata: (theme) => theme,
@@ -124,8 +188,13 @@ function createHarness(overrides = {}) {
     getSoundMuted: overrides.getSoundMuted || (() => false),
     getSoundVolume: overrides.getSoundVolume || (() => 0.4),
     getAllAgents: overrides.getAllAgents || (() => []),
+    getHardwareBuddyStatus: overrides.getHardwareBuddyStatus || (() => null),
+    testHardwareBuddyApproval: overrides.testHardwareBuddyApproval,
+    getQuickCommandPresets: overrides.getQuickCommandPresets,
+    sendQuickCommand: overrides.sendQuickCommand,
     checkForUpdates: (manual) => calls.push(["checkForUpdates", manual]),
     aboutHeroSvgPath: overrides.aboutHeroSvgPath || path.join(__dirname, "missing-about-hero.svg"),
+    getLanWsServer: overrides.getLanWsServer || (() => null),
     now: overrides.now || (() => 12345),
   });
   return { ipcMain, runtime, calls, activeTheme };
@@ -137,6 +206,11 @@ test("settings IPC registers owned channels and leaves animation override channe
   assert.ok(ipcMain.handlers.has("settings:get-snapshot"));
   assert.ok(ipcMain.handlers.has("settings:pick-sound-file"));
   assert.ok(ipcMain.handlers.has("settings:list-themes"));
+  assert.ok(ipcMain.handlers.has("settings:test-hardware-buddy-approval"));
+  assert.ok(ipcMain.handlers.has("settings:get-quick-command-presets"));
+  assert.ok(ipcMain.handlers.has("settings:send-quick-command"));
+  assert.ok(ipcMain.handlers.has("settings:open-user-themes-dir"));
+  assert.ok(ipcMain.handlers.has("settings:import-user-theme-zip"));
   assert.ok(ipcMain.handlers.has("settings:refresh-codex-pets"));
   assert.ok(!ipcMain.listeners.has("settings:open-dashboard"));
   assert.ok(!ipcMain.handlers.has("settings:getShortcutFailures"));
@@ -155,6 +229,44 @@ test("settings IPC registers owned channels and leaves animation override channe
   assert.strictEqual(ipcMain.listeners.size, 0);
 });
 
+test("mobile connection info reports starting until the LAN bridge has a port", async () => {
+  const token = "0123456789abcdef0123456789abcdef";
+  const { ipcMain, runtime } = createHarness({
+    getLanWsServer: () => ({
+      getPort: () => null,
+      getToken: () => token,
+    }),
+  });
+
+  const result = await ipcMain.invoke("settings:mobile-connection-info");
+
+  assert.deepStrictEqual(result, {
+    status: "starting",
+    message: "LAN bridge is starting",
+  });
+  runtime.dispose();
+});
+
+test("mobile connection info returns a ready pair URL only when port and token are available", async () => {
+  const token = "0123456789abcdef0123456789abcdef";
+  const { ipcMain, runtime } = createHarness({
+    getLanWsServer: () => ({
+      getPort: () => 23334,
+      getToken: () => token,
+    }),
+  });
+
+  const result = await ipcMain.invoke("settings:mobile-connection-info");
+
+  assert.strictEqual(result.status, "ok");
+  assert.strictEqual(result.port, 23334);
+  assert.strictEqual(result.token, token);
+  assert.ok(result.pairUrl.includes("port=23334"));
+  assert.ok(result.pairUrl.includes(`token=${token}`));
+  assert.ok(!result.pairUrl.includes("port=null"));
+  runtime.dispose();
+});
+
 test("settings IPC delegates controller and size preview handlers", async () => {
   const { ipcMain, calls } = createHarness();
 
@@ -168,8 +280,26 @@ test("settings IPC delegates controller and size preview handlers", async () => 
     key: "size",
     value: "P:20",
   });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:update", { key: "tgMigration", value: { transport: "native" } }), {
+    status: "error",
+    message: "tgMigration is internal; use telegramMigration.dispatch",
+  });
   assert.deepStrictEqual(await ipcMain.invoke("settings:command", { action: "resizePet", payload: "P:30" }), {
     status: "ok",
+  });
+  assert.strictEqual(await ipcMain.invoke("settings:get-hardware-buddy-status"), null);
+  assert.deepStrictEqual(await ipcMain.invoke("settings:test-hardware-buddy-approval"), {
+    status: "error",
+    message: "Hardware Buddy test approval is unavailable",
+  });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:get-quick-command-presets"), {
+    enabled: false,
+    presets: [],
+  });
+  assert.deepStrictEqual(await ipcMain.invoke("settings:send-quick-command", { id: "plan_first" }), {
+    status: "error",
+    code: "quick_commands_unavailable",
+    message: "Quick Commands are unavailable",
   });
   assert.deepStrictEqual(await ipcMain.invoke("settings:begin-size-preview"), {
     status: "ok",
@@ -193,6 +323,53 @@ test("settings IPC delegates controller and size preview handlers", async () => 
     ["sizePreview", "P:35"],
     ["sizeEnd", "P:35"],
   ]);
+});
+
+test("settings IPC delegates Hardware Buddy test approval helper", async () => {
+  const calls = [];
+  const { ipcMain } = createHarness({
+    testHardwareBuddyApproval: () => {
+      calls.push("test");
+      return Promise.resolve({ status: "ok", decision: "deny" });
+    },
+  });
+
+  assert.deepStrictEqual(
+    await ipcMain.invoke("settings:test-hardware-buddy-approval", { ignored: true }),
+    { status: "ok", decision: "deny" }
+  );
+  assert.deepStrictEqual(calls, ["test"]);
+});
+
+test("settings IPC delegates Quick Command helpers", async () => {
+  const calls = [];
+  const { ipcMain } = createHarness({
+    getQuickCommandPresets: () => ({
+      enabled: true,
+      presets: [{ id: "plan_first", label: "先列计划" }],
+    }),
+    sendQuickCommand: (payload) => {
+      calls.push(payload);
+      return { status: "ok", quickCommand: { id: payload.id } };
+    },
+  });
+
+  assert.deepStrictEqual(await ipcMain.invoke("settings:get-quick-command-presets"), {
+    enabled: true,
+    presets: [{ id: "plan_first", label: "先列计划" }],
+  });
+  assert.deepStrictEqual(
+    await ipcMain.invoke("settings:send-quick-command", {
+      id: "plan_first",
+      clientRequestId: "qc-1",
+      userText: "should be stripped",
+      source: "renderer",
+      duration: "next_turn",
+      target: { scope: "active_session", sessionId: "session-1" },
+    }),
+    { status: "ok", quickCommand: { id: "plan_first" } }
+  );
+  assert.deepStrictEqual(calls, [{ id: "plan_first", clientRequestId: "qc-1" }]);
 });
 
 test("settings IPC delegates Codex Pet theme channels and decorates metadata", async () => {
@@ -261,6 +438,101 @@ test("settings IPC delegates Codex Pet theme channels and decorates metadata", a
   ]);
 });
 
+test("settings IPC opens the user themes directory", async () => {
+  const openCalls = [];
+  const { ipcMain } = createHarness({
+    themeLoader: {
+      getPreviewSoundUrl: () => null,
+      getSoundOverridesDir: () => null,
+      getSoundUrl: () => null,
+      listThemesWithMetadata: () => [],
+      getThemeMetadata: () => null,
+      ensureUserThemesDir: () => "C:\\Users\\Example\\AppData\\Roaming\\Clawd\\themes",
+    },
+    shell: {
+      openPath: async (dir) => {
+        openCalls.push(dir);
+        return "";
+      },
+      openExternal: async () => {},
+    },
+  });
+
+  assert.deepStrictEqual(await ipcMain.invoke("settings:open-user-themes-dir"), {
+    status: "ok",
+    path: "C:\\Users\\Example\\AppData\\Roaming\\Clawd\\themes",
+  });
+  assert.deepStrictEqual(openCalls, ["C:\\Users\\Example\\AppData\\Roaming\\Clawd\\themes"]);
+});
+
+test("settings IPC imports Clawd user theme zip packages", async () => {
+  const root = makeTempDir();
+  try {
+    const userThemesDir = path.join(root, "user-themes");
+    const zipPath = path.join(root, "pixel-cat.zip");
+    const themeJson = {
+      schemaVersion: 1,
+      name: "Pixel Cat",
+      version: "1.0.0",
+      sleepSequence: { mode: "direct" },
+      viewBox: { x: 0, y: 0, width: 16, height: 16 },
+      states: {
+        idle: ["idle.svg"],
+        working: ["working.gif"],
+        thinking: ["thinking.png"],
+        sleeping: { fallbackTo: "idle" },
+      },
+    };
+    fs.writeFileSync(zipPath, makeZip([
+      { name: "pixel-cat/theme.json", data: JSON.stringify(themeJson), method: 8 },
+      { name: "pixel-cat/assets/idle.svg", data: "<svg></svg>", method: 8 },
+      { name: "pixel-cat/assets/working.gif", data: "gif", method: 8 },
+      { name: "pixel-cat/assets/thinking.png", data: "png", method: 8 },
+    ]));
+
+    let dialogParent = null;
+    let dialogOptions = null;
+    const { ipcMain } = createHarness({
+      dialog: {
+        showOpenDialog: async (parent, options) => {
+          dialogParent = parent;
+          dialogOptions = options;
+          return { canceled: false, filePaths: [zipPath] };
+        },
+        showMessageBox: async () => ({ response: 1 }),
+      },
+      themeLoader: {
+        getPreviewSoundUrl: () => null,
+        getSoundOverridesDir: () => null,
+        getSoundUrl: () => null,
+        listThemesWithMetadata: () => [],
+        getThemeMetadata: () => null,
+        ensureUserThemesDir: () => userThemesDir,
+      },
+    });
+
+    assert.deepStrictEqual(await ipcMain.invoke("settings:import-user-theme-zip"), {
+      status: "ok",
+      themeId: "pixel-cat",
+      name: "Pixel Cat",
+      path: path.join(userThemesDir, "pixel-cat"),
+    });
+    assert.deepStrictEqual(dialogParent, { id: "parent", sender: "sender-web-contents" });
+    assert.deepStrictEqual(dialogOptions.properties, ["openFile"]);
+    assert.deepStrictEqual(dialogOptions.filters, [{ name: "Clawd theme zip", extensions: ["zip"] }]);
+    assert.strictEqual(
+      fs.readFileSync(path.join(userThemesDir, "pixel-cat", "theme.json"), "utf8"),
+      JSON.stringify(themeJson)
+    );
+    assert.strictEqual(
+      fs.readFileSync(path.join(userThemesDir, "pixel-cat", "assets", "working.gif"), "utf8"),
+      "gif"
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("settings IPC copies sound overrides, removes stale siblings, and invalidates renderer cache", async () => {
   const root = makeTempDir();
   try {
@@ -317,6 +589,7 @@ test("settings IPC copies sound overrides, removes stale siblings, and invalidat
         originalName: "picked.wav",
       }],
       ["sendToRenderer", "invalidate-sound-cache", "file:///complete.wav"],
+      ["sendToRenderer", "preload-sounds", { urls: ["file:///complete.wav"] }],
     ]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -396,6 +669,8 @@ test("settings IPC serves agent/about/update/external and remove-theme dialog he
       authorName: "Ruller_Lulu / \u9e7f\u9e7f",
       authorUrl: "https://github.com/rullerzhou-afk",
       heroSvgContent: "<svg id=\"hero\"></svg>",
+      pendingUpdateVersion: "",
+      autoUpdateCheck: true,
     });
     assert.deepStrictEqual(await ipcMain.invoke("settings:confirm-remove-theme", "user-theme"), {
       confirmed: true,

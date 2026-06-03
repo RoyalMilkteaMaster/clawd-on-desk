@@ -16,6 +16,7 @@ const {
 } = require("./state-visual-resolver");
 const {
   getStaleSessionDecision,
+  isWorkingLikeState,
 } = require("./state-stale-cleanup");
 const {
   createHitboxRuntime,
@@ -63,13 +64,28 @@ let DISPLAY_HINT_MAP = {};
 // ── Session tracking ──
 const sessions = new Map();
 const MAX_SESSIONS = 20;
+const ASSISTANT_OUTPUT_MAX = 2400;
 const CODEX_EXIT_PROBE_DELAYS_MS = [1000, 3000, 8000, 15000];
+const POST_COMPLETION_EVENTS = new Set(["Stop", "PostCompact", "event_msg:task_complete"]);
 let lastSessionSnapshotSignature = null;
 let lastSessionSnapshot = null;
 let startupRecoveryActive = false;
 let startupRecoveryTimer = null;
 const STARTUP_RECOVERY_MAX_MS = 300000;
 const codexExitProbes = new Map();
+
+function normalizeAssistantOutput(value) {
+  if (typeof value !== "string") return null;
+  const text = value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+  if (!text) return null;
+  return text.length > ASSISTANT_OUTPUT_MAX
+    ? text.slice(0, ASSISTANT_OUTPUT_MAX)
+    : text;
+}
 
 // ── Hit-test bounding boxes (from theme) ──
 let HIT_BOXES = {};
@@ -154,6 +170,55 @@ function hasPermissionAnimationLock() {
   return kimiPermissionHolds.size > 0;
 }
 
+function resolveAwaitingInputSinceStop(existing, event) {
+  if (POST_COMPLETION_EVENTS.has(event)) return true;
+  if (event === "Notification") return !!(existing && existing.awaitingInputSinceStop === true);
+  if (!event || event === "stale-cleanup") return !!(existing && existing.awaitingInputSinceStop === true);
+  return false;
+}
+
+function shouldMuteMiniPostCompletionNotification(state, event, session) {
+  return !!ctx.miniMode
+    && state === "notification"
+    && event === "Notification"
+    && session
+    && session.awaitingInputSinceStop === true
+    && !hasPermissionAnimationLock();
+}
+
+// ── Qwen Code self-submit filter ──
+// qwen 0.16.1 fires a synthetic UserPromptSubmit ~900-1000ms after
+// PostToolUse to feed the tool result back to the model. Without filtering,
+// the mascot flashes "thinking" (typing animation) between working and idle.
+// Measured twice in dogfood: 908ms (non-interactive) and 945ms (interactive).
+// 2000ms window covers the agentic loop with ~2x headroom while still letting
+// real human input through after the loop settles. See
+// project_qwen_0_16_1_event_semantics for the canary.
+//
+// Two timestamps split: `lastToolBoundaryAt` tracks PostToolUse /
+// PostToolUseFailure (where the agentic loop may still self-submit), and
+// `lastStopAt` tracks end-of-turn. Filter only fires when a recent tool
+// boundary has NOT yet been followed by Stop — once Stop arrives, any
+// further UserPromptSubmit is real user input even if the tool boundary
+// is still inside the window. This avoids eating a real "继续" typed
+// within 2s of the happy end animation.
+const QWEN_SELF_SUBMIT_WINDOW_DEFAULT_MS = 2000;
+const QWEN_SELF_SUBMIT_WINDOW_MAX_MS = 10000;
+function getQwenSelfSubmitWindowMs() {
+  const raw = process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS;
+  if (typeof raw !== "string" || !raw.trim()) return QWEN_SELF_SUBMIT_WINDOW_DEFAULT_MS;
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n < 0 || n > QWEN_SELF_SUBMIT_WINDOW_MAX_MS) {
+    return QWEN_SELF_SUBMIT_WINDOW_DEFAULT_MS;
+  }
+  return n;
+}
+function isQwenSelfSubmitFilterEnabled() {
+  // Default on. Kill switch for users to disable if qwen ≥0.17 changes the
+  // self-submit behavior in a way that breaks this filter.
+  return process.env.CLAWD_QWEN_SELF_SUBMIT_FILTER !== "0";
+}
+
 // ── Stale cleanup ──
 let staleCleanupTimer = null;
 let _detectInFlight = false;
@@ -213,7 +278,7 @@ function shouldDropForDnd() {
   return !!ctx.doNotDisturb;
 }
 
-function setState(newState, svgOverride) {
+function setState(newState, svgOverride, options = {}) {
   if (shouldDropForDnd()) return;
 
   if (newState === "yawning" && SLEEP_SEQUENCE.has(currentState)) return;
@@ -251,20 +316,22 @@ function setState(newState, svgOverride) {
     if (autoReturnTimer) { clearTimeout(autoReturnTimer); autoReturnTimer = null; }
     pendingState = newState;
     const pendingSvgOverride = svgOverride;
+    const pendingOptions = options;
     pendingTimer = setTimeout(() => {
       pendingTimer = null;
       const queued = pendingState;
       const queuedSvg = pendingSvgOverride;
+      const queuedOptions = pendingOptions || {};
       pendingState = null;
       if (ONESHOT_STATES.has(queued)) {
-        applyState(queued, queuedSvg);
+        applyState(queued, queuedSvg, queuedOptions);
       } else {
         const resolved = resolveDisplayState();
-        applyState(resolved, getSvgOverride(resolved));
+        applyState(resolved, getSvgOverride(resolved), queuedOptions);
       }
     }, remaining);
   } else {
-    applyState(newState, svgOverride);
+    applyState(newState, svgOverride, options);
   }
 }
 
@@ -285,7 +352,7 @@ function resolveVisualBinding(state) {
 
 function applyResolvedDisplayState() {
   const resolved = resolveDisplayState();
-  applyState(resolved, getSvgOverride(resolved));
+  applyState(resolved, getSvgOverride(resolved), resolveSoundOptionsForState(resolved));
   // Kimi CLI permission hold: while notification is pinned, re-trigger the
   // renderer animation so non-looping GIF/APNG assets replay instead of
   // freezing on their last frame. Throttled so concurrent agents flooding
@@ -319,7 +386,29 @@ function applyDndSleepState() {
   applyState(DND_SKIP_YAWN ? "collapsing" : "yawning");
 }
 
-function applyState(state, svgOverride) {
+function resolveSoundOptionsForState(state) {
+  const logicalState = state === "mini-alert" ? "notification" : state;
+  if (logicalState !== "notification") return {};
+  let sawNotificationSession = false;
+  for (const [, session] of sessions) {
+    if (!session || session.headless || session.state !== "notification") continue;
+    sawNotificationSession = true;
+    if (session.muteNotificationSound !== true) return {};
+  }
+  return sawNotificationSession ? { muteNotificationSound: true } : {};
+}
+
+function normalizeApplyStateOptions(state, options = {}) {
+  const derived = resolveSoundOptionsForState(state);
+  return {
+    ...options,
+    muteNotificationSound:
+      options.muteNotificationSound === true || derived.muteNotificationSound === true,
+  };
+}
+
+function applyState(state, svgOverride, options = {}) {
+  const applyOptions = normalizeApplyStateOptions(state, options);
   // Phase 3b: user-disabled oneshot state — skip visual + sound, fall back to
   // whatever resolveDisplayState picks (usually working/idle). Gate lives at
   // applyState() top so it catches all three paths that reach here:
@@ -341,8 +430,8 @@ function applyState(state, svgOverride) {
   }
 
   if (ctx.miniMode && !state.startsWith("mini-")) {
-    if (state === "notification") return applyState("mini-alert");
-    if (state === "attention") return applyState("mini-happy");
+    if (state === "notification") return applyState("mini-alert", undefined, applyOptions);
+    if (state === "attention") return applyState("mini-happy", undefined, applyOptions);
     if (state === "working" || state === "thinking" || state === "juggling") {
       if (hasOwnVisualFiles("mini-working")) return applyState("mini-working");
       return;
@@ -361,8 +450,9 @@ function applyState(state, svgOverride) {
   // Sound triggers
   if (state === "attention" || state === "mini-happy") {
     ctx.playSound("complete");
+    if (ctx.flashTaskbar) ctx.flashTaskbar();
   } else if (state === "notification" || state === "mini-alert") {
-    ctx.playSound("confirm");
+    if (!applyOptions.muteNotificationSound) ctx.playSound("confirm");
   }
 
   const svg = svgOverride || resolveVisualBinding(state);
@@ -648,6 +738,7 @@ function buildSessionSnapshot() {
     getAgentIconUrl,
     statePriority: STATE_PRIORITY,
     sessionHudCleanupDetached: ctx.sessionHudCleanupDetached === true,
+    focusHostPlatform: ctx.focusHostPlatform || process.platform,
     isProcessAlive,
   });
 }
@@ -699,6 +790,102 @@ function resolvePidReachable(existing, agentPid, sourcePid) {
   return existing ? !!existing.pidReachable : false;
 }
 
+function evictOldestSessionIfNeeded(sessionId) {
+  if (sessions.has(sessionId) || sessions.size < MAX_SESSIONS) return;
+
+  // Phase 1: prefer the oldest NON-ack session — capacity safety is what we
+  // care about first, but we don't want to silently evict a session the user
+  // hasn't seen yet.
+  let oldestId = null;
+  let oldestTime = Infinity;
+  for (const [id, s] of sessions) {
+    if (s && s.requiresCompletionAck === true) continue;
+    if (s.updatedAt < oldestTime) {
+      oldestTime = s.updatedAt;
+      oldestId = id;
+    }
+  }
+
+  // Phase 2: only when EVERY entry is ack-pending do we evict the oldest
+  // ack one — capacity is a memory cap, ack retention is a UX promise; when
+  // they conflict, capacity has to win.
+  if (!oldestId) {
+    for (const [id, s] of sessions) {
+      if (s.updatedAt < oldestTime) {
+        oldestTime = s.updatedAt;
+        oldestId = id;
+      }
+    }
+  }
+
+  if (oldestId) sessions.delete(oldestId);
+}
+
+// Sets / clears `requiresCompletionAck` based on the current event.
+// Called from updateSession's `finally` block so every early-return path
+// (PermissionRequest on disabled Kimi, SessionEnd, SubagentStop on missing
+// session, etc.) still gets its flag reconciled — placing this in the
+// dispatch body would miss those paths.
+//
+// `ackedAt` is intentionally NOT touched here. It's only set in
+// ackSessionCompletion (user-initiated). The reconciler just toggles the
+// boolean flag.
+function isRemoteCodexCompletionEvent(srcAgentId, srcHost, event) {
+  return srcAgentId === "codex"
+    && !!srcHost
+    && (event === "Stop" || event === "event_msg:task_complete");
+}
+
+function isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event) {
+  return srcAgentId === "codex"
+    && !!srcHost
+    && event === "stale-cleanup";
+}
+
+function reconcileAckFlag(sessionId, srcAgentId, srcHost, event) {
+  const entry = sessions.get(sessionId);
+  if (!entry) return; // session was deleted by this update — nothing to do
+  if (isRemoteCodexCompletionEvent(srcAgentId, srcHost, event)) {
+    entry.requiresCompletionAck = true;
+  } else if (
+    entry.requiresCompletionAck
+    && !isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event)
+  ) {
+    // Strict equality on completion events: any other semantic event
+    // (including null/undefined refreshes) clears the flag. Remote Codex
+    // stale-cleanup is housekeeping from the JSONL monitor, so it must not
+    // erase an unacknowledged completion.
+    entry.requiresCompletionAck = false;
+  }
+}
+
+// User-initiated acknowledgment. Returns true if the session existed AND had
+// the flag set (a meaningful clear happened). Returns false for missing
+// sessions or sessions that aren't pending — both are idempotent no-ops the
+// renderer can safely ignore.
+function ackSessionCompletion(sessionId) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  if (session.requiresCompletionAck !== true) return false;
+  session.requiresCompletionAck = false;
+  session.ackedAt = Date.now();
+  // Force snapshot so the Mark-read button visibility (and any HUD bell
+  // wiring) reaches renderers without waiting for the next debounce.
+  emitSessionSnapshot({ force: true });
+  return true;
+}
+
+function resolveIncomingAgentId(existing, incomingAgentId, incomingDefaulted) {
+  const remembered = existing && existing.agentId ? existing.agentId : null;
+  // `incomingDefaulted` means the route only fell back to the legacy
+  // Claude attribution. Preserve the remembered owner for that session id;
+  // agents that can share ids with other agents must namespace upstream.
+  if (incomingDefaulted && remembered) return remembered;
+  return incomingAgentId || remembered || null;
+}
+
 // ── Session management ──
 // Session-related fields go through `opts`. Earlier versions took 13
 // positional params — refactored in B2 to an options bag so new fields
@@ -707,6 +894,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   try {
   const {
     sourcePid = null,
+    wtHwnd = null,
     cwd = null,
     editor = null,
     pidChain = null,
@@ -714,11 +902,21 @@ function updateSession(sessionId, state, event, opts = {}) {
     agentId = null,
     host = null,
     headless = false,
+    platform = null,
+    model = null,
+    provider = null,
+    codexOriginator = null,
+    codexSource = null,
     displayHint = undefined,
     sessionTitle = null,
+    assistantLastOutput = null,
+    assistantLastOutputTruncated = false,
     permissionSuspect = false,
     preserveState = false,
     hookSource = null,
+    agentIdDefaulted = false,
+    muteNotificationSound = false,
+    transientPermissionEvent = false,
   } = opts;
   if (startupRecoveryActive) {
     startupRecoveryActive = false;
@@ -726,7 +924,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   }
 
   const sessionForPerm = sessions.get(sessionId);
-  const permAgentId = agentId || (sessionForPerm && sessionForPerm.agentId) || null;
+  const permAgentId = resolveIncomingAgentId(sessionForPerm, agentId, agentIdDefaulted);
 
   if (event === "PermissionRequest") {
     if (permAgentId === "codex") cancelCodexExitProbe(sessionId, "PermissionRequest");
@@ -741,43 +939,146 @@ function updateSession(sessionId, state, event, opts = {}) {
       && typeof ctx.isAgentPermissionsEnabled === "function"
       && !ctx.isAgentPermissionsEnabled("kimi-cli")
     ) return;
-    setState("notification");
+    const shouldPersistCodexPermissionFocus = permAgentId === "codex" && (
+      sourcePid || wtHwnd || agentPid || (pidChain && pidChain.length) || cwd || host ||
+      model || provider || codexOriginator || codexSource || platform
+    );
+    if (shouldPersistCodexPermissionFocus) {
+      const existing = sessions.get(sessionId);
+      evictOldestSessionIfNeeded(sessionId);
+      const srcPid = sourcePid || (existing && existing.sourcePid) || null;
+      const srcWtHwnd = wtHwnd || (existing && existing.wtHwnd) || null;
+      const srcCwd = cwd || (existing && existing.cwd) || "";
+      const srcEditor = editor || (existing && existing.editor) || null;
+      const srcPidChain = (pidChain && pidChain.length) ? pidChain : (existing && existing.pidChain) || null;
+      const srcAgentPid = agentPid || (existing && existing.agentPid) || null;
+      const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
+      const srcHost = host || (existing && existing.host) || null;
+      const srcHeadless = headless || (existing && existing.headless) || false;
+      const srcPlatform = platform || (existing && existing.platform) || null;
+      const srcModel = model || (existing && existing.model) || null;
+      const srcProvider = provider || (existing && existing.provider) || null;
+      const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
+      const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
+      const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
+      // PermissionRequest should flash the pet via setState("notification"),
+      // but a brand-new Codex permission session must not persist as
+      // notification. Otherwise, if the prompt is resolved remotely and no
+      // later hook arrives for that synthetic session, auto-return keeps
+      // resolving back to notification forever.
+      const storedState = existing && existing.state ? existing.state : "idle";
+      const recentEvents = transientPermissionEvent === true
+        ? (Array.isArray(existing && existing.recentEvents) ? existing.recentEvents.slice() : [])
+        : pushRecentEvent(existing, storedState, event);
+      sessions.set(sessionId, {
+        state: storedState,
+        updatedAt: Date.now(),
+        displayHint: existing ? existing.displayHint : null,
+        sourcePid: srcPid,
+        wtHwnd: srcWtHwnd,
+        cwd: srcCwd,
+        editor: srcEditor,
+        pidChain: srcPidChain,
+        agentPid: srcAgentPid,
+        agentId: srcAgentId,
+        host: srcHost,
+        headless: srcHeadless,
+        platform: srcPlatform,
+        model: srcModel,
+        provider: srcProvider,
+        codexOriginator: srcCodexOriginator,
+        codexSource: srcCodexSource,
+        sessionTitle: srcSessionTitle,
+        recentEvents,
+        pidReachable: resolvePidReachable(existing, srcAgentPid, srcPid),
+        resumeState: (existing && existing.resumeState) || null,
+        muteNotificationSound: muteNotificationSound === true,
+      });
+    }
+    setState("notification", undefined, { muteNotificationSound: muteNotificationSound === true });
     if (permAgentId === "kimi-cli") startKimiPermissionPoll(sessionId);
     return;
   }
 
   const existing = sessions.get(sessionId);
   const srcPid = sourcePid || (existing && existing.sourcePid) || null;
+  const srcWtHwnd = wtHwnd || (existing && existing.wtHwnd) || null;
   const srcCwd = cwd || (existing && existing.cwd) || "";
   const srcEditor = editor || (existing && existing.editor) || null;
   const srcPidChain = (pidChain && pidChain.length) ? pidChain : (existing && existing.pidChain) || null;
   const srcAgentPid = agentPid || (existing && existing.agentPid) || null;
-  const srcAgentId = agentId || (existing && existing.agentId) || null;
+  const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
   const srcHost = host || (existing && existing.host) || null;
   const srcHeadless = headless || (existing && existing.headless) || false;
+  const srcPlatform = platform || (existing && existing.platform) || null;
+  const srcModel = model || (existing && existing.model) || null;
+  const srcProvider = provider || (existing && existing.provider) || null;
+  const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
+  const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
   // Sticky: empty input does not clear an existing title. A session that has
   // ever been named keeps that name until the user explicitly renames it.
   const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
+  const srcAssistantLastOutput = normalizeAssistantOutput(assistantLastOutput);
+  const srcAssistantLastOutputTruncated = !!(srcAssistantLastOutput && assistantLastOutputTruncated === true);
   const srcResumeState = (existing && existing.resumeState) || null;
   const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
   const preservedState = preserveState && existing ? existing.state : null;
+
+  // Qwen Code 0.16.1 self-submit guard. qwen's agentic loop fires a synthetic
+  // UserPromptSubmit ~900-1000ms after PostToolUse to feed the tool result
+  // back to the model. Dropping it here (before pushRecentEvent / setState)
+  // prevents the mascot from flashing "thinking" between working and idle.
+  // Falls through to normal handling when:
+  //   - No existing session / no tool boundary (cannot prove self-submit)
+  //   - Outside the window (real human input)
+  //   - Stop has fired AFTER the most recent tool boundary (end-of-turn
+  //     reached — any UserPromptSubmit now is real user input)
+  //   - Kill switch CLAWD_QWEN_SELF_SUBMIT_FILTER="0"
+  if (
+    event === "UserPromptSubmit"
+    && srcAgentId === "qwen-code"
+    && existing
+    && Number.isFinite(existing.lastToolBoundaryAt)
+    && (Date.now() - existing.lastToolBoundaryAt) < getQwenSelfSubmitWindowMs()
+    && !(Number.isFinite(existing.lastStopAt) && existing.lastStopAt >= existing.lastToolBoundaryAt)
+    && isQwenSelfSubmitFilterEnabled()
+  ) {
+    debugSession(`qwen self-submit drop sid=${sessionId} elapsed=${Date.now() - existing.lastToolBoundaryAt}ms`);
+    return;
+  }
 
   debugSession(`event ${describeSession(sessionId, existing)} -> incoming=${state}/${event || "-"} hint=${displayHint || "-"} source=${hookSource || "-"}`);
 
   const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
 
   const recentEvents = pushRecentEvent(existing, preservedState || state, event);
-  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
+  const preserveCompletionAck =
+    existing
+    && existing.requiresCompletionAck === true
+    && isAckPreservingHousekeepingEvent(srcAgentId, srcHost, event);
+  // Agent-loop boundary timestamps for the qwen self-submit filter. Two
+  // split fields: `lastToolBoundaryAt` (PostToolUse / PostToolUseFailure)
+  // marks where a synthetic UserPromptSubmit may still follow within the
+  // ~1s window; `lastStopAt` (Stop) marks end-of-turn after which any
+  // UserPromptSubmit is real user input. PostToolUseFailure is a generic
+  // defensive boundary — qwen 0.16.1 does not emit it, but other agents
+  // sharing this state.js do (claude-code, codex), and a future qwen
+  // version may. Propagated through `base` so every sessions.set path
+  // keeps both values until the next bump.
+  const isToolBoundary = event === "PostToolUse" || event === "PostToolUseFailure";
+  const isStopBoundary = event === "Stop";
+  const srcLastToolBoundaryAt = isToolBoundary
+    ? Date.now()
+    : (existing && Number.isFinite(existing.lastToolBoundaryAt) ? existing.lastToolBoundaryAt : null);
+  const srcLastStopAt = isStopBoundary
+    ? Date.now()
+    : (existing && Number.isFinite(existing.lastStopAt) ? existing.lastStopAt : null);
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, sessionTitle: srcSessionTitle, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true };
+  if (preserveCompletionAck) base.requiresCompletionAck = true;
 
-  // Evict oldest session if at capacity and this is a new session
-  if (!existing && sessions.size >= MAX_SESSIONS) {
-    let oldestId = null, oldestTime = Infinity;
-    for (const [id, s] of sessions) {
-      if (s.updatedAt < oldestTime) { oldestTime = s.updatedAt; oldestId = id; }
-    }
-    if (oldestId) sessions.delete(oldestId);
-  }
+  // Evict oldest session if at capacity and this is a new session.
+  evictOldestSessionIfNeeded(sessionId);
 
   if (isSubagentStop) {
     updateCodexExitProbe(sessionId, srcAgentId, event);
@@ -917,6 +1218,18 @@ function updateSession(sessionId, state, event, opts = {}) {
     if (hasPermissionAnimationLock() && state !== "notification") {
       return;
     }
+    // Mini mode already celebrated completion with mini-happy. Keep the idle
+    // wait-for-input event in session history, but do not make the tucked-away
+    // pet pop a second strong alert for the same completed turn.
+    if (
+      event === "Notification"
+      && state === "notification"
+      && shouldMuteMiniPostCompletionNotification(state, event, sessions.get(sessionId))
+    ) {
+      const displayState = resolveDisplayState();
+      setState(displayState, getSvgOverride(displayState));
+      return;
+    }
     // Per-agent Notification-hook mute: presentation-layer only. By this
     // point session bookkeeping, recentEvents, and Kimi hold-release cleanup
     // have already run — matching the Animation Map "events still fire"
@@ -940,6 +1253,25 @@ function updateSession(sessionId, state, event, opts = {}) {
   const displayState = resolveDisplayState();
   setState(displayState, getSvgOverride(displayState));
   } finally {
+    try {
+      // Reconcile the ack flag from the LATEST entry view, not the closure
+      // copies taken at the top — early-return paths (state.js Kimi
+      // PermissionRequest gate, SessionEnd, SubagentStop on missing
+      // session) bail out before the resolved srcAgentId/srcHost block
+      // runs. The Object.assign(existing, base) ONESHOT branch can also
+      // rebuild the entry midway. Re-fetch + fall back to raw opts so we
+      // never miss either signal.
+      const entry = sessions.get(sessionId);
+      const srcAgentId = (opts && opts.agentId) || (entry && entry.agentId) || null;
+      const srcHost = (opts && opts.host) || (entry && entry.host) || null;
+      reconcileAckFlag(sessionId, srcAgentId, srcHost, event);
+    } catch (err) {
+      // Defensive: must never let a reconciler throw shadow the outer
+      // error chain. The reconciler is one Map lookup + a boolean toggle,
+      // so this should never fire — log if it does so the regression is
+      // visible.
+      console.warn("reconcileAckFlag threw:", err);
+    }
     emitSessionSnapshot();
   }
 }
@@ -952,12 +1284,14 @@ function cleanStaleSessions() {
   const now = Date.now();
   let changed = false;
   let snapshotRefreshNeeded = false;
+  const staleConfig = typeof ctx.getStaleConfig === "function" ? ctx.getStaleConfig() : null;
   for (const [id, s] of sessions) {
     const decision = getStaleSessionDecision(s, {
       now,
       isProcessAlive,
       deriveSessionBadge,
       shouldAutoClearDetachedSession,
+      staleConfig,
     });
 
     if (decision.snapshotRefreshNeeded) snapshotRefreshNeeded = true;
@@ -1025,6 +1359,57 @@ function dismissSession(sessionId) {
   return true;
 }
 
+function takeTrailingPermissionRequest(session) {
+  const events = Array.isArray(session && session.recentEvents)
+    ? session.recentEvents
+    : null;
+  if (!events || events.length === 0) return null;
+  const last = events[events.length - 1];
+  if (!last || last.event !== "PermissionRequest") return null;
+  session.recentEvents = events.slice(0, -1);
+  return last;
+}
+
+function clearPermissionNotification(sessionId, options = {}) {
+  const id = typeof sessionId === "string" ? sessionId : "";
+  if (!id || options.hasPendingForSession === true) return false;
+
+  let changed = false;
+  const session = sessions.get(id);
+  if (session) {
+    const trailingPermission = takeTrailingPermissionRequest(session);
+    if (session.state === "notification") {
+      session.state = "idle";
+      session.displayHint = null;
+      session.resumeState = null;
+      changed = true;
+    } else if (
+      session.state === "idle"
+      && trailingPermission
+      && isWorkingLikeState(trailingPermission.state)
+    ) {
+      // A stale sweep may downgrade a Codex session while the approval is
+      // still pending. Once the permission resolves, restore the work state
+      // recorded at request time so long commands do not stay visually idle.
+      session.state = trailingPermission.state;
+      changed = true;
+    }
+    if (trailingPermission) {
+      session.updatedAt = Date.now();
+      changed = true;
+    } else if (changed) {
+      session.updatedAt = Date.now();
+    }
+  }
+
+  // Leave the one-shot notification immediately after the permission channel
+  // resolves. If another session still deserves notification, resolveDisplayState
+  // will pick it again.
+  applyResolvedDisplayState();
+  if (changed) emitSessionSnapshot({ force: true });
+  return changed;
+}
+
 function clearSessionsByAgent(agentId) {
   if (!agentId) return 0;
   let removed = 0;
@@ -1077,21 +1462,28 @@ function detectRunningAgentProcesses(callback) {
   // call entirely — nothing we could "find" should keep startup recovery
   // alive. When at least one agent is enabled, we still run the combined
   // detection because the query can't attribute individual processes back
-  // to agent ids (wmic/pgrep would need per-name queries), and the result
+  // to agent ids without per-name process queries, and the result
   // is only a boolean for startup recovery — not a session creator.
   if (typeof ctx.hasAnyEnabledAgent === "function" && !ctx.hasAnyEnabledAgent()) {
     done(false);
     return;
   }
-  const { exec } = require("child_process");
+  const { execFile, exec } = require("child_process");
   if (process.platform === "win32") {
-    exec(
-      'wmic process where "(Name=\'node.exe\' and CommandLine like \'%claude-code%\') or Name=\'claude.exe\' or Name=\'codex.exe\' or Name=\'copilot.exe\' or Name=\'gemini.exe\' or Name=\'codebuddy.exe\' or Name=\'kiro-cli.exe\' or Name=\'kimi.exe\' or Name=\'opencode.exe\'" get ProcessId /format:csv',
-      { encoding: "utf8", timeout: 5000, windowsHide: true },
+    const psScript =
+      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','agy.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','opencode.exe','pi.exe','hermes.exe'; " +
+      "$match = Get-CimInstance Win32_Process | Where-Object { " +
+        "$names -contains $_.Name -or ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*') " +
+      "} | Select-Object -First 1; " +
+      "if ($match) { $match.ProcessId }";
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", psScript],
+      { encoding: "utf8", timeout: 5000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout) => done(!err && /\d+/.test(stdout))
     );
   } else {
-    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi' || pgrep -x 'gemini' || pgrep -x 'kiro-cli' || pgrep -x 'opencode'", { timeout: 3000 },
+    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'agy' || pgrep -x 'kiro-cli' || pgrep -x 'opencode' || pgrep -x 'hermes'", { timeout: 3000 },
       (err) => done(!err)
     );
   }
@@ -1313,6 +1705,10 @@ function disableDoNotDisturb() {
   } else {
     playWakeTransitionOrResolve();
   }
+  // #329: a deferred update bubble may be waiting on DND exit.
+  if (typeof ctx.notifyUpdaterSilentExit === "function") {
+    try { ctx.notifyUpdaterSilentExit(); } catch {}
+  }
   ctx.buildContextMenu();
   ctx.buildTrayMenu();
 }
@@ -1332,6 +1728,7 @@ function getStartupRecoveryActive() { return startupRecoveryActive; }
 
 function cleanup() {
   if (pendingTimer) clearTimeout(pendingTimer);
+  pendingState = null;
   if (autoReturnTimer) clearTimeout(autoReturnTimer);
   if (eyeResendTimer) clearTimeout(eyeResendTimer);
   if (startupRecoveryTimer) clearTimeout(startupRecoveryTimer);
@@ -1356,6 +1753,8 @@ return {
   emitSessionSnapshot, broadcastSessionSnapshot, getLastSessionSnapshot,
   getActiveSessionAliasKeys,
   dismissSession,
+  clearPermissionNotification,
+  ackSessionCompletion,
   clearSessionsByAgent,
   disposeAllKimiPermissionState,
   deriveSessionBadge,

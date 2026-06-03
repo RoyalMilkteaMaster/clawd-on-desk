@@ -4,6 +4,7 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const RENDERER = path.join(__dirname, "..", "src", "renderer.js");
 const PRELOAD = path.join(__dirname, "..", "src", "preload.js");
@@ -17,6 +18,161 @@ function matchSource(source, pattern, message) {
   const match = source.match(pattern);
   assert.ok(match, message || `missing pattern ${pattern}`);
   return match;
+}
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentNode = null;
+    this.isConnected = false;
+    this.className = "";
+    this.id = "";
+    this.data = "";
+    this.src = "";
+    this.contentDocument = null;
+    this.contentWindow = {};
+    this.listeners = new Map();
+  }
+
+  get offsetHeight() {
+    return 1;
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+    if (name === "data") this.data = String(value);
+    if (name === "src") this.src = String(value);
+  }
+
+  getAttribute(name) {
+    if (name === "data") return this.data || this.attributes.get(name) || "";
+    if (name === "src") return this.src || this.attributes.get(name) || "";
+    return this.attributes.get(name) || "";
+  }
+
+  appendChild(child) {
+    child.parentNode = this;
+    child.isConnected = true;
+    this.children.push(child);
+    return child;
+  }
+
+  remove() {
+    this.isConnected = false;
+    if (this.parentNode) {
+      this.parentNode.children = this.parentNode.children.filter((child) => child !== this);
+      this.parentNode = null;
+    }
+  }
+
+  addEventListener(event, callback) {
+    this.listeners.set(event, callback);
+  }
+
+  querySelectorAll() {
+    return this.children.filter((child) => (
+      child.tagName === "OBJECT"
+      || (child.tagName === "IMG" && String(child.className).split(/\s+/).includes("clawd-img"))
+    ));
+  }
+}
+
+function createRendererHarness() {
+  const timers = [];
+  const audioInstances = [];
+  const electronHandlers = {};
+  const container = new FakeElement("div");
+  container.id = "pet-container";
+  container.isConnected = true;
+  const clawd = new FakeElement("object");
+  clawd.id = "clawd";
+  clawd.data = "../assets/svg/current.svg";
+  clawd.style.opacity = "0";
+  container.appendChild(clawd);
+
+  const document = {
+    getElementById(id) {
+      if (id === "pet-container") return container;
+      if (id === "clawd") return clawd;
+      return null;
+    },
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+  };
+  const electronAPI = new Proxy({}, {
+    get(_target, prop) {
+      const name = String(prop);
+      if (name.startsWith("on")) {
+        return (callback) => { electronHandlers[name] = callback; };
+      }
+      return () => {};
+    },
+  });
+  const context = {
+    document,
+    window: {
+      themeConfig: {
+        assetsPath: "../assets/svg",
+        eyeTracking: { states: ["idle"] },
+      },
+      electronAPI,
+      getComputedStyle: (el) => ({ opacity: el.style.opacity || "1" }),
+    },
+    console: { warn() {} },
+    setTimeout(callback, ms) {
+      const timer = { callback, ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) {
+      if (timer) timer.cleared = true;
+    },
+    requestAnimationFrame(callback) {
+      return context.setTimeout(callback, 16);
+    },
+    cancelAnimationFrame(timer) {
+      context.clearTimeout(timer);
+    },
+    Audio: function FakeAudio(url) {
+      this.url = url;
+      this.volume = 1;
+      this.currentTime = 0;
+      this.loadCalls = 0;
+      this.playCalls = 0;
+      this.pauseCalls = 0;
+      this.load = () => { this.loadCalls++; };
+      this.play = () => { this.playCalls++; return Promise.resolve(); };
+      this.pause = () => { this.pauseCalls++; };
+      audioInstances.push(this);
+    },
+  };
+  context.globalThis = context;
+
+  const source = `${readNormalized(RENDERER)}
+globalThis.__rendererTest = {
+  swapToFile,
+  getPetMediaElements,
+  get pendingNext() { return pendingNext; },
+  get pendingSvgFile() { return pendingSvgFile; },
+  get activeSwapToken() { return activeSwapToken; },
+  get clawdEl() { return clawdEl; },
+};`;
+  vm.runInNewContext(source, context);
+
+  return {
+    context,
+    container,
+    clawd,
+    timers,
+    audioInstances,
+    electronHandlers,
+    api: context.__rendererTest,
+    activeTimers: () => timers.filter((timer) => !timer.cleared),
+  };
 }
 
 describe("renderer low-power idle mode", () => {
@@ -74,6 +230,15 @@ describe("renderer low-power idle mode", () => {
     assert.ok(preload.includes('setLowPowerIdlePaused: (paused) => ipcRenderer.send("low-power-idle-paused", !!paused)'));
   });
 
+  it("relays low-power pauses to trusted scripted SVG runtimes", () => {
+    const source = readNormalized(RENDERER);
+
+    assert.ok(source.includes("function setCurrentScriptedSvgLowPowerPaused(paused)"));
+    assert.ok(source.includes("target.contentWindow.__clawdSetLowPowerPaused"));
+    assert.ok(source.includes("setCurrentScriptedSvgLowPowerPaused(true);"));
+    assert.ok(source.includes("setCurrentScriptedSvgLowPowerPaused(false);"));
+  });
+
   it("resets main's paused mirror on renderer reload/crash and boosts eye resend on resume", () => {
     const source = readNormalized(MAIN);
 
@@ -105,9 +270,9 @@ describe("renderer object-channel selection", () => {
     const source = readNormalized(RENDERER);
 
     assert.ok(source.includes("swapToFile(svgFile, null);"));
-    assert.ok(source.includes("swapToFile(_dragSvg, null);"));
+    assert.ok(source.includes("swapToFile(dragSvg, null);"));
     assert.ok(!source.includes("swapToFile(svgFile, null, false);"));
-    assert.ok(!source.includes("swapToFile(_dragSvg, null, false);"));
+    assert.ok(!source.includes("swapToFile(dragSvg, null, false);"));
   });
 
   it("uses a monotonic cache-bust counter for remaining img-channel SVG swaps", () => {
@@ -128,6 +293,45 @@ describe("renderer object-channel selection", () => {
     assert.ok(source.includes("currentDisplayedAssetUrl === desiredAssetUrl"));
     assert.ok(source.includes("pendingAssetUrl === desiredAssetUrl"));
   });
+
+  it("rescues an invisible object-channel pending swap by reloading through the img channel", () => {
+    const harness = createRendererHarness();
+
+    harness.api.swapToFile("next.svg", "idle", true);
+    const rescue = harness.activeTimers().find((timer) => timer.ms === 3750);
+    rescue.callback();
+
+    assert.strictEqual(harness.api.pendingNext.tagName, "IMG");
+    assert.strictEqual(harness.api.pendingSvgFile, "next.svg");
+    assert.strictEqual(
+      harness.container.querySelectorAll().some((el) => el.tagName === "OBJECT" && el !== harness.clawd),
+      false
+    );
+  });
+
+  it("ignores stale rescue timers after a newer swap starts", () => {
+    const harness = createRendererHarness();
+
+    harness.api.swapToFile("old.svg", "idle", true);
+    const staleRescue = harness.activeTimers().find((timer) => timer.ms === 3750);
+    harness.api.swapToFile("new.svg", "idle", true);
+    staleRescue.callback();
+
+    assert.strictEqual(harness.api.pendingNext.tagName, "OBJECT");
+    assert.strictEqual(harness.api.pendingSvgFile, "new.svg");
+  });
+
+  it("does not rescue over an already visible pet element", () => {
+    const harness = createRendererHarness();
+    harness.clawd.style.opacity = "1";
+
+    harness.api.swapToFile("next.svg", "idle", true);
+    const rescue = harness.activeTimers().find((timer) => timer.ms === 3750);
+    rescue.callback();
+
+    assert.strictEqual(harness.api.pendingNext.tagName, "OBJECT");
+    assert.strictEqual(harness.api.pendingSvgFile, "next.svg");
+  });
 });
 
 describe("renderer Cloudling pointer bridge", () => {
@@ -140,6 +344,36 @@ describe("renderer Cloudling pointer bridge", () => {
     assert.ok(source.includes('svgWindow.__cloudlingSetPointer(payload);'));
     assert.ok(source.includes('window.electronAPI.onCloudlingPointer((payload) => {'));
     assert.ok(preload.includes('onCloudlingPointer: (callback) => ipcRenderer.on("cloudling-pointer", (_, payload) => callback(payload))'));
+  });
+});
+
+describe("renderer sound preload and warmup", () => {
+  it("preloads sound files without playing a primer", () => {
+    const harness = createRendererHarness();
+    const preload = harness.electronHandlers.onPreloadSounds;
+
+    assert.strictEqual(typeof preload, "function");
+    preload({ urls: ["file:///complete.mp3"] });
+
+    assert.strictEqual(harness.audioInstances.length, 1);
+    assert.strictEqual(harness.audioInstances[0].url, "file:///complete.mp3");
+    assert.strictEqual(harness.audioInstances[0].loadCalls, 1);
+    assert.strictEqual(harness.audioInstances[0].playCalls, 0);
+  });
+
+  it("does not reload a cached sound object on playback", () => {
+    const harness = createRendererHarness();
+    const preload = harness.electronHandlers.onPreloadSounds;
+    const playSound = harness.electronHandlers.onPlaySound;
+
+    preload({ urls: ["file:///complete.mp3"] });
+    const cached = harness.audioInstances[0];
+    playSound({ url: "file:///complete.mp3", volume: 1 });
+
+    assert.strictEqual(cached.loadCalls, 1);
+    assert.strictEqual(harness.audioInstances.length, 2);
+    assert.strictEqual(harness.audioInstances[1].url, "file:///complete.mp3");
+    assert.strictEqual(harness.audioInstances[1].playCalls, 1);
   });
 });
 

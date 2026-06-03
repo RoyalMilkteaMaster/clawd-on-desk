@@ -1,5 +1,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const sessionHud = require("../src/session-hud");
 const {
@@ -7,6 +9,11 @@ const {
   computeHudLayout,
   computeHudHeight,
   getHudWidth,
+  evaluateBaseEligible,
+  evaluateShouldShow,
+  pointInExpandedRect,
+  computeAutoHideHotZone,
+  pointInHotZone,
   constants,
 } = sessionHud.__test;
 
@@ -21,9 +28,11 @@ function mkSession(id, overrides = {}) {
 }
 
 describe("session HUD geometry", () => {
-  it("uses a narrower HUD width when elapsed time is hidden", () => {
-    assert.strictEqual(getHudWidth(true), constants.HUD_WIDTH);
-    assert.strictEqual(getHudWidth(false), constants.HUD_WIDTH_COMPACT);
+  it("uses wider HUD widths when state labels are enabled", () => {
+    assert.strictEqual(getHudWidth(true, true), constants.HUD_WIDTH_LABELS);
+    assert.strictEqual(getHudWidth(false, true), constants.HUD_WIDTH_LABELS_COMPACT);
+    assert.strictEqual(getHudWidth(true, false), constants.HUD_WIDTH);
+    assert.strictEqual(getHudWidth(false, false), constants.HUD_WIDTH_COMPACT);
 
     const result = computeSessionHudBounds({
       hitRect: { left: 10, top: 80, right: 90, bottom: 160 },
@@ -124,14 +133,30 @@ describe("session HUD layout", () => {
     assert.strictEqual(rowCount, 3);
   });
 
-  it("folds sessions beyond the 3-row cap", () => {
+  it("folds sessions beyond the 5-row label cap", () => {
+    const sessions = [];
+    const orderedIds = [];
+    for (let i = 0; i < 7; i++) {
+      sessions.push(mkSession(`s${i}`));
+      orderedIds.push(`s${i}`);
+    }
+    const { expanded, folded, rowCount } = computeHudLayout({ sessions, orderedIds });
+    assert.strictEqual(expanded.length, constants.HUD_MAX_EXPANDED_ROWS_LABELS);
+    assert.strictEqual(folded.length, 7 - constants.HUD_MAX_EXPANDED_ROWS_LABELS);
+    assert.strictEqual(rowCount, constants.HUD_MAX_EXPANDED_ROWS_LABELS + 1);
+  });
+
+  it("folds sessions beyond the 3-row cap when state labels are hidden", () => {
     const sessions = [];
     const orderedIds = [];
     for (let i = 0; i < 5; i++) {
       sessions.push(mkSession(`s${i}`));
       orderedIds.push(`s${i}`);
     }
-    const { expanded, folded, rowCount } = computeHudLayout({ sessions, orderedIds });
+    const { expanded, folded, rowCount } = computeHudLayout(
+      { sessions, orderedIds },
+      { showStateLabels: false }
+    );
     assert.strictEqual(expanded.length, constants.HUD_MAX_EXPANDED_ROWS);
     assert.strictEqual(folded.length, 5 - constants.HUD_MAX_EXPANDED_ROWS);
     assert.strictEqual(rowCount, constants.HUD_MAX_EXPANDED_ROWS + 1);
@@ -145,7 +170,7 @@ describe("session HUD layout", () => {
       mkSession("oldest"),
     ];
     const orderedIds = ["newest", "middle", "old", "oldest"];
-    const { expanded, folded } = computeHudLayout({ sessions, orderedIds });
+    const { expanded, folded } = computeHudLayout({ sessions, orderedIds }, { showStateLabels: false });
     assert.deepStrictEqual(expanded.map((s) => s.id), ["newest", "middle", "old"]);
     assert.deepStrictEqual(folded.map((s) => s.id), ["oldest"]);
   });
@@ -208,5 +233,220 @@ describe("session HUD layout", () => {
     );
     assert.strictEqual(computeHudHeight(0), constants.HUD_ROW_HEIGHT);
     assert.strictEqual(computeHudHeight(-1), constants.HUD_ROW_HEIGHT);
+  });
+});
+
+describe("session HUD auto-hide helpers", () => {
+  const baseSnapshot = { sessions: [mkSession("a")] };
+  const baseFlags = {
+    snapshot: baseSnapshot,
+    sessionHudEnabled: true,
+    sessionHudPinned: false,
+    clickRevealed: true,
+    inHotZone: false,
+    now: 1000,
+    visibleHoldUntil: 0,
+    hideGraceMs: 500,
+    petHidden: false,
+    miniMode: false,
+    miniTransitioning: false,
+  };
+
+  it("evaluateBaseEligible returns false for guard branches", () => {
+    assert.strictEqual(evaluateBaseEligible({ ...baseFlags, snapshot: null }), false);
+    assert.strictEqual(evaluateBaseEligible({ ...baseFlags, sessionHudEnabled: false }), false);
+    assert.strictEqual(evaluateBaseEligible({ ...baseFlags, petHidden: true }), false);
+    assert.strictEqual(evaluateBaseEligible({ ...baseFlags, miniMode: true }), false);
+    assert.strictEqual(evaluateBaseEligible({ ...baseFlags, miniTransitioning: true }), false);
+    assert.strictEqual(evaluateBaseEligible({ ...baseFlags, snapshot: { sessions: [] } }), false);
+    assert.strictEqual(evaluateBaseEligible(baseFlags), true);
+  });
+
+  it("evaluateShouldShow hides when clickRevealed is false (default hidden state)", () => {
+    const r = evaluateShouldShow({ ...baseFlags, clickRevealed: false, inHotZone: true });
+    assert.strictEqual(r.show, false);
+    assert.strictEqual(r.nextHoldUntil, 0);
+  });
+
+  it("evaluateShouldShow hides when revealed + unpinned + outside zone + hold expired", () => {
+    const r = evaluateShouldShow({
+      ...baseFlags,
+      clickRevealed: true,
+      sessionHudPinned: false,
+      inHotZone: false,
+      visibleHoldUntil: 500,
+      now: 1000,
+    });
+    assert.strictEqual(r.show, false);
+    assert.strictEqual(r.nextHoldUntil, 500);
+  });
+
+  it("evaluateShouldShow shows when pinned regardless of clickRevealed or zone", () => {
+    const r = evaluateShouldShow({
+      ...baseFlags,
+      clickRevealed: false,
+      sessionHudPinned: true,
+      inHotZone: false,
+    });
+    assert.strictEqual(r.show, true);
+  });
+
+  it("evaluateShouldShow advances visibleHoldUntil when revealed and in hot zone", () => {
+    const r = evaluateShouldShow({
+      ...baseFlags,
+      clickRevealed: true,
+      inHotZone: true,
+      now: 1000,
+      visibleHoldUntil: 0,
+      hideGraceMs: 500,
+    });
+    assert.strictEqual(r.show, true);
+    assert.strictEqual(r.nextHoldUntil, 1500);
+  });
+
+  it("evaluateShouldShow keeps HUD visible during hold-grace window after revealed", () => {
+    const r = evaluateShouldShow({
+      ...baseFlags,
+      clickRevealed: true,
+      inHotZone: false,
+      now: 1200,
+      visibleHoldUntil: 1500,
+    });
+    assert.strictEqual(r.show, true);
+  });
+
+  it("evaluateShouldShow hides once now >= visibleHoldUntil in revealed state", () => {
+    const r = evaluateShouldShow({
+      ...baseFlags,
+      clickRevealed: true,
+      inHotZone: false,
+      now: 1500,
+      visibleHoldUntil: 1500,
+    });
+    assert.strictEqual(r.show, false);
+  });
+
+  it("evaluateShouldShow honors base guards even when revealed", () => {
+    const r = evaluateShouldShow({
+      ...baseFlags,
+      clickRevealed: true,
+      petHidden: true,
+      inHotZone: true,
+    });
+    assert.strictEqual(r.show, false);
+  });
+
+  it("pointInExpandedRect respects pad on all sides", () => {
+    const rect = { left: 10, top: 10, right: 30, bottom: 30 };
+    assert.strictEqual(pointInExpandedRect({ x: 20, y: 20 }, rect, 0), true);
+    assert.strictEqual(pointInExpandedRect({ x: 5, y: 20 }, rect, 0), false);
+    assert.strictEqual(pointInExpandedRect({ x: 5, y: 20 }, rect, 8), true);
+    assert.strictEqual(pointInExpandedRect({ x: -5, y: 20 }, rect, 8), false);
+    assert.strictEqual(pointInExpandedRect(null, rect, 0), false);
+    assert.strictEqual(pointInExpandedRect({ x: 0, y: 0 }, null, 0), false);
+  });
+
+  it("computeAutoHideHotZone collects pet + expected HUD bounds, skips invalid", () => {
+    const z1 = computeAutoHideHotZone({
+      petHitRect: { left: 0, top: 0, right: 80, bottom: 80 },
+      expectedHudContentBounds: { x: 0, y: 90, width: 240, height: 28 },
+      pad: 24,
+    });
+    assert.strictEqual(z1.rects.length, 2);
+    assert.strictEqual(z1.pad, 24);
+
+    const z2 = computeAutoHideHotZone({
+      petHitRect: { left: 0, top: 0, right: 80, bottom: 80 },
+      expectedHudContentBounds: null,
+      pad: 24,
+    });
+    assert.strictEqual(z2.rects.length, 1);
+
+    const z3 = computeAutoHideHotZone({
+      petHitRect: null,
+      expectedHudContentBounds: null,
+      pad: 24,
+    });
+    assert.strictEqual(z3.rects.length, 0);
+  });
+
+  it("pointInHotZone treats union of expanded rects", () => {
+    const zone = computeAutoHideHotZone({
+      petHitRect: { left: 0, top: 0, right: 80, bottom: 80 },
+      expectedHudContentBounds: { x: 0, y: 100, width: 240, height: 28 },
+      pad: 24,
+    });
+    assert.strictEqual(pointInHotZone({ x: 40, y: 40 }, zone), true); // pet
+    assert.strictEqual(pointInHotZone({ x: 100, y: 110 }, zone), true); // hud
+    assert.strictEqual(pointInHotZone({ x: 40, y: 90 }, zone), true); // gap covered by pad expansion
+    assert.strictEqual(pointInHotZone({ x: 500, y: 500 }, zone), false);
+  });
+});
+
+describe("session HUD v5 three-state runtime contracts (source-level)", () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, "..", "src", "session-hud.js"),
+    "utf8"
+  );
+
+  it("revealFromPet seeds visibleHoldUntil with HIDE_GRACE_MS (HIGH 3 fix)", () => {
+    // Inside revealFromPet, after setting clickRevealed, must seed hold.
+    const revealFn = src.match(/function revealFromPet\(\)\s*\{[\s\S]*?\n  \}/);
+    assert.ok(revealFn, "revealFromPet function missing");
+    assert.ok(
+      /visibleHoldUntil\s*=\s*Date\.now\(\)\s*\+\s*HIDE_GRACE_MS/.test(revealFn[0]),
+      "revealFromPet must seed visibleHoldUntil = Date.now() + HIDE_GRACE_MS"
+    );
+    assert.ok(
+      /clickRevealed\s*=\s*true/.test(revealFn[0]),
+      "revealFromPet must set clickRevealed=true"
+    );
+  });
+
+  it("handlePinnedChanged(false) reads real hudWindow.isVisible(), NOT shouldShow() (HIGH 2 fix)", () => {
+    const pinFn = src.match(/function handlePinnedChanged\([\s\S]*?\n  \}/);
+    assert.ok(pinFn, "handlePinnedChanged function missing");
+    // Must read real window visibility — router has already mirrored
+    // sessionHudPinned=false, so calling shouldShow() would return false.
+    assert.ok(
+      /hudWindow\.isVisible\(\)/.test(pinFn[0]),
+      "handlePinnedChanged must read hudWindow.isVisible() for unpin transition"
+    );
+    assert.ok(
+      !/wasVisible\s*=\s*shouldShow\(/.test(pinFn[0]),
+      "handlePinnedChanged must NOT rely on shouldShow() to detect visibility"
+    );
+  });
+
+  it("syncSessionHud entry clears clickRevealed when baseEligible drops (HIGH 1 stale defense)", () => {
+    const syncFn = src.match(/function syncSessionHud\([\s\S]*?\n  \}/);
+    assert.ok(syncFn, "syncSessionHud function missing");
+    assert.ok(
+      /if\s*\(!baseEligible\(snapshot\)\)\s*\{[\s\S]{0,80}clearReveal\(\)/.test(syncFn[0]),
+      "syncSessionHud must clearReveal() when !baseEligible(snapshot)"
+    );
+  });
+
+  it("isAutoHidePollingNeeded gates on clickRevealed only (no hover-mode regression)", () => {
+    const pollFn = src.match(/function isAutoHidePollingNeeded\(\)\s*\{[\s\S]*?\n  \}/);
+    assert.ok(pollFn, "isAutoHidePollingNeeded function missing");
+    assert.ok(
+      /return\s+clickRevealed\s*===\s*true/.test(pollFn[0]),
+      "polling must require clickRevealed (not autoHide)"
+    );
+    assert.ok(
+      !/sessionHudAutoHide/.test(pollFn[0]),
+      "polling must NOT reference removed sessionHudAutoHide"
+    );
+  });
+
+  it("exposes v5 three-state API surface", () => {
+    assert.ok(/revealFromPet,\s*\n\s*handlePinnedChanged,\s*\n\s*clearReveal/.test(src),
+      "module return must expose revealFromPet/handlePinnedChanged/clearReveal");
+  });
+
+  it("snapshot to renderer no longer includes hudAutoHide", () => {
+    assert.ok(!/hudAutoHide:/.test(src),
+      "session-hud must not send hudAutoHide in snapshot");
   });
 });

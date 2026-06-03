@@ -21,14 +21,24 @@ const path = require("path");
 const { isPlainObject } = require("./theme-loader");
 const { normalizeShortcuts, getDefaultShortcuts } = require("./shortcut-actions");
 const { isValidDisplaySnapshot } = require("./work-area");
+const { normalizeRemoteSsh, getDefaults: getRemoteSshDefaults } = require("./remote-ssh-profile");
+const {
+  cloneDefaultTelegramApproval,
+  normalizeTelegramApproval,
+} = require("./telegram-approval-settings");
+const {
+  DEFAULT_HARDWARE_BUDDY_SETTINGS,
+  normalizeHardwareBuddySettings,
+} = require("./hardware-buddy-settings");
 const {
   NOTIFICATION_DEFAULT_SECONDS,
   UPDATE_DEFAULT_SECONDS,
+  PERMISSION_DEFAULT_SECONDS,
   MAX_AUTO_CLOSE_SECONDS,
 } = require("./bubble-policy");
 const { normalizeSessionAliases } = require("./session-alias");
 
-const CURRENT_VERSION = 1;
+const CURRENT_VERSION = 8;
 
 // ── Schema ──
 // Each field has: type, default OR defaultFactory, optional enum/normalize/validate.
@@ -72,7 +82,7 @@ const SCHEMA = {
   preMiniX: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   preMiniY: { type: "number", default: 0, validate: (v) => Number.isFinite(v) },
   // Pure data prefs
-  lang: { type: "string", default: "en", enum: ["en", "zh", "ko", "ja"] },
+  lang: { type: "string", default: "en", enum: ["en", "zh", "zh-TW", "ko", "ja"] },
   showTray: { type: "boolean", default: true },
   showDock: { type: "boolean", default: true },
   manageClaudeHooksAutomatically: { type: "boolean", default: true },
@@ -86,13 +96,39 @@ const SCHEMA = {
   openAtLoginHydrated: { type: "boolean", default: false },
   bubbleFollowPet: { type: "boolean", default: false },
   sessionHudEnabled: { type: "boolean", default: true },
+  sessionHudShowStateLabels: { type: "boolean", default: true },
   sessionHudShowElapsed: { type: "boolean", default: true },
   sessionHudCleanupDetached: { type: "boolean", default: false },
+  sessionHudPinned: { type: "boolean", default: false },
+  // Stale-cleanup intervals (ms). Defaults match the historical constants in
+  // state-stale-cleanup.js so upgrading users see no behavioral change.
+  // sessionStaleMs = 0 means "never drop a session by idle age".
+  sessionStaleMs: {
+    type: "number",
+    default: 600000,
+    validate: (v) =>
+      Number.isInteger(v) && (v === 0 || (v >= 60_000 && v <= 86_400_000)),
+  },
+  workingStaleMs: {
+    type: "number",
+    default: 300000,
+    validate: (v) => Number.isInteger(v) && v >= 30_000 && v <= 86_400_000,
+  },
+  detachedIdleStaleMs: {
+    type: "number",
+    default: 30000,
+    validate: (v) => Number.isInteger(v) && v >= 5_000 && v <= 300_000,
+  },
   hideBubbles: { type: "boolean", default: false },
   permissionBubblesEnabled: { type: "boolean", default: true },
   notificationBubbleAutoCloseSeconds: {
     type: "number",
     default: NOTIFICATION_DEFAULT_SECONDS,
+    validate: (v) => Number.isInteger(v) && v >= 0 && v <= MAX_AUTO_CLOSE_SECONDS,
+  },
+  permissionBubbleAutoCloseSeconds: {
+    type: "number",
+    default: PERMISSION_DEFAULT_SECONDS,
     validate: (v) => Number.isInteger(v) && v >= 0 && v <= MAX_AUTO_CLOSE_SECONDS,
   },
   updateBubbleAutoCloseSeconds: {
@@ -106,7 +142,22 @@ const SCHEMA = {
     default: 1,
     validate: (v) => Number.isFinite(v) && v >= 0 && v <= 1,
   },
+  flashTaskbarOnComplete: { type: "boolean", default: true },
+  flashIntervalMs: {
+    type: "number",
+    default: 500,
+    validate: (v) => Number.isInteger(v) && v >= 200 && v <= 2000,
+  },
+  flashDurationMs: {
+    type: "number",
+    default: 5000,
+    validate: (v) => Number.isInteger(v) && v >= 0 && v <= 60000,
+  },
   lowPowerIdleMode: { type: "boolean", default: false },
+  mobilePreviewEnabled: { type: "boolean", default: false },
+  // When true, prevent the OS from sleeping while any agent task is in
+  // progress (working/thinking/etc.); allow sleep again once tasks finish.
+  keepAwakeWhileWorking: { type: "boolean", default: false },
   allowEdgePinning: { type: "boolean", default: false },
   // When true, moving the pet between displays does not trigger a
   // proportional pixel-size recomputation. The pet keeps its current
@@ -124,14 +175,23 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => ({
       "claude-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept" },
+      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
       "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      // Antigravity is state-only post-D2 — Clawd never surfaces a permission
+      // bubble for agy regardless of this flag (see server-route-permission.js
+      // antigravity branch). Default kept as false so legacy reads don't see a
+      // stale "true" implying bubbles are enabled.
+      "antigravity-cli": { enabled: true, permissionsEnabled: false },
       "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "kimi-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "qwen-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "pi": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
+      "openclaw": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
+      "hermes": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
   },
@@ -152,6 +212,69 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => ({}),
     normalize: normalizeSessionAliases,
+  },
+  // Remote SSH (Phase 2 plan-remote-ssh-one-click v7). Stores user-defined
+  // SSH tunnel profiles. The runtime is owned by `remote-ssh-runtime.js` —
+  // this field is data only.
+  remoteSsh: {
+    type: "object",
+    defaultFactory: () => getRemoteSshDefaults(),
+    normalize: normalizeRemoteSsh,
+  },
+  tgApproval: {
+    type: "object",
+    defaultFactory: () => cloneDefaultTelegramApproval(),
+    normalize: normalizeTelegramApproval,
+  },
+  // v0.9.0 migration state. transport defaults to null (undecided) so v0.8.x
+  // users upgrading without this key fall onto the "detect legacy artefacts"
+  // path inside the migration reducer.
+  tgMigration: {
+    type: "object",
+    defaultFactory: () => ({
+      transport: null,
+      nativeVerifiedAt: null,
+      legacyEnabled: null,
+      migration: { importedAt: null, importError: null },
+    }),
+    normalize: (value) => {
+      if (!value || typeof value !== "object") {
+        return { transport: null, nativeVerifiedAt: null, legacyEnabled: null, migration: { importedAt: null, importError: null } };
+      }
+      return {
+        transport: ["legacy", "native", "off"].includes(value.transport) ? value.transport : null,
+        nativeVerifiedAt: typeof value.nativeVerifiedAt === "number" ? value.nativeVerifiedAt : null,
+        legacyEnabled: typeof value.legacyEnabled === "boolean" ? value.legacyEnabled : null,
+        migration: value.migration && typeof value.migration === "object"
+          ? {
+              importedAt: typeof value.migration.importedAt === "number" ? value.migration.importedAt : null,
+              importError: typeof value.migration.importError === "string" ? value.migration.importError : null,
+            }
+          : { importedAt: null, importError: null },
+      };
+    },
+  },
+  hardwareBuddy: {
+    type: "object",
+    defaultFactory: () => ({ ...DEFAULT_HARDWARE_BUDDY_SETTINGS }),
+    normalize: normalizeHardwareBuddySettings,
+  },
+  // Background update-check toggle. When true, the scheduler in updater.js
+  // runs a quiet GitHub discovery on a 12-hour cycle (packaged builds only).
+  // Default on per #329.
+  autoUpdateCheck: { type: "boolean", default: true },
+  // Last version the scheduler discovered that is newer than the running
+  // app. Empty string = none pending. Surfaced in the tray label and the
+  // About version-row hint. Cleared on install or by
+  // reconcilePendingOnStartup() when app.getVersion() catches up.
+  pendingUpdateVersion: { type: "string", default: "" },
+  // Versions the user explicitly dismissed (clicked Later on the scheduler
+  // bubble after actually seeing it). Object map of `{ "v0.9.0": true }`
+  // because prefs.js does not support `type: "array"` (see isValidValue).
+  dismissedUpdateVersions: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeDismissedUpdateVersions,
   },
 };
 
@@ -200,6 +323,25 @@ function validate(raw) {
     }
     // else: keep default already in `out`
   }
+  normalizeStaleTriple(out);
+  return out;
+}
+
+// Hand-edited-file fallback: if a user manually inverted the pair in
+// clawd-prefs.json, clamp workingStaleMs down to sessionStaleMs at load time
+// so the live mirror is consistent. Primary enforcement lives in the
+// per-key validators in settings-actions.js and the
+// commandRegistry["sessionCleanup.setTriple"] command — this function is
+// only the boot-time safety net for files that bypass the controller.
+function normalizeStaleTriple(out) {
+  if (
+    Number.isFinite(out.sessionStaleMs) &&
+    out.sessionStaleMs > 0 &&
+    Number.isFinite(out.workingStaleMs) &&
+    out.workingStaleMs > out.sessionStaleMs
+  ) {
+    out.workingStaleMs = out.sessionStaleMs;
+  }
   return out;
 }
 
@@ -209,6 +351,14 @@ function validate(raw) {
 // v0 → v1: add `version`, `agents`, `themeOverrides` fields. Existing fields
 //   stay as-is and get re-validated downstream. Pre-existing prefs files have
 //   no `version` key — that's the v0 marker.
+// v1 → v2: historical Pi permission-subgate backfill. Version 2 is also the
+//   first schema version that includes Hermes in the built-in agent defaults.
+// v2 → v3: raise passive notification bubble default from 3s to 6s. Users
+//   who explicitly chose 3s in v2 are indistinguishable from defaulted-3 and
+//   are migrated too; other non-default values are preserved.
+// v3 → v4: Pi returns to a state-only integration. Clawd no longer inserts a
+//   permission prompt into Pi's default YOLO flow, so the Pi permission subgate
+//   is reset off.
 function migrate(raw) {
   if (!raw || typeof raw !== "object") return raw;
   const out = { ...raw };
@@ -241,12 +391,99 @@ function migrate(raw) {
       out.updateBubbleAutoCloseSeconds = out.hideBubbles ? 0 : UPDATE_DEFAULT_SECONDS;
     }
   }
+  // v1 -> v2 historical backfill for the short-lived Pi permission subgate.
+  // v4 below resets it off again because Pi is state-only.
+  if (out.version < 2) {
+    if (!out.agents || typeof out.agents !== "object") out.agents = {};
+    const currentPi = out.agents.pi && typeof out.agents.pi === "object" ? out.agents.pi : {};
+    out.agents.pi = {
+      ...currentPi,
+      enabled: typeof currentPi.enabled === "boolean" ? currentPi.enabled : true,
+      permissionsEnabled: typeof currentPi.permissionsEnabled === "boolean"
+        ? currentPi.permissionsEnabled
+        : true,
+      notificationHookEnabled: typeof currentPi.notificationHookEnabled === "boolean"
+        ? currentPi.notificationHookEnabled
+        : true,
+    };
+    out.version = 2;
+  }
+  if (out.version < 3) {
+    if (out.notificationBubbleAutoCloseSeconds === 3) {
+      out.notificationBubbleAutoCloseSeconds = NOTIFICATION_DEFAULT_SECONDS;
+    }
+    out.version = 3;
+  }
+  if (out.version < 4) {
+    if (!out.agents || typeof out.agents !== "object") out.agents = {};
+    const currentPi = out.agents.pi && typeof out.agents.pi === "object" ? out.agents.pi : {};
+    out.agents.pi = {
+      ...currentPi,
+      enabled: typeof currentPi.enabled === "boolean" ? currentPi.enabled : true,
+      permissionsEnabled: false,
+      notificationHookEnabled: typeof currentPi.notificationHookEnabled === "boolean"
+        ? currentPi.notificationHookEnabled
+        : true,
+    };
+    out.version = 4;
+  }
+  // v4 → v5: Session HUD hover/auto-hide mode removed in favor of explicit
+  // click-to-reveal. Users who explicitly opted out of auto-hide (
+  // `sessionHudAutoHide === false`, meaning "always show") get auto-pinned so
+  // their visual behavior is preserved. The deprecated field is dropped.
+  if (out.version < 5) {
+    if (out.sessionHudAutoHide === false && out.sessionHudPinned !== true) {
+      out.sessionHudPinned = true;
+    }
+    delete out.sessionHudAutoHide;
+    out.version = 5;
+  }
+  // v5 → v6: introduce autoUpdateCheck / pendingUpdateVersion /
+  // dismissedUpdateVersions for the #329 scheduler. No data conversion
+  // needed — new keys fill in from schema defaults via validate(); the
+  // version bump just records that the schema grew.
+  if (out.version < 6) {
+    out.version = 6;
+  }
+  // v6 → v7: Codex Native permission prompt sound now defaults off. Early
+  // builds may have written the old default true into prefs, so reset that
+  // default-like value during migration; users can turn the switch back on.
+  if (out.version < 7) {
+    if (out.agents && typeof out.agents === "object") {
+      const codex = out.agents.codex;
+      if (codex && typeof codex === "object") {
+        codex.nativeNotificationSoundEnabled = false;
+      }
+    }
+    out.version = 7;
+  }
+  // v7 -> v8: bare Telegram completion pings now default off. There was no
+  // UI for this flag, so a persisted true is overwhelmingly the old default
+  // rather than an explicit user opt-in.
+  if (out.version < 8) {
+    if (out.tgApproval && typeof out.tgApproval === "object") {
+      out.tgApproval.notifyOnComplete = false;
+    }
+    out.version = 8;
+  }
+  if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
+    out.version = CURRENT_VERSION;
+  }
   // Future migrations slot in here as `if (out.version < N) { ... out.version = N }`.
   return out;
 }
 
-const AGENT_FLAGS = ["enabled", "permissionsEnabled", "notificationHookEnabled"];
+const AGENT_FLAGS = ["enabled", "permissionsEnabled", "notificationHookEnabled", "nativeNotificationSoundEnabled"];
 const CODEX_PERMISSION_MODES = ["native", "intercept"];
+
+function normalizeDismissedUpdateVersions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (typeof key === "string" && key && value[key] === true) out[key] = true;
+  }
+  return out;
+}
 
 function normalizePositionDisplay(value) {
   if (!isValidDisplaySnapshot(value)) return null;
@@ -277,7 +514,8 @@ function normalizeAgents(value, defaultsValue) {
       || { enabled: true, permissionsEnabled: true, notificationHookEnabled: true };
     const merged = { ...base };
     let touched = false;
-    for (const flag of AGENT_FLAGS) {
+    const allowedFlags = AGENT_FLAGS.filter((flag) => Object.prototype.hasOwnProperty.call(base, flag));
+    for (const flag of allowedFlags) {
       if (typeof entry[flag] === "boolean") {
         merged[flag] = entry[flag];
         touched = true;

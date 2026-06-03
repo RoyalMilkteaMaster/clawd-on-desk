@@ -89,6 +89,92 @@ describe("updateSession: Notification hook gate", () => {
     assert.deepStrictEqual(ctx._soundsPlayed, ["confirm"], "confirm sound must play");
   });
 
+  it("mutes mini alert for post-completion idle Notification while keeping bookkeeping", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    ctx.miniMode = true;
+    api = require("../src/state")(ctx);
+
+    api.updateSession("cc-1", "attention", "Stop", { agentId: "claude-code" });
+    assert.strictEqual(api.getCurrentState(), "mini-happy", "completion should still show mini-happy");
+
+    mock.timers.tick(defaultTheme.timings.autoReturn["mini-happy"] + 1);
+    assert.strictEqual(api.getCurrentState(), "mini-idle", "mini-happy should settle before the idle ping");
+    ctx._rendererEvents.length = 0;
+    ctx._soundsPlayed.length = 0;
+
+    api.updateSession("cc-1", "notification", "Notification", { agentId: "claude-code" });
+
+    const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
+    assert.ok(stateChanges.every(([, s]) => s !== "mini-alert"), "post-completion idle ping must not show mini-alert");
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "post-completion idle ping must not play confirm");
+    assert.deepStrictEqual(
+      api.sessions.get("cc-1").recentEvents.map((entry) => entry.event),
+      ["Stop", "Notification"],
+      "Notification event should still be recorded"
+    );
+  });
+
+  it("keeps standalone mini Notification alerts enabled", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    ctx.miniMode = true;
+    api = require("../src/state")(ctx);
+
+    api.updateSession("cc-1", "notification", "Notification", { agentId: "claude-code" });
+
+    const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
+    assert.ok(stateChanges.length >= 1, "standalone mini notification should still broadcast");
+    assert.strictEqual(stateChanges[0][1], "mini-alert");
+    assert.deepStrictEqual(ctx._soundsPlayed, ["confirm"], "standalone mini notification should still chime");
+  });
+
+  it("restores mini Notification alerts after user activity follows completion", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    ctx.miniMode = true;
+    api = require("../src/state")(ctx);
+
+    api.updateSession("cc-1", "attention", "Stop", { agentId: "claude-code" });
+    mock.timers.tick(defaultTheme.timings.autoReturn["mini-happy"] + 1);
+    ctx._rendererEvents.length = 0;
+    ctx._soundsPlayed.length = 0;
+
+    api.updateSession("cc-1", "thinking", "UserPromptSubmit", { agentId: "claude-code" });
+    assert.strictEqual(
+      api.sessions.get("cc-1").awaitingInputSinceStop,
+      false,
+      "new user activity should clear the post-completion idle tail"
+    );
+    ctx._rendererEvents.length = 0;
+    ctx._soundsPlayed.length = 0;
+
+    api.updateSession("cc-1", "notification", "Notification", { agentId: "claude-code" });
+
+    const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
+    assert.ok(stateChanges.length >= 1, "notification after user activity should broadcast");
+    assert.strictEqual(stateChanges[0][1], "mini-alert");
+    assert.deepStrictEqual(ctx._soundsPlayed, ["confirm"], "notification after user activity should chime");
+  });
+
+  it("keeps post-completion Notification alerts enabled outside mini mode", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("cc-1", "attention", "Stop", { agentId: "claude-code" });
+    mock.timers.tick(defaultTheme.timings.autoReturn.attention + 1);
+    ctx._rendererEvents.length = 0;
+    ctx._soundsPlayed.length = 0;
+
+    api.updateSession("cc-1", "notification", "Notification", { agentId: "claude-code" });
+
+    const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
+    assert.ok(stateChanges.length >= 1, "normal-mode wait-for-input alert should still broadcast");
+    assert.strictEqual(stateChanges[0][1], "notification");
+    assert.deepStrictEqual(ctx._soundsPlayed, ["confirm"], "normal-mode wait-for-input alert should still chime");
+  });
+
   it("mutes Gemini Notification bell + animation when the per-agent flag is off", () => {
     mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
     ctx = makeCtx({ notificationHookEnabled: false });
@@ -130,6 +216,97 @@ describe("updateSession: Notification hook gate", () => {
     const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
     assert.ok(stateChanges.length >= 1, "permission request must still broadcast notification");
     assert.strictEqual(stateChanges[0][1], "notification");
+  });
+
+  it("can mute only the Codex native PermissionRequest prompt sound", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex-1", "notification", "PermissionRequest", {
+      agentId: "codex",
+      muteNotificationSound: true,
+    });
+
+    const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
+    assert.ok(stateChanges.length >= 1, "Codex native prompt must still show notification");
+    assert.strictEqual(stateChanges[0][1], "notification");
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "Codex native prompt sound must be muted");
+  });
+
+  it("lets Codex PermissionRequest play confirm when no mute flag is set", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex-1", "notification", "PermissionRequest", {
+      agentId: "codex",
+    });
+
+    assert.deepStrictEqual(ctx._soundsPlayed, ["confirm"], "baseline prompt sound must still play");
+  });
+
+  it("keeps Codex native prompt sound muted across notification auto-return", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex-1", "notification", "PermissionRequest", {
+      agentId: "codex",
+      sourcePid: 123,
+      muteNotificationSound: true,
+    });
+
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "initial prompt sound must be muted");
+    mock.timers.tick(defaultTheme.timings.autoReturn.notification + 1);
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "auto-return re-resolve must not replay confirm");
+  });
+
+  it("keeps Codex native prompt sound muted through the pending min-display path", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    api = require("../src/state")(ctx);
+
+    api.applyState("attention");
+    ctx._soundsPlayed.length = 0;
+    api.updateSession("codex-1", "notification", "PermissionRequest", {
+      agentId: "codex",
+      muteNotificationSound: true,
+    });
+
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "pending notification should not sound immediately");
+    mock.timers.tick(defaultTheme.timings.minDisplay.attention + 1);
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "pending notification must preserve mute options");
+  });
+
+  it("mutes Codex native prompt sound in mini-alert mode", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    ctx.miniMode = true;
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex-1", "notification", "PermissionRequest", {
+      agentId: "codex",
+      muteNotificationSound: true,
+    });
+
+    const stateChanges = ctx._rendererEvents.filter(([ch]) => ch === "state-change");
+    assert.ok(stateChanges.length >= 1, "mini mode should still show the alert animation");
+    assert.strictEqual(stateChanges[0][1], "mini-alert");
+    assert.deepStrictEqual(ctx._soundsPlayed, [], "mini-alert prompt sound must be muted");
+  });
+
+  it("keeps Codex completion sound even when native prompt sound is muted", () => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx({ notificationHookEnabled: true });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex-1", "attention", "Stop", {
+      agentId: "codex",
+      muteNotificationSound: true,
+    });
+
+    assert.deepStrictEqual(ctx._soundsPlayed, ["complete"], "completion sound must still play");
   });
 
   it("never drops Elicitation events even when the flag is off", () => {

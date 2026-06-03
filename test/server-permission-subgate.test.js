@@ -3,7 +3,10 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
 
-const { shouldBypassCCBubble, shouldBypassOpencodeBubble } = require("../src/server").__test;
+const {
+  shouldBypassCCBubble,
+  shouldBypassOpencodeBubble,
+} = require("../src/server").__test;
 
 function makeCtx({ enabled = true, hideBubbles = false, permissionBubblesEnabled = true } = {}) {
   return {
@@ -96,3 +99,7 @@ describe("shouldBypassOpencodeBubble", () => {
     assert.strictEqual(shouldBypassOpencodeBubble({}), false);
   });
 });
+
+// D2/D3: shouldBypassAntigravityBubble and shouldBypassPiBubble are absent
+// because both integrations are state-only; no bubble path exists for a
+// subgate to gate.

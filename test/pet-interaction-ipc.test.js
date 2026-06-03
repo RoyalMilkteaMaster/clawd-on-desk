@@ -77,6 +77,7 @@ function createHarness(overrides = {}) {
     showDashboard: () => calls.push(["showDashboard"]),
     focusSession: (sessionId, options) => calls.push(["focusSession", sessionId, options]),
     setLowPowerIdlePaused: (value) => calls.push(["setLowPowerIdlePaused", value]),
+    revealSessionHud: () => calls.push(["revealSessionHud"]),
   });
   return { ipcMain, runtime, calls, state };
 }
@@ -93,6 +94,7 @@ test("pet interaction IPC registers owned channels and disposes them", () => {
     "focus-terminal",
     "low-power-idle-paused",
     "pause-cursor-polling",
+    "pet-interaction:reveal-session-hud",
     "play-click-reaction",
     "resume-from-reaction",
     "show-context-menu",
@@ -102,6 +104,14 @@ test("pet interaction IPC registers owned channels and disposes them", () => {
   runtime.dispose();
 
   assert.strictEqual(ipcMain.listeners.size, 0);
+});
+
+test("pet interaction IPC delegates pet-interaction:reveal-session-hud to revealSessionHud", () => {
+  const { ipcMain, calls } = createHarness();
+  ipcMain.send("pet-interaction:reveal-session-hud");
+  assert.deepStrictEqual(calls.filter((c) => c[0] === "revealSessionHud"), [
+    ["revealSessionHud"],
+  ]);
 });
 
 test("pet interaction IPC delegates menu, drag move, reaction pause, and renderer relays", () => {
@@ -128,9 +138,23 @@ test("pet interaction IPC delegates menu, drag move, reaction pause, and rendere
     ["setLowPowerIdlePaused", true],
     ["setLowPowerIdlePaused", false],
     ["setIdlePaused", false],
-    ["sendToRenderer", "start-drag-reaction"],
+    ["sendToRenderer", "start-drag-reaction", null],
     ["sendToRenderer", "end-drag-reaction"],
     ["sendToRenderer", "play-click-reaction", "click.svg", 900],
+  ]);
+});
+
+test("pet interaction IPC relays only supported drag directions", () => {
+  const { ipcMain, calls } = createHarness();
+
+  ipcMain.send("start-drag-reaction", "left");
+  ipcMain.send("start-drag-reaction", "right");
+  ipcMain.send("start-drag-reaction", "up");
+
+  assert.deepStrictEqual(calls, [
+    ["sendToRenderer", "start-drag-reaction", "left"],
+    ["sendToRenderer", "start-drag-reaction", "right"],
+    ["sendToRenderer", "start-drag-reaction", null],
   ]);
 });
 

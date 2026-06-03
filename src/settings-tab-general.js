@@ -4,9 +4,14 @@
   const GENERAL_IN_PLACE_KEYS = new Set([
     "size",
     "soundMuted",
+    "flashTaskbarOnComplete",
+    "flashIntervalMs",
+    "flashDurationMs",
     "soundVolume",
     "lowPowerIdleMode",
+    "keepAwakeWhileWorking",
     "sessionHudEnabled",
+    "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
     "sessionHudCleanupDetached",
     "allowEdgePinning",
@@ -19,28 +24,52 @@
     "permissionBubblesEnabled",
     "notificationBubbleAutoCloseSeconds",
     "updateBubbleAutoCloseSeconds",
+    "sessionStaleMs",
+    "workingStaleMs",
+    "detachedIdleStaleMs",
   ]);
   const BUBBLE_POLICY_KEYS = new Set([
     "permissionBubblesEnabled",
+    "permissionBubbleAutoCloseSeconds",
     "notificationBubbleAutoCloseSeconds",
     "updateBubbleAutoCloseSeconds",
   ]);
+  const SESSION_CLEANUP_NUMBER_KEYS = new Set([
+    "sessionStaleMs",
+    "workingStaleMs",
+    "detachedIdleStaleMs",
+  ]);
+  const FLASH_NUMBER_KEYS = new Set([
+    "flashIntervalMs",
+    "flashDurationMs",
+  ]);
+  const SESSION_CLEANUP_DEFAULTS = {
+    sessionStaleMs: 600_000,
+    workingStaleMs: 300_000,
+    detachedIdleStaleMs: 30_000,
+  };
   const SESSION_HUD_CHILD_SWITCH_KEYS = [
+    "sessionHudShowStateLabels",
     "sessionHudShowElapsed",
     "sessionHudCleanupDetached",
   ];
+  const SESSION_HUD_SUMMARY_KEYS = new Set([
+    "sessionHudEnabled",
+    "sessionHudShowStateLabels",
+    "sessionHudShowElapsed",
+    "sessionHudCleanupDetached",
+  ]);
   const CLAUDE_HOOK_MANAGEMENT_CHILD_SWITCH_KEYS = [
     "autoStartWithClaude",
   ];
   const BUBBLE_SECONDS_AUTO_COMMIT_DELAY_MS = 600;
 
   let state = null;
-  let runtime = null;
   let readers = null;
   let helpers = null;
   let ops = null;
 
-  const LANGUAGE_OPTIONS = ["en", "zh", "ko", "ja"];
+  const LANGUAGE_OPTIONS = ["en", "zh", "zh-TW", "ko", "ja"];
 
   function t(key) {
     return helpers.t(key);
@@ -56,40 +85,21 @@
     subtitle.textContent = t("settingsSubtitle");
     parent.appendChild(subtitle);
 
-    const sessionHudControlsEnabled = !!(state.snapshot && state.snapshot.sessionHudEnabled);
     parent.appendChild(helpers.buildSection(t("sectionAppearance"), [
       buildLanguageRow(),
       buildSizeSliderRow(),
-      helpers.buildSwitchRow({
-        key: "sessionHudEnabled",
-        labelKey: "rowSessionHud",
-        descKey: "rowSessionHudDesc",
-      }),
-      helpers.buildSwitchRow({
-        key: "sessionHudShowElapsed",
-        labelKey: "rowSessionHudElapsed",
-        descKey: "rowSessionHudElapsedDesc",
-        disabled: !sessionHudControlsEnabled,
-      }),
-      helpers.buildSwitchRow({
-        key: "sessionHudCleanupDetached",
-        labelKey: "rowSessionHudCleanupDetached",
-        descKey: "rowSessionHudCleanupDetachedDesc",
-        disabled: !sessionHudControlsEnabled,
-      }),
-      buildDashboardRow(),
-      helpers.buildSwitchRow({
-        key: "soundMuted",
-        labelKey: "rowSound",
-        descKey: "rowSoundDesc",
-        invert: true,
-      }),
-      buildVolumeSliderRow(),
+      buildSoundGroup(),
       helpers.buildSwitchRow({
         key: "lowPowerIdleMode",
         labelKey: "rowLowPowerIdleMode",
         descKey: "rowLowPowerIdleModeDesc",
       }),
+      helpers.buildSwitchRow({
+        key: "keepAwakeWhileWorking",
+        labelKey: "rowKeepAwakeWhileWorking",
+        descKey: "rowKeepAwakeWhileWorkingDesc",
+      }),
+      buildFlashGroup(),
       helpers.buildSwitchRow({
         key: "allowEdgePinning",
         labelKey: "rowAllowEdgePinning",
@@ -100,6 +110,12 @@
         labelKey: "rowKeepSizeAcrossDisplays",
         descKey: "rowKeepSizeAcrossDisplaysDesc",
       }),
+    ]));
+
+    parent.appendChild(helpers.buildSection(t("sectionSession"), [
+      buildSessionHudGroup(),
+      buildSessionCleanupGroup(),
+      buildDashboardRow(),
     ]));
 
     const manageClaudeHooksEnabled = !!(state.snapshot && state.snapshot.manageClaudeHooksAutomatically);
@@ -136,12 +152,12 @@
         descKey: "rowHideBubblesDesc",
         onToggle: ({ nextRaw }) => window.settingsAPI.command("setAllBubblesHidden", { hidden: nextRaw }),
       }),
+      buildBubblePolicyRow(),
       helpers.buildSwitchRow({
         key: "bubbleFollowPet",
         labelKey: "rowBubbleFollow",
         descKey: "rowBubbleFollowDesc",
       }),
-      buildBubblePolicyRow(),
     ]));
   }
 
@@ -187,6 +203,14 @@
     return row;
   }
 
+  const LANGUAGE_LABEL_KEYS = {
+    "en": "langEnglish",
+    "zh": "langChinese",
+    "zh-TW": "langTraditionalChinese",
+    "ko": "langKorean",
+    "ja": "langJapanese",
+  };
+
   function buildLanguageRow() {
     const row = document.createElement("div");
     row.className = "row";
@@ -196,53 +220,535 @@
         `<span class="row-desc"></span>` +
       `</div>` +
       `<div class="row-control">` +
-        `<div class="segmented language-segmented" role="tablist">` +
-          `<button data-lang="en"></button>` +
-          `<button data-lang="zh"></button>` +
-          `<button data-lang="ko"></button>` +
-          `<button data-lang="ja"></button>` +
+        `<div class="language-picker">` +
+          `<button type="button" class="language-picker-trigger" aria-haspopup="listbox" aria-expanded="false">` +
+            `<span class="language-picker-value"></span>` +
+            `<span class="language-picker-chevron" aria-hidden="true"></span>` +
+          `</button>` +
+          `<div class="language-picker-menu" role="listbox" aria-hidden="true"></div>` +
         `</div>` +
       `</div>`;
     row.querySelector(".row-label").textContent = t("rowLanguage");
     row.querySelector(".row-desc").textContent = t("rowLanguageDesc");
-    const buttons = row.querySelectorAll(".segmented button");
-    buttons[0].textContent = t("langEnglish");
-    buttons[1].textContent = t("langChinese");
-    buttons[2].textContent = t("langKorean");
-    buttons[3].textContent = t("langJapanese");
-    const current = readers.getLang();
-    const segmented = row.querySelector(".language-segmented");
-    const transition = runtime && runtime.languageTransition;
-    const currentIndex = Math.max(0, LANGUAGE_OPTIONS.indexOf(current));
-    const fromIndex = transition && transition.to === current
-      ? Math.max(0, LANGUAGE_OPTIONS.indexOf(transition.from))
-      : currentIndex;
-    segmented.style.setProperty("--language-active-index", String(fromIndex));
-    if (fromIndex !== currentIndex) {
-      requestAnimationFrame(() => {
-        segmented.getBoundingClientRect();
-        segmented.style.setProperty("--language-active-index", String(currentIndex));
+    const picker = row.querySelector(".language-picker");
+    const trigger = row.querySelector(".language-picker-trigger");
+    const valueEl = row.querySelector(".language-picker-value");
+    const menu = row.querySelector(".language-picker-menu");
+    trigger.setAttribute("aria-label", t("rowLanguage"));
+    const currentLang = readers.getLang();
+    let activeLang = currentLang;
+    const getLabel = (lang) => t(LANGUAGE_LABEL_KEYS[lang] || "langEnglish");
+    const options = [];
+    for (const lang of LANGUAGE_OPTIONS) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "language-picker-option";
+      option.setAttribute("role", "option");
+      option.setAttribute("data-lang", lang);
+      option.setAttribute("aria-selected", lang === currentLang ? "true" : "false");
+      option.textContent = getLabel(lang);
+      menu.appendChild(option);
+      options.push(option);
+    }
+    function getOption(lang) {
+      return options.find((option) => option.dataset.lang === lang) || options[0] || null;
+    }
+    function syncDisplay(lang) {
+      const selectedLang = LANGUAGE_OPTIONS.includes(lang) ? lang : LANGUAGE_OPTIONS[0];
+      activeLang = selectedLang;
+      valueEl.textContent = getLabel(selectedLang);
+      const open = picker.classList.contains("open");
+      for (const option of options) {
+        const selected = option.dataset.lang === selectedLang;
+        option.classList.toggle("selected", selected);
+        option.setAttribute("aria-selected", selected ? "true" : "false");
+        option.tabIndex = open && selected ? 0 : -1;
+      }
+    }
+    function setOpen(open) {
+      picker.classList.toggle("open", open);
+      trigger.setAttribute("aria-expanded", open ? "true" : "false");
+      menu.setAttribute("aria-hidden", open ? "false" : "true");
+      syncDisplay(activeLang);
+      if (!open) return;
+      const option = getOption(activeLang);
+      if (option && typeof option.focus === "function") option.focus();
+    }
+    function chooseLanguage(next) {
+      if (next === activeLang) {
+        setOpen(false);
+        return;
+      }
+      if (next === readers.getLang()) {
+        syncDisplay(next);
+        setOpen(false);
+        return;
+      }
+      syncDisplay(next);
+      setOpen(false);
+      const revertIfStillPending = () => {
+        if (activeLang === next) syncDisplay(readers.getLang());
+      };
+      window.settingsAPI.update("lang", next).then((result) => {
+        if (!result || result.status !== "ok") {
+          const msg = (result && result.message) || "unknown error";
+          ops.showToast(t("toastSaveFailed") + msg, { error: true });
+          revertIfStillPending();
+        }
+      }).catch((err) => {
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+        revertIfStillPending();
       });
     }
-    if (runtime && transition) {
-      runtime.languageTransition = null;
+    trigger.addEventListener("click", () => {
+      setOpen(!picker.classList.contains("open"));
+    });
+    trigger.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setOpen(true);
+      }
+    });
+    for (const option of options) {
+      option.addEventListener("click", () => chooseLanguage(option.dataset.lang));
+      option.addEventListener("keydown", (event) => {
+        const index = options.indexOf(option);
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setOpen(false);
+          if (typeof trigger.focus === "function") trigger.focus();
+          return;
+        }
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          chooseLanguage(option.dataset.lang);
+          return;
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const delta = event.key === "ArrowDown" ? 1 : -1;
+          const nextOption = options[(index + delta + options.length) % options.length];
+          if (nextOption && typeof nextOption.focus === "function") nextOption.focus();
+        }
+      });
     }
-    for (const btn of buttons) {
-      if (btn.dataset.lang === current) btn.classList.add("active");
-      btn.addEventListener("click", () => {
-        const next = btn.dataset.lang;
-        if (next === readers.getLang()) return;
-        window.settingsAPI.update("lang", next).then((result) => {
-          if (!result || result.status !== "ok") {
-            const msg = (result && result.message) || "unknown error";
-            ops.showToast(t("toastSaveFailed") + msg, { error: true });
+    const closeOnOutsideClick = (event) => {
+      if (!picker.classList.contains("open")) return;
+      if (picker.contains(event.target)) return;
+      setOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape" || !picker.classList.contains("open")) return;
+      event.preventDefault();
+      setOpen(false);
+    };
+    if (document && typeof document.addEventListener === "function") {
+      document.addEventListener("click", closeOnOutsideClick);
+      document.addEventListener("keydown", closeOnEscape);
+      state.mountedControls.languagePicker = {
+        dispose: () => {
+          if (typeof document.removeEventListener === "function") {
+            document.removeEventListener("click", closeOnOutsideClick);
+            document.removeEventListener("keydown", closeOnEscape);
           }
-        }).catch((err) => {
-          ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+        },
+      };
+    }
+    syncDisplay(currentLang);
+    return row;
+  }
+
+  function buildSessionHudGroup() {
+    const summaryControl = buildSessionHudSummary();
+    state.mountedControls.sessionHudSummary = summaryControl;
+    const sessionHudControlsEnabled = !!(state.snapshot && state.snapshot.sessionHudEnabled);
+    return helpers.buildCollapsibleGroup({
+      id: "general:session-hud",
+      title: t("rowSessionHud"),
+      desc: t("rowSessionHudDesc"),
+      summary: summaryControl.element,
+      defaultCollapsed: true,
+      className: "session-hud-collapsible",
+      children: [buildSessionHudOptionsList(sessionHudControlsEnabled)],
+    });
+  }
+
+  function buildOptionList(className, rows) {
+    const list = document.createElement("div");
+    list.className = `settings-option-list ${className || ""}`.trim();
+    for (const row of rows) {
+      row.classList.add("settings-option-item");
+      list.appendChild(row);
+    }
+    return list;
+  }
+
+  function buildSessionHudOptionsList(sessionHudControlsEnabled) {
+    return buildOptionList("session-hud-option-list", [
+      helpers.buildSwitchRow({
+        key: "sessionHudEnabled",
+        labelKey: "rowSessionHudMaster",
+      }),
+      helpers.buildSwitchRow({
+        key: "sessionHudShowStateLabels",
+        labelKey: "rowSessionHudStateLabels",
+        descKey: "rowSessionHudStateLabelsDesc",
+        disabled: !sessionHudControlsEnabled,
+      }),
+      helpers.buildSwitchRow({
+        key: "sessionHudShowElapsed",
+        labelKey: "rowSessionHudElapsed",
+        descKey: "rowSessionHudElapsedDesc",
+        disabled: !sessionHudControlsEnabled,
+      }),
+      helpers.buildSwitchRow({
+        key: "sessionHudCleanupDetached",
+        labelKey: "rowSessionHudCleanupDetached",
+        descKey: "rowSessionHudCleanupDetachedDesc",
+        disabled: !sessionHudControlsEnabled,
+      }),
+    ]);
+  }
+
+  function buildSessionHudSummary() {
+    const wrap = document.createElement("div");
+    wrap.className = "collapsible-summary-wrap session-hud-summary-control";
+
+    function syncFromSnapshot() {
+      wrap.innerHTML = "";
+      const snapshot = state.snapshot || {};
+      const enabled = snapshot.sessionHudEnabled !== false;
+      wrap.classList.toggle("compact", !enabled);
+      const onLabel = t("bubblePolicySummaryOn");
+      const offLabel = t("bubblePolicySummaryOff");
+      const items = [];
+      if (!enabled) {
+        items.push({
+          text: t("sessionHudSummaryEnabled").replace("{state}", offLabel),
+          accent: false,
         });
+      }
+      if (enabled) {
+        items.push({
+          text: t("sessionHudSummaryLabels").replace(
+            "{state}",
+            snapshot.sessionHudShowStateLabels !== false ? onLabel : offLabel
+          ),
+          accent: snapshot.sessionHudShowStateLabels !== false,
+        });
+        items.push({
+          text: t("sessionHudSummaryElapsed").replace(
+            "{state}",
+            snapshot.sessionHudShowElapsed !== false ? onLabel : offLabel
+          ),
+          accent: snapshot.sessionHudShowElapsed !== false,
+        });
+        items.push({
+          text: t("sessionHudSummaryCleanup").replace(
+            "{state}",
+            snapshot.sessionHudCleanupDetached === true ? onLabel : offLabel
+          ),
+          accent: snapshot.sessionHudCleanupDetached === true,
+        });
+      }
+      for (const item of items) {
+        const chip = document.createElement("span");
+        chip.className = "collapsible-summary-chip" + (item.accent ? " accent" : "");
+        chip.textContent = item.text;
+        wrap.appendChild(chip);
+      }
+    }
+
+    syncFromSnapshot();
+    return {
+      element: wrap,
+      syncFromSnapshot,
+    };
+  }
+
+  function buildSessionCleanupGroup() {
+    const optionList = buildOptionList("session-cleanup-option-list", [
+      helpers.buildNumberInputRow({
+        key: "sessionStaleMs",
+        labelKey: "rowStaleSession",
+        descKey: "rowStaleSessionDesc",
+        unitKey: "unitMinutes",
+        toDisplay: (ms) => Math.round(ms / 60_000),
+        fromDisplay: (min) => Math.max(0, Math.round(min * 60_000)),
+        min: 0,
+        max: 1440,
+        zeroLabelKey: "valueDisabled",
+      }).row,
+      helpers.buildNumberInputRow({
+        key: "workingStaleMs",
+        labelKey: "rowStaleWorking",
+        descKey: "rowStaleWorkingDesc",
+        unitKey: "unitSeconds",
+        toDisplay: (ms) => Math.round(ms / 1000),
+        fromDisplay: (sec) => Math.max(30_000, Math.min(86_400_000, Math.round(sec * 1000))),
+        min: 30,
+        max: 86_400,
+      }).row,
+      helpers.buildNumberInputRow({
+        key: "detachedIdleStaleMs",
+        labelKey: "rowStaleDetached",
+        descKey: "rowStaleDetachedDesc",
+        unitKey: "unitSeconds",
+        toDisplay: (ms) => Math.round(ms / 1000),
+        fromDisplay: (sec) => Math.max(5_000, Math.min(300_000, Math.round(sec * 1000))),
+        min: 5,
+        max: 300,
+      }).row,
+    ]);
+
+    // Reset lives in its own row outside the option-list so it doesn't render
+    // as a card; mirrors how Sound group puts the volume slider on its own row.
+    const resetRow = document.createElement("div");
+    resetRow.className = "row session-cleanup-reset-row";
+    const resetButton = document.createElement("button");
+    resetButton.type = "button";
+    resetButton.className = "soft-btn";
+    resetButton.textContent = t("actionResetSessionCleanup");
+    resetButton.addEventListener("click", async () => {
+      resetButton.disabled = true;
+      try {
+        const result = await window.settingsAPI.command(
+          "sessionCleanup.setTriple",
+          { ...SESSION_CLEANUP_DEFAULTS }
+        );
+        if (!result || result.status !== "ok") {
+          const msg = (result && result.message) || "unknown error";
+          ops.showToast(t("toastSaveFailed") + msg, { error: true });
+        }
+      } catch (err) {
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+      } finally {
+        resetButton.disabled = false;
+      }
+    });
+    resetRow.appendChild(resetButton);
+
+    return helpers.buildCollapsibleGroup({
+      id: "general:session-cleanup",
+      title: t("rowSessionCleanupGroup"),
+      desc: t("rowSessionCleanupGroupDesc"),
+      defaultCollapsed: true,
+      className: "session-cleanup-collapsible",
+      children: [optionList, resetRow],
+    });
+  }
+
+  function buildSoundGroup() {
+    const summaryControl = buildSoundSummary();
+    state.mountedControls.soundSummary = summaryControl;
+    return helpers.buildCollapsibleGroup({
+      id: "general:sound",
+      title: t("rowSound"),
+      desc: t("rowSoundDesc"),
+      summary: summaryControl.element,
+      defaultCollapsed: true,
+      className: "sound-collapsible",
+      children: [buildOptionList("sound-option-list", [
+        buildSoundEnabledRow(summaryControl),
+        buildVolumeSliderRow(),
+      ])],
+    });
+  }
+
+  function buildFlashGroup() {
+    return helpers.buildCollapsibleGroup({
+      id: "general:flash",
+      title: t("rowFlash"),
+      desc: t("rowFlashDesc"),
+      defaultCollapsed: true,
+      className: "flash-collapsible",
+      children: [buildOptionList("flash-option-list", [
+        helpers.buildSwitchRow({
+          key: "flashTaskbarOnComplete",
+          labelKey: "rowFlashTaskbarOnComplete",
+          descKey: "rowFlashTaskbarOnCompleteDesc",
+        }),
+        helpers.buildNumberInputRow({
+          key: "flashIntervalMs",
+          labelKey: "rowFlashInterval",
+          descKey: "rowFlashIntervalDesc",
+          unitKey: "unitMilliseconds",
+          toDisplay: (ms) => ms,
+          fromDisplay: (v) => Math.max(200, Math.min(2000, Math.round(v))),
+          min: 200,
+          max: 2000,
+        }).row,
+        helpers.buildNumberInputRow({
+          key: "flashDurationMs",
+          labelKey: "rowFlashDuration",
+          descKey: "rowFlashDurationDesc",
+          unitKey: "unitMilliseconds",
+          toDisplay: (ms) => ms,
+          fromDisplay: (v) => {
+            const n = parseInt(v, 10);
+            return Number.isFinite(n) ? Math.max(0, Math.min(60000, Math.round(n))) : 0;
+          },
+          min: 0,
+          max: 60000,
+          zeroLabelKey: "valueAlways",
+        }).row,
+      ])],
+    });
+  }
+
+  function buildSoundEnabledRow(summaryControl) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML =
+      `<div class="row-text">` +
+        `<span class="row-label"></span>` +
+      `</div>` +
+      `<div class="row-control"><div class="switch" role="switch" tabindex="0"></div></div>`;
+    row.querySelector(".row-label").textContent = t("rowSoundEnabled");
+    const sw = row.querySelector(".switch");
+    const text = row.querySelector(".row-text");
+    const override = state.transientUiState.generalSwitches.get("soundMuted");
+    const visualOn = override ? override.visualOn : readers.readGeneralSwitchVisual("soundMuted", true);
+    helpers.setSwitchVisual(sw, visualOn, { pending: override ? override.pending : false });
+    state.mountedControls.generalSwitches.set("soundMuted", {
+      element: sw,
+      invert: true,
+      row,
+      text,
+      extraElement: null,
+    });
+
+    const run = (ev) => {
+      if (sw.classList.contains("disabled") || sw.getAttribute("aria-disabled") === "true") return;
+      if (!summaryControl || typeof summaryControl.toggleSound !== "function") return;
+      summaryControl.toggleSound(ev);
+    };
+    sw.addEventListener("click", run);
+    sw.addEventListener("keydown", (ev) => {
+      if (ev.key !== " " && ev.key !== "Enter") return;
+      run(ev);
+    });
+    return row;
+  }
+
+  function buildSoundSummary() {
+    const wrap = document.createElement("div");
+    wrap.className = "sound-summary-control";
+    const chip = document.createElement("span");
+    const sw = document.createElement("div");
+    sw.className = "switch sound-header-switch";
+    sw.setAttribute("role", "switch");
+    sw.setAttribute("aria-label", t("rowSoundEnabled"));
+    sw.setAttribute("tabindex", "0");
+    wrap.appendChild(chip);
+    wrap.appendChild(sw);
+
+    function getSnapshotVolumePct() {
+      const v = state.snapshot && typeof state.snapshot.soundVolume === "number"
+        ? state.snapshot.soundVolume : 1;
+      return Math.round(Math.max(0, Math.min(1, v)) * 100);
+    }
+
+    function getSoundTransientState() {
+      return state.transientUiState.generalSwitches.get("soundMuted") || null;
+    }
+
+    function getCommittedSoundVisual() {
+      return readers.readGeneralSwitchVisual("soundMuted", true);
+    }
+
+    function getDisplaySoundVisual() {
+      const transient = getSoundTransientState();
+      return transient ? transient.visualOn : getCommittedSoundVisual();
+    }
+
+    function getDisplaySoundPending() {
+      const transient = getSoundTransientState();
+      return transient ? transient.pending : false;
+    }
+
+    function setSoundChildSwitchVisual(visualOn, pendingVisual) {
+      const meta = getMountedGeneralSwitch("soundMuted");
+      if (!meta) return;
+      helpers.setSwitchVisual(meta.element, visualOn, { pending: pendingVisual });
+    }
+
+    function normalizeVolumePct(pct) {
+      const n = Number(pct);
+      if (!Number.isFinite(n)) return getSnapshotVolumePct();
+      return Math.round(Math.max(0, Math.min(100, n)));
+    }
+
+    function applySoundSummaryVisual(enabled, pendingVisual = false, volumePct = getSnapshotVolumePct()) {
+      const stateLabel = enabled ? t("bubblePolicySummaryOn") : t("bubblePolicySummaryOff");
+      chip.className = "collapsible-summary-chip" + (enabled ? " accent" : "");
+      chip.textContent = `${stateLabel} · ${normalizeVolumePct(volumePct)}%`;
+      helpers.setSwitchVisual(sw, enabled, { pending: pendingVisual });
+    }
+
+    function syncFromSnapshot() {
+      applySoundSummaryVisual(getDisplaySoundVisual(), getDisplaySoundPending());
+    }
+
+    function syncVolumePreview(pct) {
+      applySoundSummaryVisual(getDisplaySoundVisual(), getDisplaySoundPending(), pct);
+    }
+
+    function toggleSound(ev) {
+      if (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      const activeTransient = getSoundTransientState();
+      if (activeTransient && activeTransient.pending) return;
+      const currentRaw = readers.readGeneralSwitchRaw("soundMuted");
+      const currentVisual = !currentRaw;
+      const nextVisual = !currentVisual;
+      const nextMuted = !nextVisual;
+      const seq = state.nextTransientUiSeq++;
+      state.transientUiState.generalSwitches.set("soundMuted", { visualOn: nextVisual, pending: true, seq });
+      applySoundSummaryVisual(nextVisual, true);
+      setSoundChildSwitchVisual(nextVisual, true);
+      window.settingsAPI.update("soundMuted", nextMuted).then((result) => {
+        const currentTransient = getSoundTransientState();
+        if (!currentTransient || currentTransient.seq !== seq) return;
+        state.transientUiState.generalSwitches.delete("soundMuted");
+        if (!result || result.status !== "ok" || result.noop) {
+          const committedVisual = getCommittedSoundVisual();
+          applySoundSummaryVisual(committedVisual, false);
+          setSoundChildSwitchVisual(committedVisual, false);
+          if (result && result.noop) return;
+          const msg = (result && result.message) || "unknown error";
+          ops.showToast(t("toastSaveFailed") + msg, { error: true });
+          return;
+        }
+        applySoundSummaryVisual(nextVisual, false);
+        setSoundChildSwitchVisual(nextVisual, false);
+      }).catch((err) => {
+        const currentTransient = getSoundTransientState();
+        if (!currentTransient || currentTransient.seq !== seq) return;
+        state.transientUiState.generalSwitches.delete("soundMuted");
+        const committedVisual = getCommittedSoundVisual();
+        applySoundSummaryVisual(committedVisual, false);
+        setSoundChildSwitchVisual(committedVisual, false);
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
       });
     }
-    return row;
+
+    sw.addEventListener("click", toggleSound);
+    sw.addEventListener("keydown", (ev) => {
+      if (ev.key !== " " && ev.key !== "Enter") return;
+      toggleSound(ev);
+    });
+
+    syncFromSnapshot();
+    return {
+      element: wrap,
+      headerSwitch: sw,
+      syncFromSnapshot,
+      syncVolumePreview,
+      toggleSound,
+    };
   }
 
   function buildBubblePolicyRow() {
@@ -270,6 +776,7 @@
 
   function buildBubblePolicySummary() {
     const wrap = document.createElement("div");
+    wrap.className = "collapsible-summary-wrap";
 
     function syncFromSnapshot() {
       wrap.innerHTML = "";
@@ -313,7 +820,8 @@
       category: "permission",
       labelKey: "bubblePermissionLabel",
       descKey: "bubblePermissionDesc",
-      secondsKey: null,
+      enabledKey: "permissionBubblesEnabled",
+      secondsKey: "permissionBubbleAutoCloseSeconds",
     }));
     list.appendChild(buildBubbleCategoryControl({
       category: "notification",
@@ -331,8 +839,8 @@
     return list;
   }
 
-  function buildBubbleCategoryControl({ category, labelKey, descKey, warningKey = null, secondsKey = null }) {
-    const stateKey = secondsKey || "permissionBubblesEnabled";
+  function buildBubbleCategoryControl({ category, labelKey, descKey, warningKey = null, secondsKey = null, enabledKey = null }) {
+    const stateKey = enabledKey || secondsKey || "permissionBubblesEnabled";
     const item = document.createElement("div");
     item.className = "bubble-policy-item";
     item.innerHTML =
@@ -362,6 +870,7 @@
 
     function currentEnabled() {
       if (state.snapshot && state.snapshot.hideBubbles === true) return false;
+      if (enabledKey) return !!(state.snapshot && state.snapshot[enabledKey] !== false);
       if (!secondsKey) return !!(state.snapshot && state.snapshot.permissionBubblesEnabled !== false);
       const seconds = Number(state.snapshot && state.snapshot[secondsKey]);
       return Number.isFinite(seconds) && seconds > 0;
@@ -522,6 +1031,15 @@
       row: item,
       syncFromSnapshot,
     });
+    // Permission row owns two settings keys (the on/off toggle and the
+    // autoclose seconds). Register the secondary key against the same row so
+    // the diff-based sync loop can resolve either key without remounting.
+    if (secondsKey && secondsKey !== stateKey) {
+      state.mountedControls.bubblePolicyControls.set(secondsKey, {
+        row: item,
+        syncFromSnapshot,
+      });
+    }
 
     return item;
   }
@@ -691,6 +1209,10 @@
       slider.value = String(pct);
       slider.style.setProperty("--volume-fill", `${pct}%`);
       readout.textContent = `${pct}%`;
+      const summary = state.mountedControls.soundSummary;
+      if (summary && document.body.contains(summary.element) && typeof summary.syncVolumePreview === "function") {
+        summary.syncVolumePreview(pct);
+      }
     }
 
     function getSnapshotVolumePct() {
@@ -986,6 +1508,8 @@
     if (keys.includes("soundVolume") || keys.includes("soundMuted")) {
       const vc = state.mountedControls.soundVolume;
       if (!vc || !document.body.contains(vc.row)) return false;
+      const summary = state.mountedControls.soundSummary;
+      if (!summary || !document.body.contains(summary.element)) return false;
     }
     if (keys.includes("sessionHudEnabled")
       && !SESSION_HUD_CHILD_SWITCH_KEYS.every((key) => getMountedGeneralSwitch(key))) {
@@ -999,6 +1523,20 @@
       && !hasMountedBubblePolicyControls()) {
       return false;
     }
+    if (keys.some((key) => SESSION_CLEANUP_NUMBER_KEYS.has(key))) {
+      for (const key of keys) {
+        if (!SESSION_CLEANUP_NUMBER_KEYS.has(key)) continue;
+        const meta = state.mountedControls.sessionCleanupControls.get(key);
+        if (!meta || !document.body.contains(meta.row)) return false;
+      }
+    }
+    if (keys.some((key) => FLASH_NUMBER_KEYS.has(key))) {
+      for (const key of keys) {
+        if (!FLASH_NUMBER_KEYS.has(key)) continue;
+        const meta = state.mountedControls.sessionCleanupControls.get(key);
+        if (!meta || !document.body.contains(meta.row)) return false;
+      }
+    }
     for (const key of keys) {
       if (key === "size" || key === "soundVolume") continue;
       if (BUBBLE_POLICY_KEYS.has(key)) {
@@ -1006,6 +1544,8 @@
         if (!meta || !document.body.contains(meta.row)) return false;
         continue;
       }
+      if (SESSION_CLEANUP_NUMBER_KEYS.has(key)) continue;
+      if (FLASH_NUMBER_KEYS.has(key)) continue;
       const meta = state.mountedControls.generalSwitches.get(key);
       if (!meta || !document.body.contains(meta.element)) return false;
     }
@@ -1019,6 +1559,14 @@
         state.mountedControls.bubblePolicyControls.get(key).syncFromSnapshot();
         continue;
       }
+      if (SESSION_CLEANUP_NUMBER_KEYS.has(key)) {
+        state.mountedControls.sessionCleanupControls.get(key).syncFromSnapshot();
+        continue;
+      }
+      if (FLASH_NUMBER_KEYS.has(key)) {
+        state.mountedControls.sessionCleanupControls.get(key).syncFromSnapshot();
+        continue;
+      }
       const meta = state.mountedControls.generalSwitches.get(key);
       state.transientUiState.generalSwitches.delete(key);
       helpers.setSwitchVisual(meta.element, readers.readGeneralSwitchVisual(key, meta.invert), { pending: false });
@@ -1027,16 +1575,24 @@
       }
     }
     if (keys.includes("sessionHudEnabled") && !syncSessionHudChildSwitchesDisabled()) return false;
+    if (keys.some((key) => SESSION_HUD_SUMMARY_KEYS.has(key))) {
+      const summary = state.mountedControls.sessionHudSummary;
+      if (summary && document.body.contains(summary.element)) summary.syncFromSnapshot();
+    }
     if (keys.includes("manageClaudeHooksAutomatically")
       && !syncClaudeHookManagementChildSwitchesDisabled()) return false;
     if ((keys.includes("hideBubbles") || keys.some((key) => BUBBLE_POLICY_KEYS.has(key)))
       && !syncBubblePolicyControlsFromSnapshot()) return false;
+    if ((keys.includes("soundVolume") || keys.includes("soundMuted"))
+      && state.mountedControls.soundSummary
+      && document.body.contains(state.mountedControls.soundSummary.element)) {
+      state.mountedControls.soundSummary.syncFromSnapshot();
+    }
     return true;
   }
 
   function init(core) {
     state = core.state;
-    runtime = core.runtime;
     readers = core.readers;
     helpers = core.helpers;
     ops = core.ops;

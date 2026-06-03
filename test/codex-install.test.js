@@ -104,8 +104,8 @@ describe("Codex official hook installer", () => {
     assert.ok(settings.hooks.PermissionRequest[0].hooks[0].command.includes(DEBUG_MARKER));
   });
 
-  it("does not flip an explicit codex_hooks=false", () => {
-    const codexDir = makeTempCodexDir({}, "[features]\ncodex_hooks = false\n");
+  it("does not flip an explicit hooks=false", () => {
+    const codexDir = makeTempCodexDir({}, "[features]\nhooks = false\n");
     const result = registerCodexHooks({
       silent: true,
       codexDir,
@@ -114,15 +114,32 @@ describe("Codex official hook installer", () => {
     });
 
     assert.strictEqual(result.configChanged, false);
-    assert.match(result.warnings[0], /codex_hooks = false/);
+    assert.match(result.warnings[0], /hooks = false/);
     assert.strictEqual(
       fs.readFileSync(path.join(codexDir, "config.toml"), "utf8"),
-      "[features]\ncodex_hooks = false\n"
+      "[features]\nhooks = false\n"
     );
   });
 
-  it("can force codex_hooks=true during an explicit repair", () => {
+  it("migrates legacy codex_hooks=false without enabling it", () => {
     const codexDir = makeTempCodexDir({}, "[features]\ncodex_hooks = false\n");
+    const result = registerCodexHooks({
+      silent: true,
+      codexDir,
+      nodeBin: "/usr/local/bin/node",
+      platform: "linux",
+    });
+
+    assert.strictEqual(result.configChanged, true);
+    assert.match(result.warnings[0], /hooks = false/);
+    assert.strictEqual(
+      fs.readFileSync(path.join(codexDir, "config.toml"), "utf8"),
+      "[features]\nhooks = false\n"
+    );
+  });
+
+  it("can force hooks=true during an explicit repair", () => {
+    const codexDir = makeTempCodexDir({}, "[features]\nhooks = false\n");
     const result = registerCodexHooks({
       silent: true,
       codexDir,
@@ -135,7 +152,7 @@ describe("Codex official hook installer", () => {
     assert.deepStrictEqual(result.warnings, []);
     assert.strictEqual(
       fs.readFileSync(path.join(codexDir, "config.toml"), "utf8"),
-      "[features]\ncodex_hooks = true\n"
+      "[features]\nhooks = true\n"
     );
   });
 
@@ -203,5 +220,81 @@ describe("Codex official hook installer", () => {
     }
     assert.strictEqual(settings.hooks.PermissionRequest.length, 1);
     assert.strictEqual(CODEX_DEBUG_HOOK_EVENTS.includes("PermissionRequest"), true);
+  });
+
+  // Verifies the v0.7.x follow-up that points users at codex's `/hooks` review
+  // step. Without this reminder, fresh installs leave hooks Active=0 and the
+  // desktop pet stays silent until the user randomly discovers the review UI.
+  it("emits a 'Next step: open codex CLI and run /hooks' reminder on non-silent install", () => {
+    const codexDir = makeTempCodexDir({});
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => captured.push(args.join(" "));
+    try {
+      registerCodexHooks({
+        silent: false,
+        codexDir,
+        nodeBin: "/usr/local/bin/node",
+        platform: "linux",
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    const joined = captured.join("\n");
+    assert.match(joined, /Next step:.*codex.*\/hooks/i,
+      "stdout must include the codex /hooks review reminder");
+  });
+
+  it("does NOT emit the reminder when silent: true (deploy / sync paths use silent)", () => {
+    const codexDir = makeTempCodexDir({});
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => captured.push(args.join(" "));
+    try {
+      registerCodexHooks({
+        silent: true,
+        codexDir,
+        nodeBin: "/usr/local/bin/node",
+        platform: "linux",
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    assert.equal(captured.length, 0, "silent install must not log reminder (or anything else)");
+  });
+
+  it("does NOT emit the reminder line on no-op re-install (summary lines still emit)", () => {
+    // Semantics being asserted: "no-op re-install does not print the
+    // /hooks-review reminder line". This is intentionally narrower than
+    // "no-op re-install is fully silent on stdout" — `Clawd Codex hooks ->`
+    // and `Added: 0, updated: 0, skipped: N` summary lines are useful for
+    // CLI users who re-run the installer (they confirm the install is
+    // already in place). Only the reminder is gated on actual changes,
+    // so users don't get warning fatigue from re-running an idempotent
+    // install.
+    const codexDir = makeTempCodexDir({});
+    // First install: changes happen, reminder fires.
+    registerCodexHooks({ silent: true, codexDir, nodeBin: "/usr/local/bin/node", platform: "linux" });
+    // Second install: idempotent, nothing added/updated/configChanged.
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => captured.push(args.join(" "));
+    try {
+      registerCodexHooks({
+        silent: false,
+        codexDir,
+        nodeBin: "/usr/local/bin/node",
+        platform: "linux",
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    const joined = captured.join("\n");
+    assert.equal(/Next step/i.test(joined), false,
+      "no-op re-install must NOT print the reminder line");
+    // Confirm summary lines DO still emit (this is the contract — keep
+    // CLI feedback for users who want to verify the install state).
+    assert.match(joined, /Clawd .* hooks/, "summary header should still print");
+    assert.match(joined, /Added: 0/, "Added/updated/skipped count should still print");
   });
 });

@@ -39,6 +39,7 @@ function makeCtx(overrides = {}) {
     resolvePermissionEntry: () => {},
     dismissPermissionsForDnd: () => {},
     focusTerminalWindow: () => {},
+    focusHostPlatform: "darwin",
     // Default: all pids dead
     processKill: () => { const e = new Error("ESRCH"); e.code = "ESRCH"; throw e; },
     getCursorScreenPoint: () => ({ x: 100, y: 100 }),
@@ -71,6 +72,7 @@ function update(api, o = {}) {
     o.event || "PreToolUse",
     {
       sourcePid: o.sourcePid ?? null,
+      wtHwnd: o.wtHwnd ?? null,
       cwd: o.cwd || "/tmp",
       editor: o.editor || null,
       pidChain: o.pidChain || null,
@@ -80,6 +82,11 @@ function update(api, o = {}) {
       headless: o.headless || false,
       displayHint: o.displayHint,
       sessionTitle: o.sessionTitle ?? null,
+      platform: o.platform ?? null,
+      model: o.model ?? null,
+      provider: o.provider ?? null,
+      codexOriginator: o.codexOriginator ?? null,
+      codexSource: o.codexSource ?? null,
     },
   );
 }
@@ -91,6 +98,7 @@ function rawSession(state, opts = {}) {
     updatedAt: opts.updatedAt ?? Date.now(),
     displayHint: opts.displayHint || null,
     sourcePid: opts.sourcePid || null,
+    wtHwnd: opts.wtHwnd || null,
     cwd: opts.cwd || "",
     editor: opts.editor || null,
     pidChain: opts.pidChain || null,
@@ -98,6 +106,11 @@ function rawSession(state, opts = {}) {
     agentId: opts.agentId || null,
     host: opts.host || null,
     headless: opts.headless || false,
+    platform: opts.platform || null,
+    model: opts.model || null,
+    provider: opts.provider || null,
+    codexOriginator: opts.codexOriginator || null,
+    codexSource: opts.codexSource || null,
     sessionTitle: opts.sessionTitle ?? null,
     recentEvents: opts.recentEvents || [],
     pidReachable: opts.pidReachable ?? false,
@@ -347,10 +360,10 @@ describe("working sub-animations", () => {
     assert.strictEqual(api.getSvgOverride("working"), "clawd-working-typing.svg");
   });
 
-  it("2 working sessions → juggling SVG", () => {
+  it("2 working sessions → headphones groove SVG", () => {
     api.sessions.set("s1", rawSession("working"));
     api.sessions.set("s2", rawSession("working"));
-    assert.strictEqual(api.getSvgOverride("working"), "clawd-working-juggling.svg");
+    assert.strictEqual(api.getSvgOverride("working"), "clawd-headphones-groove.svg");
   });
 
   it("3+ working sessions → building SVG", () => {
@@ -360,15 +373,15 @@ describe("working sub-animations", () => {
     assert.strictEqual(api.getSvgOverride("working"), "clawd-working-building.svg");
   });
 
-  it("1 juggling session → juggling SVG", () => {
+  it("1 juggling session → headphones groove SVG", () => {
     api.sessions.set("s1", rawSession("juggling"));
-    assert.strictEqual(api.getSvgOverride("juggling"), "clawd-working-juggling.svg");
+    assert.strictEqual(api.getSvgOverride("juggling"), "clawd-headphones-groove.svg");
   });
 
-  it("2+ juggling sessions → conducting SVG", () => {
+  it("2+ juggling sessions → three-ball juggling SVG", () => {
     api.sessions.set("s1", rawSession("juggling"));
     api.sessions.set("s2", rawSession("juggling"));
-    assert.strictEqual(api.getSvgOverride("juggling"), "clawd-working-conducting.svg");
+    assert.strictEqual(api.getSvgOverride("juggling"), "clawd-working-juggling.svg");
   });
 
   it("idle → follow SVG", () => {
@@ -799,6 +812,56 @@ describe("updateSession()", () => {
     assert.ok(api.sessions.get("s1").updatedAt >= t1);
   });
 
+  it("defaulted Claude attribution does not overwrite a remembered agent id", () => {
+    api.updateSession("opencode-s1", "thinking", "UserPromptSubmit", {
+      agentId: "opencode",
+      cwd: "/repo",
+    });
+    api.updateSession("opencode-s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+      agentIdDefaulted: true,
+    });
+
+    assert.strictEqual(api.sessions.get("opencode-s1").agentId, "opencode");
+  });
+
+  it("explicit attribution can replace a remembered agent id for a reused session id", () => {
+    api.updateSession("shared-s1", "thinking", "UserPromptSubmit", {
+      agentId: "opencode",
+      cwd: "/repo",
+    });
+    api.updateSession("shared-s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+    });
+
+    assert.strictEqual(api.sessions.get("shared-s1").agentId, "claude-code");
+  });
+
+  it("defaulted Claude attribution is still used for new legacy sessions", () => {
+    api.updateSession("legacy-s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+      agentIdDefaulted: true,
+    });
+
+    assert.strictEqual(api.sessions.get("legacy-s1").agentId, "claude-code");
+  });
+
+  it("opencode namespaced ids do not collide with bare Claude session ids", () => {
+    api.updateSession("opencode:shared-sid", "thinking", "UserPromptSubmit", {
+      agentId: "opencode",
+      sessionTitle: "hello",
+    });
+    api.updateSession("shared-sid", "attention", "Stop", {
+      agentId: "claude-code",
+      sessionTitle: "hi",
+    });
+
+    assert.strictEqual(api.sessions.get("opencode:shared-sid").agentId, "opencode");
+    assert.strictEqual(api.sessions.get("opencode:shared-sid").sessionTitle, "hello");
+    assert.strictEqual(api.sessions.get("shared-sid").agentId, "claude-code");
+    assert.strictEqual(api.sessions.get("shared-sid").sessionTitle, "hi");
+  });
+
   it("juggling + working (non-SubagentStop) → keeps juggling", () => {
     update(api, { id: "s1", state: "juggling", event: "SubagentStart" });
     assert.strictEqual(api.sessions.get("s1").state, "juggling");
@@ -848,6 +911,258 @@ describe("updateSession()", () => {
     update(api, { id: "perm1", state: "notification", event: "PermissionRequest" });
     assert.ok(!api.sessions.has("perm1"));
     assert.strictEqual(api.getCurrentState(), "notification");
+  });
+
+  it("Codex PermissionRequest persists focus metadata for snapshots", () => {
+    update(api, {
+      id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+      agentPid: 456,
+      pidChain: [789, 456],
+      model: "gpt-5.4",
+      codexOriginator: "Codex Desktop",
+      codexSource: "vscode",
+    });
+
+    const session = api.sessions.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777");
+    assert.ok(session);
+    assert.strictEqual(session.agentId, "codex");
+    assert.strictEqual(session.sourcePid, 456);
+    assert.strictEqual(session.cwd, "/repo");
+    assert.deepStrictEqual(session.pidChain, [789, 456]);
+    assert.strictEqual(session.codexOriginator, "Codex Desktop");
+    assert.strictEqual(session.codexSource, "vscode");
+    const entry = api.getLastSessionSnapshot().sessions.find((item) =>
+      item.id === "codex:019e115a-4df2-7ed0-b90e-8e6345aca777"
+    );
+    assert.strictEqual(entry.canFocus, true);
+    assert.deepStrictEqual(entry.focusTarget, {
+      type: "codex-thread",
+      url: "codex://threads/019e115a-4df2-7ed0-b90e-8e6345aca777",
+    });
+  });
+
+  it("Codex Desktop focus metadata downgrades on Windows", () => {
+    api = require("../src/state")(makeCtx({ focusHostPlatform: "win32" }));
+
+    update(api, {
+      id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      agentPid: 456,
+      codexOriginator: "Codex Desktop",
+    });
+    update(api, {
+      id: "codex:019e115b-4df2-7ed0-b90e-8e6345aca777",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      codexOriginator: "Codex Desktop",
+    });
+
+    const byId = new Map(api.getLastSessionSnapshot().sessions.map((entry) => [entry.id, entry]));
+    assert.strictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").canFocus, true);
+    assert.deepStrictEqual(byId.get("codex:019e115a-4df2-7ed0-b90e-8e6345aca777").focusTarget, {
+      type: "terminal",
+      url: null,
+    });
+    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").canFocus, false);
+    assert.strictEqual(byId.get("codex:019e115b-4df2-7ed0-b90e-8e6345aca777").focusTarget, null);
+  });
+
+  it("keeps wtHwnd sticky when later events do not provide one", () => {
+    update(api, {
+      id: "s1",
+      state: "idle",
+      event: "SessionStart",
+      sourcePid: 100,
+      wtHwnd: "123456",
+    });
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PostToolUse",
+      sourcePid: 100,
+    });
+
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session.wtHwnd, "123456");
+    const entry = api.getLastSessionSnapshot().sessions.find((item) => item.id === "s1");
+    assert.strictEqual(entry.wtHwnd, "123456");
+  });
+
+  it("Codex PermissionRequest focus metadata respects the session cap", () => {
+    for (let i = 0; i < 20; i++) {
+      update(api, { id: `s${i}`, state: "working" });
+      mock.timers.tick(1);
+    }
+    assert.strictEqual(api.sessions.size, 20);
+
+    update(api, {
+      id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      codexOriginator: "Codex Desktop",
+    });
+
+    assert.strictEqual(api.sessions.size, 20);
+    assert.ok(api.sessions.has("codex:019e115a-4df2-7ed0-b90e-8e6345aca777"));
+    assert.ok(!api.sessions.has("s0"));
+  });
+
+  it("Codex PermissionRequest without an existing session does not persist notification", () => {
+    update(api, {
+      id: "codex:new-permission",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+    });
+
+    assert.strictEqual(api.getCurrentState(), "notification");
+    assert.strictEqual(api.sessions.get("codex:new-permission").state, "idle");
+    assert.strictEqual(api.resolveDisplayState(), "idle");
+
+    mock.timers.tick(5000);
+
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+
+  it("Codex transient PermissionRequest preserves focus without keeping a waiting tail", () => {
+    update(api, { id: "codex:native", state: "working", event: "PreToolUse", agentId: "codex" });
+
+    api.updateSession("codex:native", "notification", "PermissionRequest", {
+      agentId: "codex",
+      sourcePid: 456,
+      transientPermissionEvent: true,
+    });
+
+    const session = api.sessions.get("codex:native");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.sourcePid, 456);
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
+    assert.ok(!session.recentEvents.some((entry) => entry.event === "PermissionRequest"));
+  });
+
+  it("stores one-shot visuals as idle while permission prompts preserve active work", () => {
+    update(api, { id: "notify", state: "notification", event: "Notification", agentId: "claude-code" });
+    assert.strictEqual(api.sessions.get("notify").state, "idle");
+
+    update(api, { id: "done", state: "attention", event: "Stop", agentId: "claude-code" });
+    assert.strictEqual(api.sessions.get("done").state, "idle");
+
+    update(api, { id: "perm-active", state: "working", event: "PreToolUse", agentId: "codex" });
+    update(api, {
+      id: "perm-active",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+    });
+
+    assert.strictEqual(api.sessions.get("perm-active").state, "working");
+  });
+
+  it("clearPermissionNotification releases a persisted notification session immediately", () => {
+    api.sessions.set("codex:stale-permission", rawSession("notification", {
+      agentId: "codex",
+      sourcePid: 456,
+      pidReachable: true,
+    }));
+    api.setState("notification");
+
+    assert.strictEqual(api.getCurrentState(), "notification");
+
+    assert.strictEqual(api.clearPermissionNotification("codex:stale-permission"), true);
+
+    assert.strictEqual(api.sessions.get("codex:stale-permission").state, "idle");
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
+
+  it("clearPermissionNotification removes a resolved PermissionRequest tail event", () => {
+    update(api, { id: "perm-active", state: "working", event: "PreToolUse", agentId: "codex" });
+    update(api, {
+      id: "perm-active",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "codex",
+      sourcePid: 456,
+    });
+
+    assert.strictEqual(api.sessions.get("perm-active").recentEvents.at(-1).event, "PermissionRequest");
+
+    assert.strictEqual(api.clearPermissionNotification("perm-active"), true);
+
+    const session = api.sessions.get("perm-active");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
+    assert.strictEqual(api.resolveDisplayState(), "working");
+  });
+
+  it("clearPermissionNotification restores Codex work state after stale idle downgrade", () => {
+    api.sessions.set("codex:stale-approved", rawSession("idle", {
+      agentId: "codex",
+      sourcePid: 456,
+      pidReachable: true,
+      recentEvents: [
+        { event: "PreToolUse", state: "working", at: Date.now() - 360000 },
+        { event: "PermissionRequest", state: "working", at: Date.now() - 350000 },
+      ],
+    }));
+
+    assert.strictEqual(api.clearPermissionNotification("codex:stale-approved"), true);
+
+    const session = api.sessions.get("codex:stale-approved");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
+    assert.strictEqual(api.getCurrentState(), "working");
+  });
+
+  it("clearPermissionNotification keeps the tail while another permission is pending", () => {
+    api.sessions.set("codex:stacked", rawSession("working", {
+      agentId: "codex",
+      sourcePid: 456,
+      pidReachable: true,
+      recentEvents: [
+        { event: "PreToolUse", state: "working", at: Date.now() - 2000 },
+        { event: "PermissionRequest", state: "working", at: Date.now() - 1000 },
+      ],
+    }));
+
+    assert.strictEqual(
+      api.clearPermissionNotification("codex:stacked", { hasPendingForSession: true }),
+      false,
+    );
+
+    const session = api.sessions.get("codex:stacked");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PermissionRequest");
+  });
+
+  it("clearPermissionNotification also strips a resolved remote Codex tail", () => {
+    api.sessions.set("codex:remote-approved", rawSession("idle", {
+      agentId: "codex",
+      host: "ssh://devbox",
+      recentEvents: [
+        { event: "PreToolUse", state: "working", at: Date.now() - 360000 },
+        { event: "PermissionRequest", state: "working", at: Date.now() - 350000 },
+      ],
+    }));
+
+    assert.strictEqual(api.clearPermissionNotification("codex:remote-approved"), true);
+
+    const session = api.sessions.get("codex:remote-approved");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.recentEvents.at(-1).event, "PreToolUse");
   });
 
   it("SessionEnd + sweeping → plays sweeping even with other active sessions", () => {
@@ -1035,6 +1350,25 @@ describe("updateSession()", () => {
   it("stores sessionTitle from updateSession positional arg", () => {
     update(api, { id: "s1", state: "working", sessionTitle: "My Task" });
     assert.strictEqual(api.sessions.get("s1").sessionTitle, "My Task");
+  });
+
+  it("stores optional platform and model metadata", () => {
+    update(api, {
+      id: "s1",
+      state: "working",
+      platform: "webui",
+      model: "gpt-5.4",
+      provider: "openai",
+    });
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session.platform, "webui");
+    assert.strictEqual(session.model, "gpt-5.4");
+    assert.strictEqual(session.provider, "openai");
+
+    update(api, { id: "s1", state: "idle", event: "Stop" });
+    assert.strictEqual(api.sessions.get("s1").platform, "webui");
+    assert.strictEqual(api.sessions.get("s1").model, "gpt-5.4");
+    assert.strictEqual(api.sessions.get("s1").provider, "openai");
   });
 
   it("trims whitespace on sessionTitle", () => {
@@ -1929,5 +2263,384 @@ describe("refreshTheme()", () => {
 
     mock.timers.tick(1);
     assert.strictEqual(api.getCurrentState(), "idle");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Group: requiresCompletionAck lifecycle (PR2, issue #308)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("requiresCompletionAck lifecycle", () => {
+  let api;
+  beforeEach(() => { api = require("../src/state")(makeCtx()); });
+  afterEach(() => { api.cleanup(); });
+
+  it("remote Codex Stop sets requiresCompletionAck=true (via finally reconciler)", () => {
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "codex", host: "ssh:example.com" });
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session && session.requiresCompletionAck, true);
+  });
+
+  it("remote Codex JSONL task_complete also sets requiresCompletionAck=true", () => {
+    update(api, { id: "s1", state: "attention", event: "event_msg:task_complete", agentId: "codex", host: "ssh:example.com" });
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session && session.requiresCompletionAck, true);
+  });
+
+  it("remote Codex task_complete after Stop preserves the ack flag", () => {
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+
+    update(api, { id: "s1", state: "attention", event: "event_msg:task_complete", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+  });
+
+  it("remote Codex stale-cleanup preserves an unacknowledged completion", () => {
+    update(api, { id: "s1", state: "attention", event: "event_msg:task_complete", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+
+    update(api, { id: "s1", state: "sleeping", event: "stale-cleanup", agentId: "codex", host: "ssh:example.com" });
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session.requiresCompletionAck, true);
+    assert.strictEqual(session.recentEvents.at(-1).event, "stale-cleanup");
+    const entry = api.buildSessionSnapshot().sessions.find((s) => s.id === "s1");
+    assert.strictEqual(entry.badge, "done");
+    assert.strictEqual(entry.requiresCompletionAck, true);
+  });
+
+  it("remote Codex stale-cleanup alone does not create an ack requirement", () => {
+    update(api, { id: "s1", state: "sleeping", event: "stale-cleanup", agentId: "codex", host: "ssh:example.com" });
+    assert.notStrictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+  });
+
+  it("remote Codex activity after stale-cleanup clears the previous ack requirement", () => {
+    update(api, { id: "s1", state: "attention", event: "event_msg:task_complete", agentId: "codex", host: "ssh:example.com" });
+    update(api, { id: "s1", state: "sleeping", event: "stale-cleanup", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+
+    update(api, { id: "s1", state: "thinking", event: "UserPromptSubmit", agentId: "codex", host: "ssh:example.com" });
+    assert.notStrictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+  });
+
+  it("ackSessionCompletion works after remote Codex stale-cleanup", () => {
+    update(api, { id: "s1", state: "attention", event: "event_msg:task_complete", agentId: "codex", host: "ssh:example.com" });
+    update(api, { id: "s1", state: "sleeping", event: "stale-cleanup", agentId: "codex", host: "ssh:example.com" });
+
+    assert.strictEqual(api.ackSessionCompletion("s1"), true);
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, false);
+  });
+
+  it("LOCAL Codex Stop does NOT set the flag (host=null)", () => {
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "codex", host: null });
+    const session = api.sessions.get("s1");
+    assert.notStrictEqual(session && session.requiresCompletionAck, true);
+  });
+
+  it("non-codex Stop on a remote session does NOT set the flag", () => {
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "claude-code", host: "ssh:example.com" });
+    const session = api.sessions.get("s1");
+    assert.notStrictEqual(session && session.requiresCompletionAck, true);
+  });
+
+  it("subsequent non-Stop event clears the flag without touching ackedAt", () => {
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+
+    update(api, { id: "s1", state: "working", event: "UserPromptSubmit", agentId: "codex", host: "ssh:example.com" });
+    const session = api.sessions.get("s1");
+    // "cleared" = not true. When sessions.set rebuilds the entry the flag
+    // simply isn't carried over (undefined); when the entry is mutated
+    // in place (Object.assign / juggling-hold paths) the reconciler sets
+    // it to false. Both render identically as `!!flag === false` in
+    // snapshot payloads.
+    assert.notStrictEqual(session.requiresCompletionAck, true);
+    assert.strictEqual(session.ackedAt, undefined);
+  });
+
+  it("event === null on a flagged session clears the flag (locked semantics)", () => {
+    // §3.11: null/undefined event = state-derived refresh with no carry;
+    // must NOT preserve the flag. This test lives so any future refactor
+    // that wants to preserve the flag on null events has to update it
+    // consciously. Calls updateSession directly because the `update()`
+    // helper's `o.event || "PreToolUse"` clobbers null.
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+
+    api.updateSession("s1", "idle", null, {
+      agentId: "codex",
+      host: "ssh:example.com",
+    });
+    assert.notStrictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+  });
+
+  it("Kimi PermissionRequest early-return still reconciles the flag", () => {
+    // §3.11 test #38: state.js:750-813 PermissionRequest path takes an
+    // early return — must still go through the finally reconciler.
+    // Pre-seed a flagged remote codex session, then deliver a Kimi
+    // PermissionRequest gated off — flag MUST clear.
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "codex",
+      host: "ssh:example.com",
+      updatedAt: Date.now(),
+    }));
+    api.sessions.get("s1").requiresCompletionAck = true;
+
+    const ctxNoKimi = makeCtx({ isAgentPermissionsEnabled: () => false });
+    const api2 = require("../src/state")(ctxNoKimi);
+    api2.sessions.set("s1", rawSession("idle", {
+      agentId: "codex",
+      host: "ssh:example.com",
+      updatedAt: Date.now(),
+    }));
+    api2.sessions.get("s1").requiresCompletionAck = true;
+    update(api2, { id: "s1", state: "notification", event: "PermissionRequest", agentId: "kimi-cli" });
+    // The Kimi gate early-returns, but flag should be cleared via finally.
+    assert.strictEqual(api2.sessions.get("s1").requiresCompletionAck, false);
+    api2.cleanup();
+  });
+
+  it("Object.assign ONESHOT path still reconciles the flag on non-Stop events", () => {
+    // §3.11 test #39: ONESHOT_STATES branch at state.js:910-916 mutates
+    // the existing entry in place via Object.assign; flag survival across
+    // that mutation must be governed by the reconciler.
+    api.sessions.set("s1", rawSession("idle", {
+      agentId: "codex",
+      host: "ssh:example.com",
+      updatedAt: Date.now(),
+    }));
+    api.sessions.get("s1").requiresCompletionAck = true;
+    // sweeping is a ONESHOT state — triggers Object.assign(existing, base).
+    update(api, { id: "s1", state: "sweeping", event: "UserPromptSubmit", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, false);
+  });
+
+  it("ackSessionCompletion: clears flag, sets ackedAt, returns true, forces snapshot", () => {
+    update(api, { id: "s1", state: "idle", event: "Stop", agentId: "codex", host: "ssh:example.com" });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, true);
+
+    const before = Date.now();
+    const result = api.ackSessionCompletion("s1");
+    assert.strictEqual(result, true);
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session.requiresCompletionAck, false);
+    assert.ok(session.ackedAt >= before, "ackedAt should be set to the ack timestamp");
+  });
+
+  it("ackSessionCompletion on a missing session returns false silently", () => {
+    assert.strictEqual(api.ackSessionCompletion("does-not-exist"), false);
+  });
+
+  it("ackSessionCompletion on an unflagged session is an idempotent no-op", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse", agentId: "codex", host: null });
+    assert.strictEqual(api.sessions.get("s1").requiresCompletionAck, undefined);
+    const result = api.ackSessionCompletion("s1");
+    assert.strictEqual(result, false);
+    assert.strictEqual(api.sessions.get("s1").ackedAt, undefined);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Group: two-phase MAX_SESSIONS evictor (PR2)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("evictOldestSessionIfNeeded two-phase", () => {
+  let api;
+  beforeEach(() => { api = require("../src/state")(makeCtx()); });
+  afterEach(() => { api.cleanup(); });
+
+  function seed(api, count, ackedIndices = new Set()) {
+    // Helper: seed N sessions with distinct, RECENT updatedAt values so the
+    // "oldest" candidate is deterministic and none of them trip the 24h
+    // ack-pending cap when cleanStaleSessions sweeps after the eviction.
+    const baseTime = Date.now() - 10_000; // ~10 s ago, well within all caps
+    for (let i = 0; i < count; i++) {
+      const id = `s${i}`;
+      api.sessions.set(id, rawSession("idle", {
+        agentId: "codex",
+        host: "ssh:example.com",
+        updatedAt: baseTime + i, // s0 oldest, sN-1 newest
+      }));
+      if (ackedIndices.has(i)) {
+        api.sessions.get(id).requiresCompletionAck = true;
+      }
+    }
+  }
+
+  it("prefers the oldest non-ack session when capacity is hit", () => {
+    // 19 ack-pending + 1 non-ack. Adding the 21st (capacity = 20) must
+    // evict the non-ack oldest, not any of the ack-pending sessions.
+    seed(api, 20, new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]));
+    // s19 is non-ack and oldest of the non-ack group (only one).
+    update(api, { id: "s-new", state: "working", event: "PreToolUse", agentId: "claude-code" });
+    assert.strictEqual(api.sessions.has("s19"), false, "s19 (non-ack) should have been evicted");
+    // All 19 ack-pending entries survived
+    for (let i = 0; i <= 18; i++) {
+      assert.strictEqual(api.sessions.has(`s${i}`), true, `s${i} ack-pending should survive`);
+    }
+  });
+
+  it("evicts the oldest ack-pending session only when every entry is ack-pending", () => {
+    seed(api, 20, new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]));
+    update(api, { id: "s-new", state: "working", event: "PreToolUse", agentId: "claude-code" });
+    // s0 is oldest ack-pending (smallest updatedAt) — must be the victim.
+    assert.strictEqual(api.sessions.has("s0"), false, "oldest ack-pending should be evicted as fallback");
+    for (let i = 1; i <= 19; i++) {
+      assert.strictEqual(api.sessions.has(`s${i}`), true);
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Qwen Code 0.16.1 self-submit filter — qwen's agentic loop fires a synthetic
+// UserPromptSubmit ~900-1000ms after PostToolUse to feed the tool result back
+// to the model. Without filtering this flashes "thinking" between working and
+// idle. Measured twice in dogfood (908ms non-interactive, 945ms interactive).
+// Window = 2000ms default, overridable via CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS.
+// Two timestamps: lastToolBoundaryAt (PostToolUse / PostToolUseFailure) and
+// lastStopAt (Stop). Filter only fires while a recent tool boundary has NOT
+// yet been followed by Stop. See project_qwen_0_16_1_event_semantics canary.
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("qwen-code self-submit filter", () => {
+  let api, ctx;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    ctx = makeCtx();
+    api = require("../src/state")(ctx);
+    delete process.env.CLAWD_QWEN_SELF_SUBMIT_FILTER;
+    delete process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS;
+  });
+  afterEach(() => {
+    api.cleanup();
+    mock.timers.reset();
+    delete process.env.CLAWD_QWEN_SELF_SUBMIT_FILTER;
+    delete process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS;
+  });
+
+  function bootQwenAfterPostToolUse() {
+    update(api, { id: "qsid", state: "working", event: "PreToolUse", agentId: "qwen-code" });
+    update(api, { id: "qsid", state: "working", event: "PostToolUse", agentId: "qwen-code" });
+    const entry = api.sessions.get("qsid");
+    assert.ok(entry, "qwen session should exist after PostToolUse");
+    assert.ok(Number.isFinite(entry.lastToolBoundaryAt), "PostToolUse should bump lastToolBoundaryAt");
+    return entry;
+  }
+
+  it("PostToolUse within window → UserPromptSubmit dropped (state/updatedAt/recentEvents untouched)", () => {
+    const before = bootQwenAfterPostToolUse();
+    const snapshot = {
+      state: before.state,
+      updatedAt: before.updatedAt,
+      recentEvents: [...(before.recentEvents || [])],
+      lastToolBoundaryAt: before.lastToolBoundaryAt,
+    };
+
+    mock.timers.tick(1500); // within 2000ms
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, snapshot.state, "state must not change");
+    assert.strictEqual(after.updatedAt, snapshot.updatedAt, "updatedAt must not bump");
+    assert.deepStrictEqual(after.recentEvents, snapshot.recentEvents, "recentEvents must not append");
+    assert.strictEqual(after.lastToolBoundaryAt, snapshot.lastToolBoundaryAt, "lastToolBoundaryAt must not change");
+  });
+
+  it("UserPromptSubmit after window passes through → state switches to thinking", () => {
+    bootQwenAfterPostToolUse();
+    mock.timers.tick(2500); // outside 2000ms
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "thinking", "real human input must reach state");
+  });
+
+  it("PostToolUseFailure also acts as a tool boundary (defensive — qwen 0.16.1 does not emit it, but other agents do)", () => {
+    update(api, { id: "qsid", state: "working", event: "PreToolUse", agentId: "qwen-code" });
+    update(api, { id: "qsid", state: "working", event: "PostToolUseFailure", agentId: "qwen-code" });
+    const before = api.sessions.get("qsid");
+    assert.ok(Number.isFinite(before.lastToolBoundaryAt), "PostToolUseFailure should bump lastToolBoundaryAt");
+
+    mock.timers.tick(1500);
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "working", "self-submit dropped after PostToolUseFailure");
+  });
+
+  it("Stop after tool boundary → next UserPromptSubmit passes through even within window", () => {
+    // Codex review caught this: end-of-turn must reset the self-submit window,
+    // otherwise a user typing "继续" within 2s of Stop would be eaten as a
+    // false self-submit. Stop bumps lastStopAt, which beats lastToolBoundaryAt.
+    bootQwenAfterPostToolUse();
+    mock.timers.tick(800); // simulate qwen Stop landing after the loop settles
+    update(api, { id: "qsid", state: "attention", event: "Stop", agentId: "qwen-code" });
+    const afterStop = api.sessions.get("qsid");
+    assert.ok(Number.isFinite(afterStop.lastStopAt), "Stop should bump lastStopAt");
+    assert.ok(afterStop.lastStopAt >= afterStop.lastToolBoundaryAt, "Stop must land after tool boundary");
+
+    mock.timers.tick(500); // user types fast — 500ms after Stop, still inside the tool-boundary window
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "thinking", "real input after Stop must reach state");
+  });
+
+  it("non-qwen agents are not filtered", () => {
+    update(api, { id: "csid", state: "working", event: "PreToolUse", agentId: "claude-code" });
+    update(api, { id: "csid", state: "working", event: "PostToolUse", agentId: "claude-code" });
+    mock.timers.tick(500); // well within the qwen window
+    update(api, { id: "csid", state: "thinking", event: "UserPromptSubmit", agentId: "claude-code" });
+
+    const after = api.sessions.get("csid");
+    assert.strictEqual(after.state, "thinking", "claude-code must pass through normally");
+  });
+
+  it("kill switch CLAWD_QWEN_SELF_SUBMIT_FILTER=0 disables the filter", () => {
+    process.env.CLAWD_QWEN_SELF_SUBMIT_FILTER = "0";
+    bootQwenAfterPostToolUse();
+    mock.timers.tick(500);
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "thinking", "filter disabled — UserPromptSubmit must take effect");
+  });
+
+  it("UserPromptSubmit with no prior boundary passes through (cold session)", () => {
+    // Brand new qwen session, no PostToolUse yet — first UserPromptSubmit is
+    // always real human input, must reach state.
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "thinking", "no boundary → cannot be a self-submit");
+  });
+
+  it("CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS override widens the window", () => {
+    process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS = "5000";
+    bootQwenAfterPostToolUse();
+    mock.timers.tick(3500); // would pass with default 2000 window, but env override extends to 5000
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "working", "extended window must still drop self-submit");
+  });
+
+  it("CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS invalid value falls back to default 2000ms", () => {
+    process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS = "not-a-number";
+    bootQwenAfterPostToolUse();
+    mock.timers.tick(1500); // within default 2000ms
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "working", "invalid env must fall back to default and still drop");
+  });
+
+  it("CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS out-of-range value falls back to default", () => {
+    process.env.CLAWD_QWEN_SELF_SUBMIT_WINDOW_MS = "999999"; // above max 10000
+    bootQwenAfterPostToolUse();
+    mock.timers.tick(3000); // outside default 2000ms window
+    update(api, { id: "qsid", state: "thinking", event: "UserPromptSubmit", agentId: "qwen-code" });
+
+    const after = api.sessions.get("qsid");
+    assert.strictEqual(after.state, "thinking", "out-of-range env must fall back to default 2000ms (not honored)");
   });
 });

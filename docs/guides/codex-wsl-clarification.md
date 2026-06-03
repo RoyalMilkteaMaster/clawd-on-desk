@@ -1,6 +1,6 @@
 # Codex + WSL Clarification
 
-Last verified: April 26, 2026
+Last verified: May 8, 2026
 
 This note separates three questions that are easy to conflate:
 
@@ -13,7 +13,7 @@ Those answers are not the same. Most confusion comes from mixing the official Co
 ## TL;DR
 
 - OpenAI officially supports running Codex in WSL2.
-- OpenAI's current Hooks documentation describes Codex hooks as feature-flagged via `[features].codex_hooks = true`.
+- Current Codex CLI builds enable hooks through `[features].hooks = true`; older builds and some docs used the deprecated `[features].codex_hooks` key.
 - Clawd now uses Codex official hooks as the primary integration and keeps `~/.codex/sessions` JSONL polling as fallback.
 - Windows native Codex hooks were verified locally on April 26, 2026; hook commands on Windows must use PowerShell's `&` call operator.
 - When Clawd runs on Windows while Codex runs inside WSL with the default Linux home directory, Clawd does not automatically see `/home/<user>/.codex/sessions`.
@@ -51,12 +51,14 @@ So the precise statement is "supports WSL2", not just "supports WSL".
 
 ### Codex hooks are feature-flagged
 
-OpenAI's Hooks documentation currently says hooks are enabled through:
+Current Codex CLI builds enable hooks through:
 
 ```toml
 [features]
-codex_hooks = true
+hooks = true
 ```
+
+Older Codex builds and some documentation used the deprecated `codex_hooks` key.
 
 It also documents `hooks.json`, common input fields, `PermissionRequest`, `tool_input.description`, and the current fail-closed behavior for unsupported PermissionRequest decision fields.
 
@@ -64,7 +66,7 @@ Reference:
 
 - <https://developers.openai.com/codex/hooks>
 
-Clawd's Codex installer writes `~/.codex/hooks.json` and enables this feature flag unless the user explicitly set `codex_hooks = false`, which Clawd preserves with a warning.
+Clawd's Codex installer writes `~/.codex/hooks.json` and enables this feature flag unless the user explicitly set hooks to `false`. If it sees the deprecated `codex_hooks` key, it migrates it to `hooks` while preserving an explicit false value.
 
 ### WSL and Windows do not share `.codex` by default
 
@@ -162,10 +164,10 @@ So the docs do mention WSL, but they do not clearly spell out the support bounda
 
 ## 4. The most accurate current conclusion
 
-As of April 26, 2026:
+As of May 8, 2026:
 
 1. OpenAI officially supports Codex in WSL2.
-2. OpenAI documents Codex hooks behind the `codex_hooks` feature flag.
+2. Current Codex CLI builds use the `hooks` feature flag; `codex_hooks` is deprecated.
 3. Clawd uses official Codex hooks as primary integration and JSONL polling as fallback.
 4. Clawd currently syncs hooks and polls fallback logs in the host machine's own `.codex` home.
 5. So if Codex runs inside WSL2 and still uses Linux `~/.codex`, Windows Clawd does not auto-detect those sessions by default.

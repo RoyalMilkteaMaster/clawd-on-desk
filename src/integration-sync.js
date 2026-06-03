@@ -47,6 +47,21 @@ function createIntegrationSyncRuntime(options = {}) {
     }
   }
 
+  function syncAntigravityHooks() {
+    try {
+      if (typeof ctx.syncAntigravityHooksImpl === "function") return ctx.syncAntigravityHooksImpl();
+      const { registerAntigravityHooks } = require("../hooks/antigravity-install.js");
+      const result = registerAntigravityHooks({ silent: true });
+      if (result.added > 0 || result.updated > 0) {
+        console.log(`Clawd: synced Antigravity hooks (added ${result.added}, updated ${result.updated})`);
+      }
+      return { status: "ok", ...result };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Antigravity hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Antigravity hooks" };
+    }
+  }
+
   function syncCodeBuddyHooks() {
     try {
       if (typeof ctx.syncCodeBuddyHooksImpl === "function") return ctx.syncCodeBuddyHooksImpl();
@@ -89,6 +104,21 @@ function createIntegrationSyncRuntime(options = {}) {
     } catch (err) {
       console.warn("Clawd: failed to sync Kimi hooks:", err.message);
       return { status: "error", message: err && err.message ? err.message : "Failed to sync Kimi hooks" };
+    }
+  }
+
+  function syncQwenHooks() {
+    try {
+      if (typeof ctx.syncQwenHooksImpl === "function") return ctx.syncQwenHooksImpl();
+      const { registerQwenCodeHooks } = require("../hooks/qwen-code-install.js");
+      const result = registerQwenCodeHooks({ silent: true });
+      if (result.added > 0 || result.updated > 0) {
+        console.log(`Clawd: synced Qwen hooks (added ${result.added}, updated ${result.updated})`);
+      }
+      return { status: "ok", ...result };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Qwen hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Qwen hooks" };
     }
   }
 
@@ -136,7 +166,7 @@ function createIntegrationSyncRuntime(options = {}) {
         updated,
         configChanged,
         message: configChanged
-          ? "Codex hooks repaired and [features].codex_hooks enabled"
+          ? "Codex hooks repaired and [features].hooks updated"
           : "Codex hooks repaired",
       };
     } catch (err) {
@@ -160,6 +190,21 @@ function createIntegrationSyncRuntime(options = {}) {
     }
   }
 
+  function syncCopilotHooks() {
+    try {
+      if (typeof ctx.syncCopilotHooksImpl === "function") return ctx.syncCopilotHooksImpl();
+      const { registerCopilotHooks } = require("../hooks/copilot-install.js");
+      const { added, updated } = registerCopilotHooks({ silent: true });
+      if (added > 0 || updated > 0) {
+        console.log(`Clawd: synced Copilot hooks (added ${added}, updated ${updated})`);
+      }
+      return { status: "ok", added, updated };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Copilot hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Copilot hooks" };
+    }
+  }
+
   function syncOpencodePlugin() {
     try {
       if (typeof ctx.syncOpencodePluginImpl === "function") return ctx.syncOpencodePluginImpl();
@@ -175,19 +220,103 @@ function createIntegrationSyncRuntime(options = {}) {
     }
   }
 
+  function syncPiExtension() {
+    try {
+      if (typeof ctx.syncPiExtensionImpl === "function") return ctx.syncPiExtensionImpl();
+      const { registerPiExtension } = require("../hooks/pi-install.js");
+      const result = registerPiExtension({ silent: true });
+      if (result.installed && result.updated) {
+        console.log("Clawd: synced Pi extension");
+      }
+      return { status: "ok", ...result };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Pi extension:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Pi extension" };
+    }
+  }
+
+  function syncOpenClawPlugin() {
+    try {
+      if (typeof ctx.syncOpenClawPluginImpl === "function") return ctx.syncOpenClawPluginImpl();
+      const { registerOpenClawPlugin } = require("../hooks/openclaw-install.js");
+      const result = registerOpenClawPlugin({ silent: true });
+      if (result.installed && result.updated) {
+        console.log("Clawd: synced OpenClaw plugin");
+      }
+      return { status: "ok", ...result };
+    } catch (err) {
+      console.warn("Clawd: failed to sync OpenClaw plugin:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync OpenClaw plugin" };
+    }
+  }
+
+  function repairOpenClawPlugin() {
+    try {
+      if (typeof ctx.repairOpenClawPluginImpl === "function") return ctx.repairOpenClawPluginImpl();
+      const { registerOpenClawPlugin } = require("../hooks/openclaw-install.js");
+      const result = registerOpenClawPlugin({ silent: true, useCliFallback: true });
+      if (result.status === "error" || result.installed === false) {
+        return {
+          status: "error",
+          message: result.message || result.reason || "Failed to repair OpenClaw plugin",
+        };
+      }
+      return { status: "ok", ...result, message: "OpenClaw plugin repaired" };
+    } catch (err) {
+      console.warn("Clawd: failed to repair OpenClaw plugin:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to repair OpenClaw plugin" };
+    }
+  }
+
+  function syncHermesPlugin() {
+    try {
+      if (typeof ctx.syncHermesPluginImpl === "function") return ctx.syncHermesPluginImpl();
+      const { isHermesInstalled, registerHermesPlugin } = require("../hooks/hermes-install.js");
+      const installed = typeof ctx.isHermesInstalledImpl === "function"
+        ? ctx.isHermesInstalledImpl()
+        : isHermesInstalled();
+      if (!installed) {
+        return {
+          status: "skipped",
+          reason: "hermes-not-installed",
+          message: "Hermes Agent is not installed; skipped plugin sync",
+        };
+      }
+      const result = registerHermesPlugin({ silent: true });
+      if (result && result.status === "error") {
+        console.warn("Clawd: failed to sync Hermes plugin:", result.message);
+        return result;
+      }
+      if (result && (result.installed > 0 || result.updated > 0)) {
+        console.log(`Clawd: synced Hermes plugin (installed=${result.installed}, updated=${result.updated})`);
+      }
+      return result && typeof result === "object" ? result : { status: "ok" };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Hermes plugin:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Hermes plugin" };
+    }
+  }
+
   const AGENT_INTEGRATION_SYNCERS = Object.freeze({
     "gemini-cli": syncGeminiHooks,
+    "antigravity-cli": syncAntigravityHooks,
     "cursor-agent": syncCursorHooks,
+    "copilot-cli": syncCopilotHooks,
     codebuddy: syncCodeBuddyHooks,
     "kiro-cli": syncKiroHooks,
     "kimi-cli": syncKimiHooks,
+    "qwen-code": syncQwenHooks,
     codex: syncCodexHooks,
     opencode: syncOpencodePlugin,
+    pi: syncPiExtension,
+    openclaw: syncOpenClawPlugin,
+    hermes: syncHermesPlugin,
   });
 
   const AGENT_INTEGRATION_REPAIRERS = Object.freeze({
     ...AGENT_INTEGRATION_SYNCERS,
     codex: repairCodexHooks,
+    openclaw: repairOpenClawPlugin,
   });
 
   function syncIntegrationForAgent(agentId) {
@@ -233,13 +362,20 @@ function createIntegrationSyncRuntime(options = {}) {
   return {
     syncClawdHooks,
     syncGeminiHooks,
+    syncAntigravityHooks,
     syncCursorHooks,
+    syncCopilotHooks,
     syncCodeBuddyHooks,
     syncKiroHooks,
     syncKimiHooks,
+    syncQwenHooks,
     syncCodexHooks,
     syncOpencodePlugin,
+    syncPiExtension,
+    syncOpenClawPlugin,
+    syncHermesPlugin,
     repairCodexHooks,
+    repairOpenClawPlugin,
     syncIntegrationForAgent,
     repairIntegrationForAgent,
     stopIntegrationForAgent,

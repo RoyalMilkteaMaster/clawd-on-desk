@@ -220,6 +220,20 @@ describe("theme-runtime active ownership", () => {
     assert.deepStrictEqual(calls, []);
   });
 
+  it("explicitly reloads an already-active theme through the full reload protocol", () => {
+    makeFixture();
+    const { runtime, calls } = createRuntime();
+    runtime.loadInitialTheme("clawd");
+
+    const result = runtime.reloadActiveTheme();
+
+    assert.deepStrictEqual(result, { themeId: "clawd", variantId: "default" });
+    assert.ok(calls.includes("state.cleanup"));
+    assert.ok(calls.includes("state.refreshTheme"));
+    assert.ok(calls.includes("syncRendererState"));
+    assert.ok(calls.includes("flushPrefs"));
+  });
+
   it("returns the resolved variant id when activation falls back from an unknown variant", () => {
     makeFixture();
     const { runtime } = createRuntime();
@@ -255,6 +269,29 @@ describe("theme-runtime active ownership", () => {
       "syncHitWin",
       "syncSessionHud",
       "startMainTick",
+      "flushPrefs",
+    ]);
+  });
+
+  it("refreshes active theme hitbox overrides without running the full reload protocol", () => {
+    makeFixture();
+    const { runtime, calls } = createRuntime();
+    runtime.loadInitialTheme("clawd");
+
+    const result = runtime.refreshActiveThemeHitboxOverrides("clawd", {
+      hitbox: {
+        wide: {
+          "thinking.svg": true,
+        },
+      },
+    });
+
+    assert.deepStrictEqual(result, { themeId: "clawd", variantId: "default" });
+    assert.deepStrictEqual(runtime.getActiveTheme().wideHitboxFiles, ["thinking.svg"]);
+    assert.deepStrictEqual(calls, [
+      "state.refreshTheme",
+      "syncHitState",
+      "syncHitWin",
       "flushPrefs",
     ]);
   });

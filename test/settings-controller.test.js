@@ -417,6 +417,58 @@ describe("applyCommand", () => {
     assert.deepStrictEqual(order, ["start:a", "end:a", "start:b", "end:b"]);
   });
 
+  it("serializes commands sharing a domain lockKey (cross-command race fix)", async () => {
+    // Codex review #9 high finding: remoteSsh.update / .markDeployed /
+    // .delete all write the same prefs field. Without a shared lockKey
+    // they execute concurrently — markDeployed can compute its commit
+    // from a stale snapshot taken before update committed, and stomp
+    // the user's edit. Domain lockKey forces serialization.
+    const order = [];
+    const slowFast = async (payload) => {
+      order.push(`start:${payload.tag}`);
+      await new Promise((r) => setTimeout(r, payload.tag === "a" ? 20 : 1));
+      order.push(`end:${payload.tag}`);
+      return { status: "ok" };
+    };
+    const cmdA = (payload) => slowFast(payload);
+    const cmdB = (payload) => slowFast(payload);
+    cmdA.lockKey = "shared";
+    cmdB.lockKey = "shared";
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      commands: { cmdA, cmdB },
+    });
+    const a = ctrl.applyCommand("cmdA", { tag: "a" });
+    const b = ctrl.applyCommand("cmdB", { tag: "b" });
+    await Promise.all([a, b]);
+    // Without shared lock they'd interleave start:a, start:b, end:b, end:a.
+    assert.deepStrictEqual(order, ["start:a", "end:a", "start:b", "end:b"],
+      "commands sharing a domain lockKey must serialize even across different names");
+  });
+
+  it("commands without shared lockKey can interleave (control: distinct lockKeys are independent)", async () => {
+    const order = [];
+    const slowFast = async (payload) => {
+      order.push(`start:${payload.tag}`);
+      await new Promise((r) => setTimeout(r, payload.tag === "a" ? 20 : 1));
+      order.push(`end:${payload.tag}`);
+      return { status: "ok" };
+    };
+    const cmdA = (payload) => slowFast(payload);
+    const cmdB = (payload) => slowFast(payload);
+    // No lockKey on either — controller defaults to per-name lock; different
+    // names → no cross-command serialization.
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      commands: { cmdA, cmdB },
+    });
+    const a = ctrl.applyCommand("cmdA", { tag: "a" });
+    const b = ctrl.applyCommand("cmdB", { tag: "b" });
+    await Promise.all([a, b]);
+    // b finishes first (1ms vs 20ms) without serialization.
+    assert.deepStrictEqual(order, ["start:a", "start:b", "end:b", "end:a"]);
+  });
+
   it("applies uninstallHooks commit without clearing latent autoStartWithClaude preference", async () => {
     const ctrl = createSettingsController({
       prefsPath: makeTempPath(),
@@ -695,5 +747,54 @@ describe("locked controller (future-version files)", () => {
     const onDisk = JSON.parse(fs.readFileSync(p, "utf8"));
     assert.strictEqual(onDisk.version, 999);
     assert.strictEqual(onDisk.lang, "en");
+  });
+});
+
+describe("sessionCleanup.setTriple via applyCommand", () => {
+  // This is the regression for v4 — applyCommand must accept a triple that
+  // would have been rejected if each key were applied separately via
+  // applyUpdate, because lowering both knobs simultaneously would otherwise
+  // hit the single-key cross-field validator with the pre-change snapshot.
+  it("commits an atomic triple that drops both stale intervals together", async () => {
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      loadResult: {
+        snapshot: {
+          ...prefs.getDefaults(),
+          sessionStaleMs: 600_000,
+          workingStaleMs: 300_000,
+          detachedIdleStaleMs: 30_000,
+        },
+        locked: false,
+      },
+    });
+    const result = await ctrl.applyCommand("sessionCleanup.setTriple", {
+      sessionStaleMs: 120_000,
+      workingStaleMs: 60_000,
+      detachedIdleStaleMs: 30_000,
+    });
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(ctrl.get("sessionStaleMs"), 120_000);
+    assert.strictEqual(ctrl.get("workingStaleMs"), 60_000);
+    assert.strictEqual(ctrl.get("detachedIdleStaleMs"), 30_000);
+  });
+
+  it("rejects an inverted triple without partial commit", async () => {
+    const ctrl = createSettingsController({
+      prefsPath: makeTempPath(),
+      loadResult: {
+        snapshot: { ...prefs.getDefaults() },
+        locked: false,
+      },
+    });
+    const result = await ctrl.applyCommand("sessionCleanup.setTriple", {
+      sessionStaleMs: 120_000,
+      workingStaleMs: 300_000,
+      detachedIdleStaleMs: 30_000,
+    });
+    assert.strictEqual(result.status, "error");
+    // Original defaults intact.
+    assert.strictEqual(ctrl.get("sessionStaleMs"), 600_000);
+    assert.strictEqual(ctrl.get("workingStaleMs"), 300_000);
   });
 });

@@ -19,6 +19,10 @@ const path = require("path");
 const os = require("os");
 const CodexSubagentClassifier = require("./codex-subagent-classifier");
 const { readCodexThreadName } = require("../hooks/codex-session-index");
+const {
+  clampAssistantOutputText,
+  extractAssistantTextFromRecord,
+} = require("../hooks/codex-assistant-output");
 
 const APPROVAL_HEURISTIC_MS = 2000;
 const MAX_TRACKED_FILES = 50;
@@ -291,6 +295,8 @@ class CodexLogMonitor {
         filePath,
         cwd: retired ? retired.cwd : "",
         sessionTitle: retired ? retired.sessionTitle : null,
+        codexOriginator: retired ? retired.codexOriginator : null,
+        codexSource: retired ? retired.codexSource : null,
         lastEventTime: Date.now(),
         lastState: retired ? retired.lastState : null,
         lastStateEvent: retired ? retired.lastStateEvent : null,
@@ -300,6 +306,8 @@ class CodexLogMonitor {
         isSubagent: retired ? retired.isSubagent === true : false,
         agentPid: retired ? retired.agentPid : null,
         pendingApprovalDetail: null,
+        assistantLastOutput: retired ? retired.assistantLastOutput || null : null,
+        assistantLastOutputTruncated: retired ? retired.assistantLastOutputTruncated === true : false,
         // Backfill mode: only a file whose last write predates monitor
         // start (by more than BACKFILL_GRACE_MS) is treated as stale
         // history — we replay it silently to advance offset + pick up
@@ -361,13 +369,6 @@ class CodexLogMonitor {
       return; // corrupted line, skip
     }
 
-    // Skip historical events that predate monitor start — prevents replay
-    // storms on app restart from driving stale state transitions
-    if (obj && typeof obj.timestamp === "string") {
-      const ts = Date.parse(obj.timestamp);
-      if (Number.isFinite(ts) && ts < this._startedAtMs - 1500) return;
-    }
-
     const type = obj.type;
     const payload = obj.payload;
     const subtype =
@@ -376,12 +377,24 @@ class CodexLogMonitor {
     // Build lookup key
     const key = subtype ? type + ":" + subtype : type;
 
-    // Extract CWD from session_meta
-    if (type === "session_meta" && payload) {
-      tracked.cwd = payload.cwd || "";
-      const role = this._classifier.registerSession(tracked.sessionId, { sessionMeta: payload });
-      if (role === "subagent") tracked.isSubagent = true;
-      else if (role === "root") tracked.isSubagent = false;
+    // Metadata is needed for future live writes even when the session_meta
+    // record itself predates monitor start.
+    if (type === "session_meta") {
+      this._applySessionMeta(payload, tracked);
+    }
+
+    // Skip historical events that predate monitor start — prevents replay
+    // storms on app restart from driving stale state transitions.
+    if (obj && typeof obj.timestamp === "string") {
+      const ts = Date.parse(obj.timestamp);
+      if (Number.isFinite(ts) && ts < this._startedAtMs - 1500) return;
+    }
+
+    const assistantText = extractAssistantTextFromRecord(obj);
+    if (assistantText) {
+      const assistantOutput = clampAssistantOutputText(assistantText);
+      tracked.assistantLastOutput = assistantOutput ? assistantOutput.text : null;
+      tracked.assistantLastOutputTruncated = !!(assistantOutput && assistantOutput.truncated);
     }
 
     // Extract Codex-authored session summary (turn_context.summary).
@@ -426,6 +439,8 @@ class CodexLogMonitor {
     // Track tool use per turn — reset on task_started, set on function_call
     if (key === "event_msg:task_started") {
       tracked.hadToolUse = false;
+      tracked.assistantLastOutput = null;
+      tracked.assistantLastOutputTruncated = false;
     }
     if (key === "response_item:function_call") {
       tracked.hadToolUse = true;
@@ -444,7 +459,7 @@ class CodexLogMonitor {
       tracked.hadToolUse = false;
       tracked.lastState = resolved;
       if (tracked.backfilling) return;
-      this._emitStateChange(tracked, resolved, key);
+      this._emitStateChange(tracked, resolved, key, this._assistantOutputExtra(tracked));
       return;
     }
 
@@ -494,6 +509,20 @@ class CodexLogMonitor {
     if (state === tracked.lastState && state === "working") return;
     tracked.lastState = state;
     this._emitStateChange(tracked, state, key);
+  }
+
+  _applySessionMeta(payload, tracked) {
+    if (!payload || typeof payload !== "object") return;
+    tracked.cwd = payload.cwd || "";
+    tracked.codexOriginator = typeof payload.originator === "string" && payload.originator.trim()
+      ? payload.originator.trim()
+      : tracked.codexOriginator;
+    tracked.codexSource = typeof payload.source === "string" && payload.source.trim()
+      ? payload.source.trim()
+      : tracked.codexSource;
+    const role = this._classifier.registerSession(tracked.sessionId, { sessionMeta: payload });
+    if (role === "subagent") tracked.isSubagent = true;
+    else if (role === "root") tracked.isSubagent = false;
   }
 
   // Codex-authored session summary, extracted from turn_context.summary.
@@ -629,12 +658,16 @@ class CodexLogMonitor {
       offset: Number.isFinite(tracked.offset) ? tracked.offset : 0,
       cwd: tracked.cwd || "",
       sessionTitle: tracked.sessionTitle || null,
+      codexOriginator: tracked.codexOriginator || null,
+      codexSource: tracked.codexSource || null,
       lastState: tracked.lastState || null,
       lastStateEvent: tracked.lastStateEvent || null,
       hasEmittedState: tracked.hasEmittedState === true,
       hadToolUse: tracked.hadToolUse === true,
       isSubagent: tracked.isSubagent === true,
       agentPid: tracked.agentPid || null,
+      assistantLastOutput: tracked.assistantLastOutput || null,
+      assistantLastOutputTruncated: tracked.assistantLastOutputTruncated === true,
     });
     while (this._retiredTracked.size > MAX_RETIRED_TRACKED_FILES) {
       const oldest = this._retiredTracked.keys().next().value;
@@ -654,6 +687,16 @@ class CodexLogMonitor {
       tracked.lastStateEvent || "session_meta",
       extra
     );
+  }
+
+  _assistantOutputExtra(tracked) {
+    if (!tracked || typeof tracked.assistantLastOutput !== "string" || !tracked.assistantLastOutput) {
+      return null;
+    }
+    return {
+      assistantLastOutput: tracked.assistantLastOutput,
+      assistantLastOutputTruncated: tracked.assistantLastOutputTruncated === true,
+    };
   }
 
   _isTrackedSubagent(tracked) {
@@ -686,6 +729,8 @@ class CodexLogMonitor {
         ? extra.agentPid
         : agentPid,
       sessionTitle: tracked.sessionTitle,
+      codexOriginator: tracked.codexOriginator || null,
+      codexSource: tracked.codexSource || null,
       ...(extra || {}),
       headless: this._isTrackedSubagent(tracked)
         ? true

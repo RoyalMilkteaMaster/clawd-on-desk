@@ -7,6 +7,7 @@ const MENU_AFFECTING_KEYS = new Set([
   "hideBubbles",
   "permissionBubblesEnabled",
   "notificationBubbleAutoCloseSeconds",
+  "permissionBubbleAutoCloseSeconds",
   "updateBubbleAutoCloseSeconds",
   "manageClaudeHooksAutomatically",
   "autoStartWithClaude",
@@ -59,12 +60,15 @@ function createSettingsEffectRouter(options = {}) {
   const clearCodexNotifyBubbles = options.clearCodexNotifyBubbles || noop;
   const clearKimiNotifyBubbles = options.clearKimiNotifyBubbles || noop;
   const refreshPassiveNotifyAutoClose = options.refreshPassiveNotifyAutoClose || noop;
+  const refreshPermissionAutoCloseForPolicy = options.refreshPermissionAutoCloseForPolicy || noop;
   const hideUpdateBubbleForPolicy = options.hideUpdateBubbleForPolicy || noop;
   const refreshUpdateBubbleAutoClose = options.refreshUpdateBubbleAutoClose || noop;
   const repositionFloatingBubbles = options.repositionFloatingBubbles || noop;
   const syncSessionHudVisibility = options.syncSessionHudVisibility || noop;
+  const handleSessionHudPinnedChanged = options.handleSessionHudPinnedChanged || noop;
   const reclampPetAfterEdgePinningChange = options.reclampPetAfterEdgePinningChange || noop;
   const rebuildAllMenus = options.rebuildAllMenus || noop;
+  const reconcilePowerSaveBlocker = options.reconcilePowerSaveBlocker || noop;
 
   let started = false;
   let unsubscribeSettings = null;
@@ -89,6 +93,9 @@ function createSettingsEffectRouter(options = {}) {
     }
     if ("lowPowerIdleMode" in changes) {
       sendToRenderer("low-power-idle-mode-change", changes.lowPowerIdleMode);
+    }
+    if ("keepAwakeWhileWorking" in changes) {
+      safeCall(logWarn, "Clawd: reconcilePowerSaveBlocker failed:", reconcilePowerSaveBlocker);
     }
     if ("lang" in changes) {
       safeCall(logWarn, "Clawd: dashboard lang broadcast failed:", sendDashboardI18n);
@@ -152,10 +159,35 @@ function createSettingsEffectRouter(options = {}) {
         refreshUpdateBubbleAutoClose
       );
     }
+    // Permission autoclose: any change (including 0 = disable) needs to be
+    // pushed into pending entries so they re-arm or clear timers.
+    if ("permissionBubbleAutoCloseSeconds" in changes) {
+      safeCall(
+        logWarn,
+        "Clawd: refresh permission bubble timer failed:",
+        refreshPermissionAutoCloseForPolicy
+      );
+    }
     if ("bubbleFollowPet" in changes) {
       safeCall(logWarn, "Clawd: repositionFloatingBubbles failed:", repositionFloatingBubbles);
     }
-    if ("sessionHudEnabled" in changes || "sessionHudShowElapsed" in changes) {
+    if ("sessionHudPinned" in changes) {
+      // Pinned transitions are handled inside session-hud.js so the visible
+      // state can be inspected BEFORE the new mirror takes effect during a
+      // generic sync. handlePinnedChanged internally calls syncSessionHud,
+      // which triggers reposition via the reserved-offset callback — no
+      // need to call repositionFloatingBubbles here as well.
+      try {
+        handleSessionHudPinnedChanged(changes.sessionHudPinned);
+      } catch (err) {
+        warn(logWarn, "Clawd: session HUD pinned change failed:", err);
+      }
+    }
+    if (
+      "sessionHudEnabled" in changes
+      || "sessionHudShowStateLabels" in changes
+      || "sessionHudShowElapsed" in changes
+    ) {
       try {
         syncSessionHudVisibility();
         repositionFloatingBubbles();
@@ -177,6 +209,18 @@ function createSettingsEffectRouter(options = {}) {
         emitSessionSnapshot,
         { force: true }
       );
+    }
+    if (
+      "sessionStaleMs" in changes
+      || "workingStaleMs" in changes
+      || "detachedIdleStaleMs" in changes
+    ) {
+      try {
+        cleanStaleSessions();
+        emitSessionSnapshot({ force: true });
+      } catch (err) {
+        warn(logWarn, "Clawd: stale cleanup config refresh failed:", err);
+      }
     }
     if ("allowEdgePinning" in changes) {
       safeCall(

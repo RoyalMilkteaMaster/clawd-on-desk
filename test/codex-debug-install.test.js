@@ -69,7 +69,7 @@ describe("Codex debug hook installer", () => {
     }
 
     const configText = fs.readFileSync(path.join(codexDir, "config.toml"), "utf8");
-    assert.match(configText, /\[features\]\s+codex_hooks = true/);
+    assert.match(configText, /\[features\]\s+hooks = true/);
   });
 
   it("is idempotent on second run", () => {
@@ -139,8 +139,8 @@ describe("Codex debug hook installer", () => {
     assert.ok(hook.command.includes("/home/user/.volta/bin/node"));
   });
 
-  it("does not flip an explicit codex_hooks=false", () => {
-    const codexDir = makeTempCodexDir({}, "[features]\ncodex_hooks = false\n");
+  it("does not flip an explicit hooks=false", () => {
+    const codexDir = makeTempCodexDir({}, "[features]\nhooks = false\n");
     const result = registerCodexDebugHooks({
       silent: true,
       codexDir,
@@ -149,14 +149,14 @@ describe("Codex debug hook installer", () => {
     });
 
     assert.strictEqual(result.configChanged, false);
-    assert.match(result.warnings[0], /codex_hooks = false/);
+    assert.match(result.warnings[0], /hooks = false/);
     assert.strictEqual(
       fs.readFileSync(path.join(codexDir, "config.toml"), "utf8"),
-      "[features]\ncodex_hooks = false\n"
+      "[features]\nhooks = false\n"
     );
   });
 
-  it("inserts codex_hooks=true into an existing features section", () => {
+  it("inserts hooks=true into an existing features section", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-config-"));
     tempDirs.push(tmpDir);
     const configPath = path.join(tmpDir, "config.toml");
@@ -167,7 +167,7 @@ describe("Codex debug hook installer", () => {
     assert.strictEqual(result.changed, true);
     assert.strictEqual(
       fs.readFileSync(configPath, "utf8"),
-      "[features]\ncodex_hooks = true\nfoo = true\n[model]\nname = \"x\"\n"
+      "[features]\nhooks = true\nfoo = true\n[model]\nname = \"x\"\n"
     );
   });
 
@@ -186,11 +186,11 @@ describe("Codex debug hook installer", () => {
     assert.strictEqual(result.changed, true);
     assert.strictEqual(
       fs.readFileSync(configPath, "utf8"),
-      "[features] # user feature flags\ncodex_hooks = true\nfoo = true\n\n# comment about model\n[model] # model config\nname = \"x\"\n"
+      "[features] # user feature flags\nhooks = true\nfoo = true\n\n# comment about model\n[model] # model config\nname = \"x\"\n"
     );
   });
 
-  it("does not duplicate features when codex_hooks=false appears under a commented header", () => {
+  it("migrates legacy codex_hooks=false under a commented header without enabling it", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-config-"));
     tempDirs.push(tmpDir);
     const configPath = path.join(tmpDir, "config.toml");
@@ -199,9 +199,9 @@ describe("Codex debug hook installer", () => {
 
     const result = ensureCodexHooksFeature(configPath);
 
-    assert.strictEqual(result.changed, false);
-    assert.match(result.warning, /codex_hooks = false/);
-    assert.strictEqual(fs.readFileSync(configPath, "utf8"), original);
+    assert.strictEqual(result.changed, true);
+    assert.match(result.warning, /hooks = false/);
+    assert.strictEqual(fs.readFileSync(configPath, "utf8"), "[features] # user feature flags\nhooks = false\n");
   });
 
   it("parses TOML table headers without treating quoted # as a comment", () => {

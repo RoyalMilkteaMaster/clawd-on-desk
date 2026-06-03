@@ -6,9 +6,12 @@ const os = require("os");
 
 const {
   checkAgentIntegrations,
+  findOpenClawPluginEntry,
   findOpencodePluginEntry,
 } = require("../src/doctor-detectors/agent-integrations");
 const { GEMINI_HOOK_EVENTS } = require("../hooks/gemini-install");
+const { ANTIGRAVITY_HOOK_EVENTS, __test: antigravityInstallTest } = require("../hooks/antigravity-install");
+const { QWEN_CODE_HOOK_EVENTS, buildQwenCodeHookCommand } = require("../hooks/qwen-code-install");
 
 const tempDirs = [];
 
@@ -45,12 +48,24 @@ function runOne(descriptor, options = {}) {
     fs,
     prefs: options.prefs || {},
     descriptors: [descriptor],
+    server: options.server || null,
     validateCommand: options.validateCommand || (() => ({
       ok: true,
       nodeBin: "/node",
       scriptPath: "/app/hooks/test-hook.js",
     })),
   }).details[0];
+}
+
+function suspiciousShrinkGuardServer() {
+  return {
+    getClaudeHookGuardStatus: () => ({
+      type: "suspicious-shrink",
+      at: 1234,
+      before: { keyCount: 5, hookCount: 12, thirdPartyHookCount: 2 },
+      after: { keyCount: 1, hookCount: 0, thirdPartyHookCount: 0 },
+    }),
+  };
 }
 
 function geminiHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/gemini-hook.js" ${event}`) {
@@ -62,6 +77,102 @@ function geminiHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/gem
     }];
   }
   return hooks;
+}
+
+function antigravityDescriptor() {
+  const root = makeTempDir();
+  const parentDir = path.join(root, ".gemini", "config");
+  return baseDescriptor({
+    agentId: "antigravity-cli",
+    agentName: "Antigravity CLI",
+    marker: "antigravity-hook.js",
+    parentDir,
+    configPath: path.join(parentDir, "hooks.json"),
+    configMode: "antigravity-hooks",
+    hookEvents: ANTIGRAVITY_HOOK_EVENTS,
+  });
+}
+
+function antigravityHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/antigravity-hook.js" ${event}`) {
+  // D2: state-only — no PreToolUse.
+  return {
+    clawd: {
+      PreInvocation: [{ type: "command", command: commandForEvent("PreInvocation") }],
+      PostToolUse: [{
+        matcher: "*",
+        hooks: [{ type: "command", command: commandForEvent("PostToolUse") }],
+      }],
+      PostInvocation: [{ type: "command", command: commandForEvent("PostInvocation") }],
+      Stop: [{ type: "command", command: commandForEvent("Stop") }],
+    },
+  };
+}
+
+function writeAntigravityHooks(descriptor, hooks = antigravityHooksConfig()) {
+  writeJson(descriptor.configPath, hooks);
+}
+
+function qwenDescriptor() {
+  const root = makeTempDir();
+  const parentDir = path.join(root, ".qwen");
+  return baseDescriptor({
+    agentId: "qwen-code",
+    agentName: "Qwen Code",
+    marker: "qwen-code-hook.js",
+    parentDir,
+    configPath: path.join(parentDir, "settings.json"),
+    configMode: "file",
+    nested: true,
+    hookEvents: QWEN_CODE_HOOK_EVENTS,
+  });
+}
+
+function qwenHooksConfig(commandForEvent = (event) => `"/node" "/app/hooks/qwen-code-hook.js" ${event}`) {
+  const hooks = {};
+  for (const event of QWEN_CODE_HOOK_EVENTS) {
+    hooks[event] = [{
+      matcher: "*",
+      hooks: [{ name: "clawd", type: "command", command: commandForEvent(event) }],
+    }];
+  }
+  return { hooks };
+}
+
+function codexDescriptor() {
+  const root = makeTempDir();
+  const parentDir = path.join(root, ".codex");
+  return baseDescriptor({
+    agentId: "codex",
+    marker: "codex-hook.js",
+    parentDir,
+    configPath: path.join(parentDir, "hooks.json"),
+    nested: true,
+    supplementary: {
+      key: "hooks",
+      configPath: path.join(parentDir, "config.toml"),
+    },
+  });
+}
+
+function codexHooksConfig(events) {
+  const hooks = {};
+  for (const event of events) {
+    hooks[event] = [{ hooks: [{ command: `"/node" "/app/hooks/codex-hook.js" ${event}` }] }];
+  }
+  return { hooks };
+}
+
+function codexTrustState(descriptor, events) {
+  return [
+    "[features]",
+    "hooks = true",
+    "",
+    ...events.flatMap((event) => [
+      `[hooks.state.'${descriptor.configPath}:${event.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()}:0:0']`,
+      `trusted_hash = "sha256:${"a".repeat(64)}"`,
+      "",
+    ]),
+  ].join("\n");
 }
 
 afterEach(() => {
@@ -78,6 +189,39 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.parentDirExists, false);
   });
 
+  it("keeps enabled Hermes missing install info-only when another integration is ok", () => {
+    const okDescriptor = baseDescriptor({
+      agentId: "ok-agent",
+      marker: "ok-hook.js",
+    });
+    writeJson(okDescriptor.configPath, {
+      hooks: {
+        Stop: [{ command: '"/node" "/app/hooks/ok-hook.js" Stop' }],
+      },
+    });
+    const hermesDescriptor = baseDescriptor({
+      agentId: "hermes",
+      marker: "clawd-on-desk",
+      configMode: "plugin-dir",
+    });
+
+    const result = checkAgentIntegrations({
+      fs,
+      prefs: { agents: { hermes: { enabled: true } } },
+      descriptors: [okDescriptor, hermesDescriptor],
+      validateCommand: () => ({
+        ok: true,
+        nodeBin: "/node",
+        scriptPath: "/app/hooks/ok-hook.js",
+      }),
+    });
+
+    const hermes = result.details.find((detail) => detail.agentId === "hermes");
+    assert.strictEqual(result.status, "pass");
+    assert.strictEqual(hermes.status, "not-installed");
+    assert.strictEqual(hermes.level, "info");
+  });
+
   it("returns not-connected when config is missing for an auto-installed agent", () => {
     const descriptor = baseDescriptor();
     fs.mkdirSync(descriptor.parentDir, { recursive: true });
@@ -87,6 +231,83 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.level, "warning");
     assert.strictEqual(detail.configFileExists, false);
     assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "test-agent" });
+  });
+
+  it("explains Claude hook loss when the suspicious-shrink guard recently fired", () => {
+    const descriptor = baseDescriptor({
+      agentId: "claude-code",
+      agentName: "Claude Code",
+      marker: "clawd-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, { hooks: {} });
+
+    const detail = runOne(descriptor, {
+      server: suspiciousShrinkGuardServer(),
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.match(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard.type, "suspicious-shrink");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "claude-code" });
+  });
+
+  it("does not show the Claude guard notice for other agents", () => {
+    const descriptor = baseDescriptor();
+    writeJson(descriptor.configPath, { hooks: {} });
+
+    const detail = runOne(descriptor, {
+      server: suspiciousShrinkGuardServer(),
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.match(detail.detail, /has no test-hook\.js command/);
+    assert.doesNotMatch(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard, undefined);
+  });
+
+  it("does not show the Claude guard notice when Claude hooks are connected", () => {
+    const descriptor = baseDescriptor({
+      agentId: "claude-code",
+      agentName: "Claude Code",
+      marker: "clawd-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, {
+      hooks: {
+        Stop: [{
+          matcher: "",
+          hooks: [{ command: '"/node" "/app/hooks/clawd-hook.js" Stop' }],
+        }],
+      },
+    });
+
+    const detail = runOne(descriptor, {
+      server: suspiciousShrinkGuardServer(),
+    });
+
+    assert.strictEqual(detail.status, "ok");
+    assert.doesNotMatch(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard, undefined);
+  });
+
+  it("keeps the original Claude hook loss detail when no guard status is available", () => {
+    const descriptor = baseDescriptor({
+      agentId: "claude-code",
+      agentName: "Claude Code",
+      marker: "clawd-hook.js",
+      nested: true,
+    });
+    writeJson(descriptor.configPath, { hooks: {} });
+
+    const detail = runOne(descriptor, {
+      server: {},
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.match(detail.detail, /has no clawd-hook\.js command/);
+    assert.doesNotMatch(detail.detail, /paused automatic Claude hook repair/);
+    assert.strictEqual(detail.claudeHookGuard, undefined);
   });
 
   it("returns config-corrupt when JSON parsing fails", () => {
@@ -284,6 +505,236 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.fixAction, undefined);
   });
 
+  it("reports missing Antigravity hooks as repairable not-connected", () => {
+    const descriptor = antigravityDescriptor();
+    fs.mkdirSync(descriptor.parentDir, { recursive: true });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.eventSource, "hook");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "antigravity-cli" });
+  });
+
+  it("validates Antigravity hooks for every required event", () => {
+    const descriptor = antigravityDescriptor();
+    writeAntigravityHooks(descriptor);
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        return {
+          ok: true,
+          nodeBin: "/node",
+          scriptPath: "/app/hooks/antigravity-hook.js",
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, ANTIGRAVITY_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, ANTIGRAVITY_HOOK_EVENTS.length);
+    assert.strictEqual(detail.scriptPath, "/app/hooks/antigravity-hook.js");
+  });
+
+  it("validates Windows Antigravity EncodedCommand hooks for every required event", () => {
+    const descriptor = antigravityDescriptor();
+    const nodeBin = "C:\\Program Files\\nodejs\\node.exe";
+    const scriptPath = "D:/app/hooks/antigravity-hook.js";
+    writeAntigravityHooks(descriptor, antigravityHooksConfig((event) =>
+      antigravityInstallTest.buildWindowsAntigravityHookCommand(
+        nodeBin,
+        scriptPath,
+        event,
+        {
+          platform: "win32",
+          powerShellBin: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        }
+      )
+    ));
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        assert.strictEqual(command.includes("antigravity-hook.js"), false);
+        return {
+          ok: true,
+          nodeBin,
+          scriptPath,
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, ANTIGRAVITY_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, ANTIGRAVITY_HOOK_EVENTS.length);
+    assert.strictEqual(detail.scriptPath, scriptPath);
+  });
+
+  it("warns when Antigravity hooks are missing any required event", () => {
+    const descriptor = antigravityDescriptor();
+    writeAntigravityHooks(descriptor, {
+      clawd: {
+        PreToolUse: [{
+          matcher: "*",
+          hooks: [{ type: "command", command: '"/node" "/app/hooks/antigravity-hook.js" PreToolUse' }],
+        }],
+      },
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.ok(detail.missingAntigravityHookEvents.includes("PreInvocation"));
+    assert.ok(detail.missingAntigravityHookEvents.includes("Stop"));
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "antigravity-cli" });
+  });
+
+  it("returns broken-path when Antigravity hook commands fail validation", () => {
+    const descriptor = antigravityDescriptor();
+    writeAntigravityHooks(descriptor);
+
+    const detail = runOne(descriptor, {
+      validateCommand: () => ({
+        ok: false,
+        issue: "scriptPath-missing",
+        nodeBin: "/node",
+        scriptPath: "/missing/antigravity-hook.js",
+      }),
+    });
+
+    assert.strictEqual(detail.status, "broken-path");
+    assert.strictEqual(detail.hookCommandIssue, "scriptPath-missing");
+    assert.strictEqual(detail.brokenAntigravityHookEvent, "PreInvocation");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "antigravity-cli" });
+  });
+
+  it("validates Qwen Code hooks for every required event", () => {
+    const descriptor = qwenDescriptor();
+    writeJson(descriptor.configPath, qwenHooksConfig());
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        return {
+          ok: true,
+          nodeBin: "/node",
+          scriptPath: "/app/hooks/qwen-code-hook.js",
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.scriptPath, "/app/hooks/qwen-code-hook.js");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "qwen_hooks",
+      value: "enabled",
+      detail: "settings.json allows Clawd Qwen hooks",
+    });
+  });
+
+  it("validates Windows Qwen Code EncodedCommand hooks for every required event", () => {
+    const descriptor = qwenDescriptor();
+    const nodeBin = "C:\\Program Files\\nodejs\\node.exe";
+    const scriptPath = "D:/app/hooks/qwen-code-hook.js";
+    writeJson(descriptor.configPath, qwenHooksConfig((event) =>
+      buildQwenCodeHookCommand(
+        nodeBin,
+        scriptPath,
+        event,
+        {
+          platform: "win32",
+          powerShellBin: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        }
+      )
+    ));
+
+    const seen = [];
+    const detail = runOne(descriptor, {
+      validateCommand: (command) => {
+        seen.push(command);
+        assert.strictEqual(command.includes("qwen-code-hook.js"), false);
+        return {
+          ok: true,
+          nodeBin,
+          scriptPath,
+        };
+      },
+    });
+
+    assert.strictEqual(seen.length, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.commandCount, QWEN_CODE_HOOK_EVENTS.length);
+    assert.strictEqual(detail.scriptPath, scriptPath);
+  });
+
+  it("warns when Qwen Code is missing any required hook event", () => {
+    const descriptor = qwenDescriptor();
+    writeJson(descriptor.configPath, {
+      hooks: {
+        PreToolUse: [{
+          matcher: "*",
+          hooks: [{ name: "clawd", type: "command", command: '"/node" "/app/hooks/qwen-code-hook.js" PreToolUse' }],
+        }],
+      },
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.ok(detail.missingQwenHookEvents.includes("SessionStart"));
+    assert.ok(detail.missingQwenHookEvents.includes("PermissionRequest"));
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "qwen-code" });
+  });
+
+  it("does not offer automatic repair when Qwen hooks are disabled globally", () => {
+    const descriptor = qwenDescriptor();
+    writeJson(descriptor.configPath, {
+      ...qwenHooksConfig(),
+      disableAllHooks: true,
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.strictEqual(detail.detail, "Qwen Code hooks are disabled in settings.json; Clawd preserves this user setting and will not receive hook events");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "qwen_hooks",
+      value: "disabled-global",
+      detail: "disableAllHooks is true",
+    });
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("does not offer automatic repair when Antigravity Clawd hooks are disabled", () => {
+    const descriptor = antigravityDescriptor();
+    writeAntigravityHooks(descriptor, {
+      clawd: {
+        enabled: false,
+        ...antigravityHooksConfig().clawd,
+      },
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.detail, "Antigravity Clawd hooks are disabled in hooks.json; Clawd preserves this user setting and will not receive hook events");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "antigravity_hooks",
+      value: "disabled-clawd",
+      detail: "clawd.enabled is false",
+    });
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
   it("returns broken-path when all matching commands fail validation", () => {
     const descriptor = baseDescriptor();
     writeJson(descriptor.configPath, {
@@ -337,26 +788,10 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.hookCommandIssue, "scriptPath-missing");
   });
 
-  it("turns Codex ok into warning when codex_hooks=false", () => {
-    const root = makeTempDir();
-    const parentDir = path.join(root, ".codex");
-    const descriptor = baseDescriptor({
-      agentId: "codex",
-      marker: "codex-hook.js",
-      parentDir,
-      configPath: path.join(parentDir, "hooks.json"),
-      nested: true,
-      supplementary: {
-        key: "codex_hooks",
-        configPath: path.join(parentDir, "config.toml"),
-      },
-    });
-    writeJson(descriptor.configPath, {
-      hooks: {
-        Stop: [{ hooks: [{ command: '"/node" "/app/hooks/codex-hook.js"' }] }],
-      },
-    });
-    fs.writeFileSync(descriptor.supplementary.configPath, "[features]\ncodex_hooks = false\n", "utf8");
+  it("turns Codex ok into warning when hooks=false", () => {
+    const descriptor = codexDescriptor();
+    writeJson(descriptor.configPath, codexHooksConfig(["Stop"]));
+    fs.writeFileSync(descriptor.supplementary.configPath, "[features]\nhooks = false\n", "utf8");
 
     const detail = runOne(descriptor);
     assert.strictEqual(detail.status, "not-connected");
@@ -366,6 +801,40 @@ describe("checkAgentIntegrations", () => {
       agentId: "codex",
       forceCodexHooksFeature: true,
     });
+  });
+
+  it("turns Codex ok into warning when hooks need Codex review", () => {
+    const descriptor = codexDescriptor();
+    writeJson(descriptor.configPath, codexHooksConfig(["PermissionRequest", "Stop"]));
+    fs.writeFileSync(descriptor.supplementary.configPath, "[features]\nhooks = true\n", "utf8");
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "needs-review");
+    assert.strictEqual(detail.level, "warning");
+    assert.strictEqual(detail.fixAction, undefined);
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "hooks",
+      value: "enabled",
+      detail: "hooks=true",
+    });
+    assert.strictEqual(detail.codexHookTrust.value, "needs-review");
+    assert.strictEqual(detail.codexHookTrust.totalCount, 2);
+    assert.deepStrictEqual(detail.codexHookTrust.missingEvents, ["PermissionRequest", "Stop"]);
+    assert.match(detail.codexHookTrust.detail, /Codex \/hooks review/);
+  });
+
+  it("keeps Codex ok when Codex hook trust state exists", () => {
+    const descriptor = codexDescriptor();
+    const events = ["PermissionRequest", "Stop"];
+    writeJson(descriptor.configPath, codexHooksConfig(events));
+    fs.writeFileSync(descriptor.supplementary.configPath, codexTrustState(descriptor, events), "utf8");
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.level, null);
+    assert.strictEqual(detail.fixAction, undefined);
+    assert.strictEqual(detail.codexHookTrust.value, "trusted");
+    assert.strictEqual(detail.codexHookTrust.trustedCount, 2);
   });
 
   it("scans Kiro agent configs and reports fully-valid files", () => {
@@ -409,6 +878,78 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.fixAction, undefined);
   });
 
+  function piDescriptor() {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".pi", "agent");
+    return baseDescriptor({
+      agentId: "pi",
+      agentName: "Pi",
+      eventSource: "extension",
+      parentDir,
+      configPath: path.join(parentDir, "extensions", "clawd-on-desk"),
+      configMode: "pi-extension",
+      marker: "index.ts",
+      coreFile: "pi-extension-core.js",
+      markerFile: ".clawd-managed.json",
+    });
+  }
+
+  it("reports missing Pi extension as repairable not-connected", () => {
+    const descriptor = piDescriptor();
+    fs.mkdirSync(descriptor.parentDir, { recursive: true });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.eventSource, "extension");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "pi" });
+  });
+
+  it("reports unmanaged Pi extension directory as needs-review without repair action", () => {
+    const descriptor = piDescriptor();
+    fs.mkdirSync(descriptor.configPath, { recursive: true });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "needs-review");
+    assert.strictEqual(detail.level, "warning");
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("reports managed Pi extension as ok", () => {
+    const descriptor = piDescriptor();
+    writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "pi",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+    fs.writeFileSync(path.join(descriptor.configPath, "pi-extension-core.js"), "module.exports = {}\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.extensionFileExists, true);
+    assert.strictEqual(detail.coreFileExists, true);
+  });
+
+  it("reports managed Pi extension with missing copied files as repairable broken-path", () => {
+    const descriptor = piDescriptor();
+    writeJson(path.join(descriptor.configPath, ".clawd-managed.json"), {
+      app: "clawd-on-desk",
+      integration: "pi",
+      managed: true,
+    });
+    fs.writeFileSync(path.join(descriptor.configPath, "index.ts"), "export default function() {}\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "broken-path");
+    assert.strictEqual(detail.coreFileExists, false);
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "pi" });
+  });
+
   it("reports opencode stale absolute plugin paths", () => {
     const root = makeTempDir();
     const parentDir = path.join(root, ".config", "opencode");
@@ -428,6 +969,223 @@ describe("checkAgentIntegrations", () => {
     assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "opencode" });
   });
 
+  function openClawDescriptor() {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".openclaw");
+    return baseDescriptor({
+      agentId: "openclaw",
+      agentName: "OpenClaw",
+      eventSource: "plugin-event",
+      parentDir,
+      configPath: path.join(parentDir, "openclaw.json"),
+      configMode: "openclaw-plugin",
+      marker: "openclaw-plugin",
+      pluginId: "clawd-on-desk",
+    });
+  }
+
+  function makeOpenClawPluginDir(root) {
+    const pluginDir = path.join(root, "hooks", "openclaw-plugin");
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, "index.js"), "export default { id: 'clawd-on-desk', register() {} };\n", "utf8");
+    writeJson(path.join(pluginDir, "openclaw.plugin.json"), {
+      id: "clawd-on-desk",
+      name: "Clawd on Desk",
+      description: "test",
+      activation: { onStartup: true },
+      configSchema: { type: "object", additionalProperties: false, properties: {} },
+    });
+    return pluginDir;
+  }
+
+  it("reports missing OpenClaw plugin config as repairable not-connected", () => {
+    const descriptor = openClawDescriptor();
+    fs.mkdirSync(descriptor.parentDir, { recursive: true });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.eventSource, "plugin-event");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "openclaw" });
+  });
+
+  it("reports OpenClaw JSON5 configs as needs-review instead of corrupting them", () => {
+    const descriptor = openClawDescriptor();
+    fs.mkdirSync(descriptor.parentDir, { recursive: true });
+    fs.writeFileSync(descriptor.configPath, "{ // json5\n plugins: {} }\n", "utf8");
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "needs-review");
+    assert.match(detail.detail, /not strict JSON/);
+    assert.strictEqual(detail.fixAction, undefined);
+  });
+
+  it("reports valid OpenClaw plugin paths as ok", () => {
+    const descriptor = openClawDescriptor();
+    const pluginDir = makeOpenClawPluginDir(path.dirname(descriptor.parentDir));
+    writeJson(descriptor.configPath, {
+      plugins: {
+        load: { paths: [pluginDir] },
+        entries: {
+          "clawd-on-desk": {
+            enabled: true,
+            hooks: { allowConversationAccess: false },
+          },
+        },
+      },
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.openclawEntry, pluginDir);
+  });
+
+  it("reports OpenClaw stale plugin paths as repairable broken-path", () => {
+    const descriptor = openClawDescriptor();
+    const pluginDir = path.join(path.dirname(descriptor.parentDir), "missing", "openclaw-plugin");
+    writeJson(descriptor.configPath, {
+      plugins: {
+        load: { paths: [pluginDir] },
+        entries: { "clawd-on-desk": { enabled: true } },
+      },
+    });
+
+    const detail = runOne(descriptor);
+
+    assert.strictEqual(detail.status, "broken-path");
+    assert.strictEqual(detail.openclawEntryIssue, "directory-missing");
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "openclaw" });
+  });
+
+  it("checks Hermes plugin directory files and enabled marker", () => {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".hermes");
+    const pluginDir = path.join(parentDir, "plugins", "clawd-on-desk");
+    const descriptor = baseDescriptor({
+      agentId: "hermes",
+      marker: "clawd-on-desk",
+      parentDir,
+      configPath: pluginDir,
+      configMode: "plugin-dir",
+      managedFiles: ["plugin.yaml", "__init__.py"],
+      configFilePath: path.join(parentDir, "config.yaml"),
+    });
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), "name: clawd-on-desk\n", "utf8");
+    fs.writeFileSync(path.join(pluginDir, "__init__.py"), "# plugin\n", "utf8");
+    fs.writeFileSync(descriptor.configFilePath, "plugins:\n  enabled:\n    - clawd-on-desk\n", "utf8");
+
+    const detail = runOne(descriptor, {
+      prefs: { agents: { hermes: { enabled: true } } },
+    });
+
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.pluginEnabled, true);
+  });
+
+  it("reports Hermes plugin directory missing managed files as repairable", () => {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".hermes");
+    const pluginDir = path.join(parentDir, "plugins", "clawd-on-desk");
+    const descriptor = baseDescriptor({
+      agentId: "hermes",
+      marker: "clawd-on-desk",
+      parentDir,
+      configPath: pluginDir,
+      configMode: "plugin-dir",
+      managedFiles: ["plugin.yaml", "__init__.py"],
+      configFilePath: path.join(parentDir, "config.yaml"),
+    });
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), "name: clawd-on-desk\n", "utf8");
+
+    const detail = runOne(descriptor, {
+      prefs: { agents: { hermes: { enabled: true } } },
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.deepStrictEqual(detail.missingPluginFiles, ["__init__.py"]);
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "hermes" });
+  });
+
+  it("does not report Hermes ok when clawd-on-desk appears only in disabled plugins", () => {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".hermes");
+    const pluginDir = path.join(parentDir, "plugins", "clawd-on-desk");
+    const descriptor = baseDescriptor({
+      agentId: "hermes",
+      marker: "clawd-on-desk",
+      parentDir,
+      configPath: pluginDir,
+      configMode: "plugin-dir",
+      managedFiles: ["plugin.yaml", "__init__.py"],
+      configFilePath: path.join(parentDir, "config.yaml"),
+    });
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), "name: clawd-on-desk\n", "utf8");
+    fs.writeFileSync(path.join(pluginDir, "__init__.py"), "# plugin\n", "utf8");
+    fs.writeFileSync(
+      descriptor.configFilePath,
+      "plugins:\n  enabled: []\n  disabled:\n    - clawd-on-desk\n",
+      "utf8"
+    );
+
+    const detail = runOne(descriptor, {
+      prefs: { agents: { hermes: { enabled: true } } },
+    });
+
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.pluginEnabled, false);
+    assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "hermes" });
+  });
+
+  it("accepts Hermes inline enabled plugin lists", () => {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".hermes");
+    const pluginDir = path.join(parentDir, "plugins", "clawd-on-desk");
+    const descriptor = baseDescriptor({
+      agentId: "hermes",
+      marker: "clawd-on-desk",
+      parentDir,
+      configPath: pluginDir,
+      configMode: "plugin-dir",
+      managedFiles: ["plugin.yaml", "__init__.py"],
+      configFilePath: path.join(parentDir, "config.yaml"),
+    });
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), "name: clawd-on-desk\n", "utf8");
+    fs.writeFileSync(path.join(pluginDir, "__init__.py"), "# plugin\n", "utf8");
+    fs.writeFileSync(
+      descriptor.configFilePath,
+      "plugins:\n  enabled: [\"clawd-on-desk\"]\n  disabled: []\n",
+      "utf8"
+    );
+
+    const detail = runOne(descriptor, {
+      prefs: { agents: { hermes: { enabled: true } } },
+    });
+
+    assert.strictEqual(detail.status, "ok");
+    assert.strictEqual(detail.pluginEnabled, true);
+  });
+
+  it("keeps Hermes disabled as info-only by default", () => {
+    const descriptor = baseDescriptor({
+      agentId: "hermes",
+      marker: "clawd-on-desk",
+      configMode: "plugin-dir",
+    });
+
+    const detail = runOne(descriptor, {
+      prefs: { agents: { hermes: { enabled: false } } },
+    });
+
+    assert.strictEqual(detail.status, "disabled");
+    assert.strictEqual(detail.level, "info");
+  });
+
   it("adds a non-failing note when per-agent permission bubbles are disabled", () => {
     const descriptor = baseDescriptor({ agentId: "codex", marker: "codex-hook.js" });
     writeJson(descriptor.configPath, {
@@ -445,10 +1203,12 @@ describe("checkAgentIntegrations", () => {
   });
 
   it("aggregates all-info states as critical when no integration is ok", () => {
+    // none-global agents (info status `manual-only`) + missing agents only:
+    // no real `ok` integrations means the overall summary is critical.
     const result = checkAgentIntegrations({
       fs,
       descriptors: [
-        baseDescriptor({ agentId: "copilot-cli", configMode: "none-global" }),
+        baseDescriptor({ agentId: "hypothetical-none-global", configMode: "none-global" }),
         baseDescriptor({ agentId: "missing-agent" }),
       ],
     });
@@ -490,6 +1250,16 @@ describe("findOpencodePluginEntry", () => {
     const absEntry = "C:\\clawd\\hooks\\opencode-plugin";
     assert.strictEqual(
       findOpencodePluginEntry(["vendor/opencode-plugin", absEntry], "opencode-plugin"),
+      absEntry
+    );
+  });
+});
+
+describe("findOpenClawPluginEntry", () => {
+  it("matches only absolute plugin entries by basename", () => {
+    const absEntry = "C:\\clawd\\hooks\\openclaw-plugin";
+    assert.strictEqual(
+      findOpenClawPluginEntry(["vendor/openclaw-plugin", absEntry], "openclaw-plugin"),
       absEntry
     );
   });

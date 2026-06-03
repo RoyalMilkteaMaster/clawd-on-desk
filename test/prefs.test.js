@@ -31,6 +31,7 @@ describe("prefs.getDefaults", () => {
     assert.notStrictEqual(a.themeOverrides, b.themeOverrides);
     assert.notStrictEqual(a.shortcuts, b.shortcuts);
     assert.notStrictEqual(a.sessionAliases, b.sessionAliases);
+    assert.notStrictEqual(a.tgApproval, b.tgApproval);
     // Mutating one shouldn't affect the other
     a.agents["claude-code"].enabled = false;
     assert.strictEqual(b.agents["claude-code"].enabled, true);
@@ -49,37 +50,83 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.allowEdgePinning, false);
     assert.strictEqual(d.keepSizeAcrossDisplays, false);
     assert.strictEqual(d.sessionHudEnabled, true);
+    assert.strictEqual(d.sessionHudShowStateLabels, true);
     assert.strictEqual(d.sessionHudShowElapsed, true);
     assert.strictEqual(d.sessionHudCleanupDetached, false);
+    assert.strictEqual("sessionHudAutoHide" in d, false);
+    assert.strictEqual(d.sessionHudPinned, false);
     assert.strictEqual(d.savedPixelWidth, 0);
     assert.strictEqual(d.savedPixelHeight, 0);
     assert.strictEqual(d.permissionBubblesEnabled, true);
-    assert.strictEqual(d.notificationBubbleAutoCloseSeconds, 3);
+    assert.strictEqual(d.notificationBubbleAutoCloseSeconds, 6);
     assert.strictEqual(d.updateBubbleAutoCloseSeconds, 9);
     assert.deepStrictEqual(d.sessionAliases, {});
+    assert.deepStrictEqual(d.tgApproval, {
+      enabled: false,
+      allowedTgUserId: "",
+      targetSessionKey: "",
+      notifyOnComplete: false,
+      completionOutputMode: "full",
+      r3DirectSendEnabled: false,
+    });
   });
 
   it("seeds all known agents as enabled", () => {
     const d = prefs.getDefaults();
-    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode"]) {
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "antigravity-cli", "codebuddy", "kiro-cli", "kimi-cli", "qwen-code", "opencode", "pi", "openclaw", "hermes"]) {
       assert.strictEqual(d.agents[id].enabled, true, `${id} should default enabled`);
     }
   });
 
-  it("seeds all known agents with permissionsEnabled=true", () => {
+  it("seeds permission-capable agents with permissionsEnabled=true", () => {
     const d = prefs.getDefaults();
-    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode"]) {
+    // State-only integrations intentionally excluded — no bubble.
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "qwen-code", "opencode", "hermes"]) {
       assert.strictEqual(
         d.agents[id].permissionsEnabled,
         true,
         `${id} should default permissionsEnabled`
       );
     }
+    for (const id of ["antigravity-cli", "pi", "openclaw"]) {
+      assert.strictEqual(
+        d.agents[id].permissionsEnabled,
+        false,
+        `${id} is state-only, permissionsEnabled must default to false`
+      );
+    }
+  });
+
+  it("defaults OpenClaw permission bubbles off", () => {
+    const d = prefs.getDefaults();
+    assert.strictEqual(d.agents.openclaw.enabled, true);
+    assert.strictEqual(d.agents.openclaw.permissionsEnabled, false);
+    assert.strictEqual(d.agents.openclaw.notificationHookEnabled, true);
+  });
+
+  it("defaults Pi permission bubbles off", () => {
+    const d = prefs.getDefaults();
+    assert.strictEqual(d.agents.pi.enabled, true);
+    assert.strictEqual(d.agents.pi.permissionsEnabled, false);
+    assert.strictEqual(d.agents.pi.notificationHookEnabled, true);
   });
 
   it("defaults Codex permissions to intercept mode", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.agents.codex.permissionMode, "intercept");
+    assert.strictEqual(d.agents.codex.nativeNotificationSoundEnabled, false);
+  });
+
+  it("defaults Hardware Buddy to disabled state-only BLE", () => {
+    const d = prefs.getDefaults();
+    assert.deepStrictEqual(d.hardwareBuddy, {
+      enabled: false,
+      backend: "bleak",
+      address: "",
+      namePrefix: "Clawstick",
+      permissionsEnabled: false,
+      quickCommandsEnabled: false,
+    });
   });
 });
 
@@ -93,6 +140,7 @@ describe("prefs.validate", () => {
       x: NaN,                // not finite
       bubbleFollowPet: true, // ok
       sessionHudEnabled: "yes",
+      sessionHudShowStateLabels: "yes",
       sessionHudShowElapsed: "yes",
       sessionHudCleanupDetached: "yes",
       hideBubbles: 0,        // wrong type
@@ -111,11 +159,12 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.x, 0);
     assert.strictEqual(v.bubbleFollowPet, true);
     assert.strictEqual(v.sessionHudEnabled, true);
+    assert.strictEqual(v.sessionHudShowStateLabels, true);
     assert.strictEqual(v.sessionHudShowElapsed, true);
     assert.strictEqual(v.sessionHudCleanupDetached, false);
     assert.strictEqual(v.hideBubbles, false);
     assert.strictEqual(v.permissionBubblesEnabled, true);
-    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 3);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 6);
     assert.strictEqual(v.updateBubbleAutoCloseSeconds, 9);
     assert.strictEqual(v.allowEdgePinning, false);
     assert.strictEqual(v.savedPixelWidth, 0);
@@ -134,7 +183,7 @@ describe("prefs.validate", () => {
     const v = prefs.validate(prefs.migrate({ hideBubbles: false }));
     assert.strictEqual(v.hideBubbles, false);
     assert.strictEqual(v.permissionBubblesEnabled, true);
-    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 3);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 6);
     assert.strictEqual(v.updateBubbleAutoCloseSeconds, 9);
   });
 
@@ -150,6 +199,72 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.updateBubbleAutoCloseSeconds, 8);
   });
 
+  it("upgrades legacy default notification bubble duration during v3 migration", () => {
+    const v = prefs.validate(prefs.migrate({
+      version: 2,
+      hideBubbles: false,
+      notificationBubbleAutoCloseSeconds: 3,
+    }));
+    assert.strictEqual(v.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 6);
+  });
+
+  it("preserves explicit notification bubble duration during v3 migration", () => {
+    const v = prefs.validate(prefs.migrate({
+      version: 2,
+      hideBubbles: false,
+      notificationBubbleAutoCloseSeconds: 12,
+    }));
+    assert.strictEqual(v.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(v.notificationBubbleAutoCloseSeconds, 12);
+  });
+
+  it("resets existing Pi permission prefs during v4 migration", () => {
+    const v = prefs.validate(prefs.migrate({
+      version: 3,
+      agents: {
+        pi: { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      },
+    }));
+
+    assert.strictEqual(v.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(v.agents.pi.enabled, true);
+    assert.strictEqual(v.agents.pi.permissionsEnabled, false);
+    assert.strictEqual(v.agents.pi.notificationHookEnabled, true);
+  });
+
+  it("defaults missing Pi permission prefs off during migration", () => {
+    const v = prefs.validate(prefs.migrate({
+      version: 1,
+      agents: {
+        pi: { enabled: true, notificationHookEnabled: true },
+      },
+    }));
+
+    assert.strictEqual(v.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(v.agents.pi.permissionsEnabled, false);
+  });
+
+  it("normalizes Telegram approval prefs without storing a token", () => {
+    const v = prefs.validate({
+      tgApproval: {
+        enabled: true,
+        allowedTgUserId: " 123456789 ",
+        targetSessionKey: "987654321",
+        botToken: "123:should-not-survive",
+      },
+    });
+    assert.deepStrictEqual(v.tgApproval, {
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      notifyOnComplete: false,
+      completionOutputMode: "full",
+      r3DirectSendEnabled: false,
+    });
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(v.tgApproval, "botToken"), false);
+  });
+
   it("keeps valid fields verbatim", () => {
     const v = prefs.validate({
       lang: "ko",
@@ -158,6 +273,7 @@ describe("prefs.validate", () => {
       lowPowerIdleMode: true,
       bubbleFollowPet: true,
       sessionHudEnabled: false,
+      sessionHudShowStateLabels: false,
       sessionHudShowElapsed: false,
       sessionHudCleanupDetached: true,
       allowEdgePinning: true,
@@ -176,6 +292,7 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.lowPowerIdleMode, true);
     assert.strictEqual(v.bubbleFollowPet, true);
     assert.strictEqual(v.sessionHudEnabled, false);
+    assert.strictEqual(v.sessionHudShowStateLabels, false);
     assert.strictEqual(v.sessionHudShowElapsed, false);
     assert.strictEqual(v.sessionHudCleanupDetached, true);
     assert.strictEqual(v.allowEdgePinning, true);
@@ -243,6 +360,24 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.agents["claude-code"].permissionsEnabled, true);
   });
 
+  it("normalizes agents: preserves Hermes permission/notification flags", () => {
+    const v = prefs.validate({
+      agents: {
+        hermes: { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      },
+    });
+    assert.deepStrictEqual(v.agents.hermes, { enabled: true, permissionsEnabled: true, notificationHookEnabled: true });
+  });
+
+  it("normalizes agents: preserves Antigravity permission flag but strips notification flag", () => {
+    const v = prefs.validate({
+      agents: {
+        "antigravity-cli": { enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      },
+    });
+    assert.deepStrictEqual(v.agents["antigravity-cli"], { enabled: false, permissionsEnabled: false });
+  });
+
   it("normalizes agents: preserves notificationHookEnabled flag", () => {
     const v = prefs.validate({
       agents: {
@@ -256,11 +391,12 @@ describe("prefs.validate", () => {
   it("normalizes agents: preserves valid Codex permissionMode", () => {
     const v = prefs.validate({
       agents: {
-        codex: { enabled: true, permissionMode: "intercept" },
+        codex: { enabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
       },
     });
     assert.strictEqual(v.agents.codex.enabled, true);
     assert.strictEqual(v.agents.codex.permissionMode, "intercept");
+    assert.strictEqual(v.agents.codex.nativeNotificationSoundEnabled, false);
   });
 
   it("normalizes agents: drops invalid Codex permissionMode to intercept", () => {
@@ -284,15 +420,29 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.agents["claude-code"].notificationHookEnabled, true);
   });
 
+  it("normalizes agents: fills missing Codex nativeNotificationSoundEnabled from defaults", () => {
+    const v = prefs.validate({
+      agents: {
+        codex: { enabled: true, permissionMode: "native" },
+      },
+    });
+    assert.strictEqual(v.agents.codex.nativeNotificationSoundEnabled, false);
+  });
+
   it("seeds all known agents with notificationHookEnabled=true", () => {
     const d = prefs.getDefaults();
-    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "opencode"]) {
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "qwen-code", "opencode", "pi", "openclaw", "hermes"]) {
       assert.strictEqual(
         d.agents[id].notificationHookEnabled,
         true,
         `${id} should default notificationHookEnabled`
       );
     }
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(d.agents["antigravity-cli"], "notificationHookEnabled"),
+      false,
+      "antigravity-cli should not expose a dead notificationHookEnabled switch"
+    );
   });
 
   it("returns defaults for null/non-object input", () => {
@@ -445,13 +595,82 @@ describe("prefs.validate", () => {
       permissionDeny: "CommandOrControl+Shift+N",
     });
   });
+
+  it("defaults the three stale-cleanup intervals to the historical constants", () => {
+    const d = prefs.getDefaults();
+    assert.strictEqual(d.sessionStaleMs, 600000);
+    assert.strictEqual(d.workingStaleMs, 300000);
+    assert.strictEqual(d.detachedIdleStaleMs, 30000);
+  });
+
+  it("accepts sessionStaleMs=0 (disables idle-age cutoff)", () => {
+    const v = prefs.validate({ sessionStaleMs: 0 });
+    assert.strictEqual(v.sessionStaleMs, 0);
+  });
+
+  it("drops below-minimum non-zero sessionStaleMs back to default", () => {
+    // 30s is below the 60s floor for non-zero values, so it should fall
+    // back to the default rather than land on disk as an unsafe value.
+    const v = prefs.validate({ sessionStaleMs: 30_000 });
+    assert.strictEqual(v.sessionStaleMs, 600_000);
+  });
+
+  it("drops workingStaleMs=0 back to default (0 not allowed)", () => {
+    const v = prefs.validate({ workingStaleMs: 0 });
+    assert.strictEqual(v.workingStaleMs, 300_000);
+  });
+
+  it("drops detachedIdleStaleMs=0 back to default (0 not allowed)", () => {
+    const v = prefs.validate({ detachedIdleStaleMs: 0 });
+    assert.strictEqual(v.detachedIdleStaleMs, 30_000);
+  });
+
+  it("clamps a hand-edited inverted pair: workingStaleMs > sessionStaleMs", () => {
+    const v = prefs.validate({
+      sessionStaleMs: 120_000,
+      workingStaleMs: 600_000,
+    });
+    assert.strictEqual(v.sessionStaleMs, 120_000);
+    assert.strictEqual(v.workingStaleMs, 120_000);
+  });
+
+  it("leaves workingStaleMs alone when sessionStaleMs is disabled (=0)", () => {
+    const v = prefs.validate({
+      sessionStaleMs: 0,
+      workingStaleMs: 600_000,
+    });
+    assert.strictEqual(v.sessionStaleMs, 0);
+    assert.strictEqual(v.workingStaleMs, 600_000);
+  });
+
+  it("normalizes Hardware Buddy settings", () => {
+    const v = prefs.validate({
+      hardwareBuddy: {
+        enabled: true,
+        backend: "fake",
+        address: "  FAKE:CLAWSTICK  ",
+        namePrefix: "  Claude  ",
+        permissionsEnabled: true,
+        quickCommandsEnabled: true,
+      },
+    });
+    assert.deepStrictEqual(v.hardwareBuddy, {
+      enabled: true,
+      backend: "fake",
+      address: "FAKE:CLAWSTICK",
+      namePrefix: "Claude",
+      permissionsEnabled: true,
+      quickCommandsEnabled: true,
+    });
+    assert.deepStrictEqual(prefs.validate({ hardwareBuddy: "bad" }).hardwareBuddy, prefs.getDefaults().hardwareBuddy);
+  });
 });
 
 describe("prefs.migrate", () => {
-  it("upgrades v0 (no version field) to v1", () => {
+  it("upgrades v0 (no version field) to the current version", () => {
     const raw = { lang: "zh", soundMuted: true };
     const upgraded = prefs.migrate(raw);
-    assert.strictEqual(upgraded.version, 1);
+    assert.strictEqual(upgraded.version, prefs.CURRENT_VERSION);
     assert.ok(upgraded.agents && typeof upgraded.agents === "object");
     assert.ok(upgraded.themeOverrides && typeof upgraded.themeOverrides === "object");
     // Original fields preserved
@@ -459,14 +678,14 @@ describe("prefs.migrate", () => {
     assert.strictEqual(upgraded.soundMuted, true);
   });
 
-  it("leaves v1 files alone", () => {
+  it("migrates v1 files to the current version while preserving agent prefs", () => {
     const raw = {
       version: 1,
       lang: "en",
       agents: { "claude-code": { enabled: false } },
     };
     const upgraded = prefs.migrate(raw);
-    assert.strictEqual(upgraded.version, 1);
+    assert.strictEqual(upgraded.version, prefs.CURRENT_VERSION);
     assert.strictEqual(upgraded.agents["claude-code"].enabled, false);
   });
 
@@ -486,6 +705,135 @@ describe("prefs.migrate", () => {
     const raw = { version: 1, x: 0, y: 0, positionSaved: true };
     const upgraded = prefs.migrate(raw);
     assert.strictEqual(upgraded.positionSaved, true);
+  });
+});
+
+describe("prefs.migrate v4 → v5 (sessionHudAutoHide removal)", () => {
+  it("auto-pins users who had sessionHudAutoHide=false (always-show)", () => {
+    const upgraded = prefs.migrate({
+      version: 4,
+      sessionHudAutoHide: false,
+      sessionHudPinned: false,
+    });
+    assert.strictEqual(upgraded.sessionHudPinned, true);
+    assert.strictEqual("sessionHudAutoHide" in upgraded, false);
+    assert.strictEqual(upgraded.version, prefs.CURRENT_VERSION);
+  });
+
+  it("leaves pinned untouched for users who had auto-hide enabled", () => {
+    const upgraded = prefs.migrate({
+      version: 4,
+      sessionHudAutoHide: true,
+      sessionHudPinned: false,
+    });
+    assert.strictEqual(upgraded.sessionHudPinned, false);
+    assert.strictEqual("sessionHudAutoHide" in upgraded, false);
+  });
+
+  it("respects existing pinned=true even when sessionHudAutoHide=false", () => {
+    const upgraded = prefs.migrate({
+      version: 4,
+      sessionHudAutoHide: false,
+      sessionHudPinned: true,
+    });
+    assert.strictEqual(upgraded.sessionHudPinned, true);
+    assert.strictEqual("sessionHudAutoHide" in upgraded, false);
+  });
+
+  it("treats missing sessionHudAutoHide as no-op (no pin auto-set)", () => {
+    const upgraded = prefs.migrate({
+      version: 4,
+      sessionHudPinned: false,
+    });
+    assert.strictEqual(upgraded.sessionHudPinned, false);
+    assert.strictEqual("sessionHudAutoHide" in upgraded, false);
+  });
+
+  it("ignores non-boolean sessionHudAutoHide (only strict === false triggers pin)", () => {
+    for (const bad of ["yes", null, 0, "false"]) {
+      const upgraded = prefs.migrate({
+        version: 4,
+        sessionHudAutoHide: bad,
+        sessionHudPinned: false,
+      });
+      assert.strictEqual(
+        upgraded.sessionHudPinned,
+        false,
+        `bad value ${JSON.stringify(bad)} should not trigger pin`
+      );
+      assert.strictEqual("sessionHudAutoHide" in upgraded, false);
+    }
+  });
+
+  it("is idempotent on v5 input (skips the v4→v5 branch)", () => {
+    const upgraded = prefs.migrate({
+      version: 5,
+      sessionHudPinned: false,
+    });
+    assert.strictEqual(upgraded.sessionHudPinned, false);
+    assert.strictEqual("sessionHudAutoHide" in upgraded, false);
+    assert.strictEqual(upgraded.version, prefs.CURRENT_VERSION);
+  });
+
+  it("does not let validate() re-populate the deprecated field after save", () => {
+    const validated = prefs.validate(prefs.migrate({
+      version: 4,
+      sessionHudAutoHide: false,
+    }));
+    assert.strictEqual("sessionHudAutoHide" in validated, false);
+    assert.strictEqual(validated.sessionHudPinned, true);
+  });
+});
+
+describe("prefs.migrate v6 → v7 (Codex Native prompt sound default)", () => {
+  it("moves the early Codex Native prompt sound default to off", () => {
+    const upgraded = prefs.migrate({
+      version: 6,
+      agents: {
+        codex: {
+          enabled: true,
+          permissionsEnabled: true,
+          permissionMode: "native",
+          nativeNotificationSoundEnabled: true,
+        },
+      },
+    });
+    assert.strictEqual(upgraded.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(upgraded.agents.codex.nativeNotificationSoundEnabled, false);
+  });
+});
+
+describe("prefs.migrate v7 → v8 (Telegram bare completion default)", () => {
+  it("turns old persisted bare completion pings off", () => {
+    const upgraded = prefs.migrate({
+      version: 7,
+      tgApproval: {
+        enabled: true,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: true,
+        completionOutputMode: "full",
+      },
+    });
+    const validated = prefs.validate(upgraded);
+
+    assert.strictEqual(validated.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(validated.tgApproval.notifyOnComplete, false);
+    assert.strictEqual(validated.tgApproval.completionOutputMode, "full");
+    assert.strictEqual(validated.tgApproval.enabled, true);
+  });
+
+  it("migrates older prefs without Telegram approval settings safely", () => {
+    const upgraded = prefs.migrate({
+      version: 6,
+      lang: "zh",
+    });
+    const validated = prefs.validate(upgraded);
+
+    assert.strictEqual(validated.version, prefs.CURRENT_VERSION);
+    assert.strictEqual(validated.lang, "zh");
+    assert.strictEqual(validated.tgApproval.notifyOnComplete, false);
+    assert.strictEqual(validated.tgApproval.completionOutputMode, "full");
   });
 });
 
@@ -521,7 +869,7 @@ describe("prefs.load", () => {
     );
     const { snapshot, locked } = prefs.load(p);
     assert.strictEqual(locked, false);
-    assert.strictEqual(snapshot.version, 1);
+    assert.strictEqual(snapshot.version, prefs.CURRENT_VERSION);
     assert.strictEqual(snapshot.lang, "zh");
     assert.strictEqual(snapshot.x, 100);
     assert.strictEqual(snapshot.y, 200);
@@ -529,6 +877,27 @@ describe("prefs.load", () => {
     // New fields populated from defaults
     assert.ok(snapshot.agents);
     assert.ok(snapshot.themeOverrides);
+  });
+
+  it("loads v2 prefs without locking or warning", () => {
+    const p = makeTempPath();
+    fs.writeFileSync(
+      p,
+      JSON.stringify({ version: 2, lang: "zh" }),
+      "utf8"
+    );
+    const originalWarn = console.warn;
+    let warned = false;
+    console.warn = () => { warned = true; };
+    try {
+      const { snapshot, locked } = prefs.load(p);
+      assert.strictEqual(locked, false);
+      assert.strictEqual(snapshot.version, prefs.CURRENT_VERSION);
+      assert.strictEqual(snapshot.lang, "zh");
+      assert.strictEqual(warned, false);
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   it("returns locked=true and warns for future-version files", () => {
@@ -564,7 +933,7 @@ describe("prefs.save", () => {
     assert.strictEqual(snapshot.lang, "zh");
     assert.strictEqual(snapshot.bubbleFollowPet, true);
     assert.strictEqual(snapshot.x, 42);
-    assert.strictEqual(snapshot.version, 1);
+    assert.strictEqual(snapshot.version, prefs.CURRENT_VERSION);
   });
 
   it("validates before writing — bad fields fall back to defaults on disk", () => {

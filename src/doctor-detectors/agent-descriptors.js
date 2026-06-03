@@ -5,12 +5,18 @@ const { getAgent } = require("../../agents/registry");
 
 const claude = require("../../hooks/install");
 const codex = require("../../hooks/codex-install");
+const copilot = require("../../hooks/copilot-install");
 const cursor = require("../../hooks/cursor-install");
 const gemini = require("../../hooks/gemini-install");
+const antigravity = require("../../hooks/antigravity-install");
 const codebuddy = require("../../hooks/codebuddy-install");
 const kiro = require("../../hooks/kiro-install");
 const kimi = require("../../hooks/kimi-install");
+const qwen = require("../../hooks/qwen-code-install");
 const opencode = require("../../hooks/opencode-install");
+const pi = require("../../hooks/pi-install");
+const openclaw = require("../../hooks/openclaw-install");
+const hermes = require("../../hooks/hermes-install");
 
 function agentName(agentId) {
   const agent = getAgent(agentId);
@@ -45,7 +51,7 @@ const AGENT_DESCRIPTORS = Object.freeze([
     marker: "codex-hook.js",
     nested: true,
     supplementary: {
-      key: "codex_hooks",
+      key: "hooks",
       configPath: codex.DEFAULT_FEATURES_CONFIG,
     },
   }),
@@ -53,11 +59,13 @@ const AGENT_DESCRIPTORS = Object.freeze([
     agentId: "copilot-cli",
     agentName: agentName("copilot-cli"),
     eventSource: agentEventSource("copilot-cli"),
-    parentDir: null,
-    configPath: null,
-    configMode: "none-global",
-    autoInstall: false,
-    marker: "copilot-hook.js",
+    parentDir: copilot.resolveCopilotHome(),
+    configPath: copilot.resolveCopilotHooksPath(),
+    settingsPath: copilot.resolveCopilotSettingsPath(),
+    configMode: "copilot-hooks",
+    autoInstall: true,
+    marker: copilot.MARKER,
+    hookEvents: copilot.COPILOT_HOOK_EVENTS,
     scriptPath: path.join(__dirname, "..", "..", "hooks", "copilot-hook.js"),
   }),
   Object.freeze({
@@ -81,6 +89,17 @@ const AGENT_DESCRIPTORS = Object.freeze([
     autoInstall: true,
     marker: "gemini-hook.js",
     nested: true,
+  }),
+  Object.freeze({
+    agentId: "antigravity-cli",
+    agentName: agentName("antigravity-cli"),
+    eventSource: agentEventSource("antigravity-cli"),
+    parentDir: antigravity.DEFAULT_PARENT_DIR,
+    configPath: antigravity.DEFAULT_CONFIG_PATH,
+    configMode: "antigravity-hooks",
+    autoInstall: true,
+    marker: antigravity.MARKER,
+    hookEvents: antigravity.ANTIGRAVITY_HOOK_EVENTS,
   }),
   Object.freeze({
     agentId: "codebuddy",
@@ -115,6 +134,18 @@ const AGENT_DESCRIPTORS = Object.freeze([
     marker: "kimi-hook.js",
   }),
   Object.freeze({
+    agentId: "qwen-code",
+    agentName: agentName("qwen-code"),
+    eventSource: agentEventSource("qwen-code"),
+    parentDir: qwen.DEFAULT_PARENT_DIR,
+    configPath: qwen.DEFAULT_CONFIG_PATH,
+    configMode: "file",
+    autoInstall: true,
+    marker: qwen.MARKER,
+    nested: true,
+    hookEvents: qwen.QWEN_CODE_HOOK_EVENTS,
+  }),
+  Object.freeze({
     agentId: "opencode",
     agentName: agentName("opencode"),
     eventSource: agentEventSource("opencode"),
@@ -126,6 +157,42 @@ const AGENT_DESCRIPTORS = Object.freeze([
     // Detection matches an absolute plugin entry by basename.
     marker: "opencode-plugin",
     detection: "opencode-plugin",
+  }),
+  Object.freeze({
+    agentId: "pi",
+    agentName: agentName("pi"),
+    eventSource: agentEventSource("pi"),
+    parentDir: pi.DEFAULT_PARENT_DIR,
+    configPath: pi.DEFAULT_EXTENSION_DIR,
+    configMode: "pi-extension",
+    autoInstall: true,
+    marker: pi.EXTENSION_FILE,
+    coreFile: pi.CORE_FILE,
+    markerFile: pi.MARKER_FILE,
+  }),
+  Object.freeze({
+    agentId: "openclaw",
+    agentName: agentName("openclaw"),
+    eventSource: agentEventSource("openclaw"),
+    parentDir: openclaw.DEFAULT_STATE_DIR,
+    configPath: openclaw.DEFAULT_CONFIG_PATH,
+    configMode: "openclaw-plugin",
+    autoInstall: true,
+    marker: openclaw.PLUGIN_DIR_NAME,
+    pluginId: openclaw.PLUGIN_ID,
+    detection: "openclaw-plugin",
+  }),
+  Object.freeze({
+    agentId: "hermes",
+    agentName: agentName("hermes"),
+    eventSource: agentEventSource("hermes"),
+    parentDir: hermes.resolveHermesHome(),
+    configPath: path.join(hermes.resolveHermesHome(), "plugins", hermes.PLUGIN_ID),
+    configMode: "plugin-dir",
+    autoInstall: true,
+    marker: hermes.PLUGIN_ID,
+    managedFiles: hermes.MANAGED_PLUGIN_FILES,
+    configFilePath: path.join(hermes.resolveHermesHome(), "config.yaml"),
   }),
 ]);
 

@@ -1,6 +1,6 @@
 # Codex + WSL 现状说明
 
-最后核实日期：2026-04-26
+最后核实日期：2026-05-08
 
 这份说明专门澄清三个经常被混在一起的问题：
 
@@ -13,7 +13,7 @@
 ## TL;DR
 
 - OpenAI 官方支持 Codex 跑在 WSL2 里。
-- OpenAI 官方 Hooks 文档当前把 Codex hooks 描述为通过 `[features].codex_hooks = true` 开启的 feature flag。
+- 当前 Codex CLI 通过 `[features].hooks = true` 开启 hooks；旧版本和部分文档使用的 `[features].codex_hooks` 已废弃。
 - Clawd 当前以 Codex official hooks 为主，继续保留 `~/.codex/sessions` JSONL 轮询作为 fallback。
 - 2026-04-26 本地已验证 Windows native Codex hooks 可用；Windows hook command 必须使用 PowerShell 的 `&` 调用形式。
 - 当 Clawd 跑在 Windows、Codex 跑在 WSL 且仍使用 Linux 默认 home 时，Clawd 默认不会扫到 WSL 里的 `/home/<user>/.codex/sessions`。
@@ -49,12 +49,14 @@ OpenAI 官方 Windows 文档同时写明：
 
 ### 3. Codex hooks 仍是 feature flag
 
-OpenAI 官方 Hooks 文档当前写明 hooks 通过下面的 feature flag 开启：
+当前 Codex CLI 通过下面的 feature flag 开启 hooks：
 
 ```toml
 [features]
-codex_hooks = true
+hooks = true
 ```
+
+旧版本和部分文档使用过 `codex_hooks` key；新版 Codex CLI 已提示该 key deprecated。
 
 同一份文档还定义了 `hooks.json`、通用输入字段、`PermissionRequest`、`tool_input.description`，以及当前 `PermissionRequest` 输出里不支持字段会 fail-closed 的行为。
 
@@ -62,7 +64,7 @@ codex_hooks = true
 
 - <https://developers.openai.com/codex/hooks>
 
-Clawd 的 Codex installer 会写入 `~/.codex/hooks.json`，并在用户没有显式设置 `codex_hooks = false` 时开启这个 feature flag；如果用户主动设置为 false，Clawd 只给 warning，不强行翻转。
+Clawd 的 Codex installer 会写入 `~/.codex/hooks.json`，并在用户没有显式关闭 hooks 时开启这个 feature flag；如果看到已废弃的 `codex_hooks` key，会迁移到 `hooks`，同时保留用户显式设置的 false。
 
 ### 4. WSL 和 Windows 默认不会共享 `.codex`
 
@@ -166,10 +168,10 @@ Fallback 监控会把 `~` 展开成当前进程自己的 `os.homedir()`。也就
 
 ## 四、目前最准确的结论
 
-截至 2026-04-26，更准确的结论是：
+截至 2026-05-08，更准确的结论是：
 
 1. OpenAI 官方支持 Codex 跑在 WSL2 里。
-2. OpenAI 官方把 Codex hooks 记录为 `codex_hooks` feature flag。
+2. 当前 Codex CLI 使用 `hooks` feature flag；`codex_hooks` 已废弃。
 3. Clawd 以 Codex official hooks 为主，JSONL 日志轮询为 fallback。
 4. Clawd 当前同步 hooks 和 fallback 轮询的目标都是宿主机自己的 `.codex` home。
 5. 所以当 Codex 运行在 WSL2 且仍使用 Linux 默认 `~/.codex` 时，Windows Clawd 默认不会自动发现这些会话。
