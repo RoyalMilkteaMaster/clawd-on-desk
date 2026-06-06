@@ -91,28 +91,51 @@ function tryLaunch(bin, args, opts) {
   });
 }
 
-function findClaudeCmd(plat = platform()) {
+function findClaudeCmd(plat = platform(), deps = {}) {
+  const _execFileSync = deps.execFileSync || execFileSync;
+  const _existsSync = deps.existsSync || fs.existsSync;
+
   // 1. Try system PATH lookup
   try {
     const cmd = plat === "win32" ? "where" : "which";
-    const out = execFileSync(cmd, ["claude"], {
+    const out = _execFileSync(cmd, ["claude"], {
       encoding: "utf8",
       timeout: 5000,
       windowsHide: true,
     });
-    const lines = out.trim().split(/\r?\n/);
-    for (const line of lines) {
-      const p = line.trim();
-      if (p && fs.existsSync(p)) return p;
+    const existing = out
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((p) => p && _existsSync(p));
+    if (plat === "win32") {
+      // npm installs `claude` as BOTH an extensionless POSIX shell script and a
+      // launchable shim (claude.cmd) in the same directory, and `where claude`
+      // can list the extensionless script first. Handing that script to a
+      // terminal raises ERROR_BAD_EXE_FORMAT (0x800700c1): it is not a PE/Win32
+      // image, and nothing in our launch path (wt/cmd/powershell) runs POSIX
+      // scripts. So prefer a Windows-launchable extension; if `where` surfaced
+      // only the extensionless script, probe for its launchable sibling. Only
+      // when neither exists do we fall through to the stage-2 npm locations
+      // rather than returning the unrunnable script.
+      const launchable = existing.find((p) => /\.(com|exe|bat|cmd)$/i.test(p));
+      if (launchable) return launchable;
+      for (const p of existing) {
+        for (const ext of [".cmd", ".exe", ".bat", ".com"]) {
+          if (_existsSync(p + ext)) return p + ext;
+        }
+      }
+    } else if (existing.length) {
+      return existing[0];
     }
   } catch {}
 
-  // 2. Check common npm global install locations
+  // 2. Check common npm global install locations. On Windows we only offer the
+  // launchable .cmd shim — never the extensionless POSIX script (see above).
   const candidates = [];
   if (plat === "win32") {
     candidates.push(
       path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
-      path.join(process.env.APPDATA || "", "npm", "claude"),
       path.join(process.env.LOCALAPPDATA || "", "npm", "claude.cmd"),
     );
   } else {
@@ -123,10 +146,12 @@ function findClaudeCmd(plat = platform()) {
     );
   }
   for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
+    if (_existsSync(p)) return p;
   }
 
-  // 3. Fallback: return "claude" and let the shell resolve it
+  // 3. Fallback: return "claude" and let the shell resolve it. cmd.exe (the
+  // wt/cmd launch layer) resolves a bare name through PATHEXT and so still
+  // picks the .cmd shim over the extensionless script.
   return "claude";
 }
 
@@ -157,8 +182,27 @@ function buildTerminalCandidates(claudePath, claudeArgs, plat = platform()) {
     const cmdLine = buildCmdLaunchCommand(claudePath, claudeArgs);
     // powershell.exe -Command: call operator `&` + single-quoted PS strings.
     const psCmd = "& " + [claudePath, ...claudeArgs].map(quoteForPowerShell).join(" ");
+    // wt.exe runs its commandline through CreateProcess (no shell), which cannot
+    // execute an npm .cmd/.bat shim or an extensionless POSIX script directly —
+    // that raises ERROR_BAD_EXE_FORMAT (0x800700c1). Route the tab through
+    // cmd.exe (a real PE), which resolves and runs the shim.
+    //
+    // Two quoting hazards, both neutralized by the `call "<path>"` prefix:
+    //  - Windows Terminal re-tokenizes the args after `--` and re-quotes only
+    //    those containing spaces, so we can't rely on our own quotes surviving
+    //    verbatim (windowsVerbatimArguments only protects the Node->wt hop).
+    //  - cmd.exe's /K strips a *leading* quote unless a narrow preserve rule
+    //    holds, which breaks paths like `C:\Program Files (x86)\...`.
+    // Prefixing `call` means the /K command never begins with a quote, so cmd
+    // keeps the quoted path intact whether wt forwarded it raw or re-quoted it.
+    // (We still avoid cmdLine's `/s ""..""` idiom: cmd.exe understands it but
+    // wt's tokenizer mangles it.) This path still needs real-Windows validation.
     return [
-      { bin: "wt.exe", args: ["--", claudePath, ...claudeArgs] },
+      {
+        bin: "wt.exe",
+        args: ["--", "cmd.exe", "/d", "/v:off", "/k", "call", quoteCmdExecutablePath(claudePath), ...claudeArgs],
+        extraOpts: { shell: false, windowsVerbatimArguments: true },
+      },
       {
         bin: "cmd.exe",
         args: ["/d", "/v:off", "/s", "/k", cmdLine],

@@ -15,6 +15,7 @@ const {
   quoteCmdExecutablePath,
   quoteForPowerShell,
   launchClaudeSession,
+  findClaudeCmd,
 } = require("../src/launch-claude");
 
 const WIN_PATH = "C:\\Program Files\\nodejs\\node_modules\\@anthropic\\claude.cmd";
@@ -108,16 +109,96 @@ describe("cmd executable quoting", () => {
   });
 });
 
+describe("findClaudeCmd", () => {
+  const NPM_DIR = "C:\\Users\\Tester\\AppData\\Roaming\\npm";
+  // `where`/`which` stub: emits the given paths as newline output.
+  const fakeWhere = (...paths) => ({ execFileSync: () => paths.join("\r\n") + "\r\n" });
+  // filesystem stub: only the listed paths "exist" (case-insensitive on Windows).
+  const fakeFs = (existing) => {
+    const set = new Set(existing.map((p) => String(p).toLowerCase()));
+    return { existsSync: (p) => set.has(String(p).toLowerCase()) };
+  };
+
+  it("Windows: prefers claude.cmd when `where` lists the extensionless script first", () => {
+    const ext = `${NPM_DIR}\\claude`;
+    const cmd = `${NPM_DIR}\\claude.cmd`;
+    const out = findClaudeCmd("win32", { ...fakeWhere(ext, cmd), ...fakeFs([ext, cmd]) });
+    assert.strictEqual(out, cmd, "must not return the 0x800700c1 POSIX shim");
+  });
+
+  it("Windows: never returns the extensionless POSIX shim, probing for a sibling", () => {
+    // `where` surfaced only the unrunnable script; its launchable sibling is
+    // right next to it. Returning `ext` here is the exact #435 bug.
+    const ext = `${NPM_DIR}\\claude`;
+    const cmd = `${NPM_DIR}\\claude.cmd`;
+    const out = findClaudeCmd("win32", { ...fakeWhere(ext), ...fakeFs([ext, cmd]) });
+    assert.strictEqual(out, cmd);
+  });
+
+  it("Windows: prefers a real claude.exe over the .cmd shim", () => {
+    const exe = `${NPM_DIR}\\claude.exe`;
+    const cmd = `${NPM_DIR}\\claude.cmd`;
+    const out = findClaudeCmd("win32", { ...fakeWhere(exe, cmd), ...fakeFs([exe, cmd]) });
+    assert.strictEqual(out, exe);
+  });
+
+  it("Windows: falls back to %APPDATA%\\npm\\claude.cmd when PATH lookup misses", () => {
+    const prev = process.env.APPDATA;
+    process.env.APPDATA = "C:\\Users\\Tester\\AppData\\Roaming";
+    try {
+      const cmd = path.join(process.env.APPDATA, "npm", "claude.cmd");
+      const out = findClaudeCmd("win32", {
+        execFileSync: () => { throw new Error("where: not found"); },
+        ...fakeFs([cmd]),
+      });
+      assert.strictEqual(out, cmd);
+    } finally {
+      if (prev === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = prev;
+    }
+  });
+
+  it("Windows: returns bare \"claude\" when nothing is found", () => {
+    const out = findClaudeCmd("win32", { execFileSync: () => "", existsSync: () => false });
+    assert.strictEqual(out, "claude");
+  });
+
+  it("Windows: passes through to stage 3 when only an extensionless shim exists (no sibling)", () => {
+    // No launchable variant anywhere — must NOT return the unrunnable script;
+    // falls through to bare \"claude\" for cmd.exe/PATHEXT to resolve.
+    const ext = `${NPM_DIR}\\claude`;
+    const out = findClaudeCmd("win32", { ...fakeWhere(ext), ...fakeFs([ext]) });
+    assert.strictEqual(out, "claude");
+  });
+
+  it("Windows: matches launchable extensions case-insensitively", () => {
+    const cmd = `${NPM_DIR}\\CLAUDE.CMD`;
+    const out = findClaudeCmd("win32", { ...fakeWhere(cmd), ...fakeFs([cmd]) });
+    assert.strictEqual(out, cmd);
+  });
+
+  it("POSIX: returns the first existing `which` result", () => {
+    const p = "/usr/local/bin/claude";
+    const out = findClaudeCmd("linux", { ...fakeWhere(p), ...fakeFs([p]) });
+    assert.strictEqual(out, p);
+  });
+});
+
 describe("buildTerminalCandidates - Windows", () => {
   it("orders fallbacks wt -> cmd -> powershell", () => {
     const cands = buildTerminalCandidates("claude", [], "win32");
     assert.deepStrictEqual(cands.map((c) => c.bin), ["wt.exe", "cmd.exe", "powershell.exe"]);
   });
 
-  it("wt.exe uses an argv array, no shell quoting needed", () => {
+  it("wt.exe routes through cmd.exe so Windows Terminal never execs a .cmd shim directly", () => {
     const cands = buildTerminalCandidates(WIN_PATH, ["--resume", "sid"], "win32");
     const wt = cands.find((c) => c.bin === "wt.exe");
-    assert.deepStrictEqual(wt.args, ["--", WIN_PATH, "--resume", "sid"]);
+    assert.deepStrictEqual(wt.args, [
+      "--", "cmd.exe", "/d", "/v:off", "/k", "call", `"${WIN_PATH}"`, "--resume", "sid",
+    ]);
+    // `call` keeps cmd's /K from stripping the leading quote; verbatim keeps the
+    // Node->wt hop from re-quoting. WT's own re-tokenization needs real Windows.
+    assert.deepStrictEqual(wt.extraOpts, { shell: false, windowsVerbatimArguments: true });
   });
 
   it("cmd.exe quotes a claude path with spaces", () => {
@@ -210,6 +291,59 @@ describe("buildTerminalCandidates - Windows", () => {
       assert.strictEqual(result.status, 0, detail);
       assert.deepStrictEqual(JSON.parse(result.stdout.trim()), claudeArgs, detail);
       assert.throws(() => buildClaudeArgs("resume", 'a" & echo injected & "b'), /Invalid Claude session ID/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("round-trips a spaced + parenthesized .cmd shim through wt's cmd.exe layer", { skip: process.platform !== "win32" }, () => {
+    // Dir name carries BOTH a space and cmd-special chars `()` — the exact shape
+    // (`Program Files (x86)`) that strips quotes under plain `/k "..."`. The
+    // `call` prefix is what keeps it intact.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "launch (x86) claude wt shim-"));
+    try {
+      const shimPath = path.join(tmpDir, "claude.cmd");
+      const echoPath = path.join(tmpDir, "echo-argv.js");
+      fs.writeFileSync(echoPath, 'console.log(JSON.stringify(process.argv.slice(2)));\n', "utf8");
+      fs.writeFileSync(
+        shimPath,
+        [
+          "@ECHO off",
+          "GOTO start",
+          ":find_dp0",
+          "SET dp0=%~dp0",
+          "EXIT /b",
+          ":start",
+          "SETLOCAL",
+          "CALL :find_dp0",
+          'SET "_prog=node"',
+          'endLocal & goto #_undefined_# 2>NUL || "%_prog%"  "%dp0%echo-argv.js" %*',
+          "",
+        ].join("\r\n"),
+        "utf8",
+      );
+
+      const claudeArgs = buildClaudeArgs("resume", "safe_sid-123");
+      const cands = buildTerminalCandidates(shimPath, claudeArgs, "win32");
+      const wt = cands.find((c) => c.bin === "wt.exe");
+      // Covers the cmd.exe SIDE only: given the tokens delivered faithfully, does
+      // `cmd /c call "<path>" <args>` run the shim and forward argv? It does NOT
+      // exercise Windows Terminal's own commandline re-tokenization/re-quoting —
+      // that layer needs a real wt.exe launch on Windows. Here we drop "--", swap
+      // /k -> /c so cmd exits, and feed the tokens to cmd.exe verbatim.
+      const inner = wt.args.slice(1).map((a) => (a === "/k" ? "/c" : a));
+      const result = spawnSync(inner[0], inner.slice(1), {
+        encoding: "utf8",
+        windowsVerbatimArguments: true,
+      });
+      const detail = JSON.stringify({
+        status: result.status,
+        error: result.error && result.error.message,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+      assert.strictEqual(result.status, 0, detail);
+      assert.deepStrictEqual(JSON.parse(result.stdout.trim()), claudeArgs, detail);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -327,7 +461,9 @@ describe("launchClaudeSession - terminal fallback", () => {
   it("passes the resolved claude path and quoted args through to the terminal", async () => {
     const { attempted, deps } = makeDeps({ plat: "win32", okBins: ["wt.exe"], findResult: WIN_PATH });
     await launchClaudeSession("resume", undefined, "sid_1", deps);
-    assert.deepStrictEqual(attempted[0].args, ["--", WIN_PATH, "--resume", "sid_1"]);
+    assert.deepStrictEqual(attempted[0].args, [
+      "--", "cmd.exe", "/d", "/v:off", "/k", "call", `"${WIN_PATH}"`, "--resume", "sid_1",
+    ]);
   });
 
   it("rejects unsafe resume IDs before trying any terminal", async () => {
