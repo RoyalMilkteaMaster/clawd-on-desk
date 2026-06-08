@@ -99,11 +99,6 @@
         labelKey: "rowLowPowerIdleMode",
         descKey: "rowLowPowerIdleModeDesc",
       }),
-      helpers.buildSwitchRow({
-        key: "keepAwakeWhileWorking",
-        labelKey: "rowKeepAwakeWhileWorking",
-        descKey: "rowKeepAwakeWhileWorkingDesc",
-      }),
       buildFlashGroup(),
       helpers.buildSwitchRow({
         key: "allowEdgePinning",
@@ -125,6 +120,14 @@
     parent.appendChild(helpers.buildSection(t("sectionSession"), [
       buildSessionHudGroup(),
       buildSessionCleanupGroup(),
+      // Keep-awake is a session-lifecycle behavior (block OS sleep while an
+      // agent task is in progress), so it belongs here rather than under
+      // Appearance where it originally sat.
+      helpers.buildSwitchRow({
+        key: "keepAwakeWhileWorking",
+        labelKey: "rowKeepAwakeWhileWorking",
+        descKey: "rowKeepAwakeWhileWorkingDesc",
+      }),
       buildDashboardRow(),
     ]));
 
