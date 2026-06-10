@@ -3,24 +3,26 @@
 # auto-relaunch (issue #441 / PR #443).
 #
 # Proves, on a real Wayland compositor with the shipped AppImage:
-#   1. On a Wayland session the first process plans + logs the relaunch.
-#   2. The throwaway first process exits 0 (app.exit after app.relaunch).
-#   3. A relaunched browser process is alive with --ozone-platform=x11 on its
-#      REAL cmdline — i.e. Chromium booted the X11/XWayland backend.
-#   4. The app is healthy: GET /state on 127.0.0.1:23333 answers.
-#   5. The app's window exists on the X server — it really is an XWayland
-#      client, which is what restores positioning/drag.
-#   6. The process set is stable and the relaunch happened exactly once
-#      (no relaunch loop).
-#   7. Negative control: CLAWD_OZONE_PLATFORM=wayland boots natively with NO
+#   A. Manual `--ozone-platform=x11` (the reporter's known-good workaround)
+#      boots, serves /state, puts a window on the X server, and does NOT
+#      trigger the auto-relaunch (argv guard).
+#   B. A plain, no-argument launch on a Wayland session relaunches itself
+#      onto XWayland: relaunch logged exactly once, throwaway first process
+#      exits 0, the relaunched browser process carries --ozone-platform=x11
+#      on its REAL cmdline, /state answers, the window exists on the X
+#      server, and the process set is stable (no relaunch loop).
+#   C. Negative control: CLAWD_OZONE_PLATFORM=wayland boots natively with NO
 #      relaunch and stays alive (the escape hatch works).
 #
 # What it can NOT prove: behavior on the reporter's exact Fedora/KDE box
 # (KWin vs weston, their session env). That residual still needs a field test.
 #
 # Note: the Linux relauncher pipes the second process's stdout/stderr to
-# /dev/null, so all child-side assertions go through /proc, X, and HTTP —
-# never through logs.
+# /dev/null, so child-side assertions go through /proc, X, and HTTP. Two
+# extra eyes for debugging: ELECTRON_ENABLE_LOGGING=file (env is inherited,
+# so even the silenced child writes Chromium logs to ELECTRON_LOG_FILE) and
+# a 10 Hz /proc sampler that records every Clawd/relauncher process's
+# appearance and disappearance.
 
 set -u
 
@@ -33,15 +35,33 @@ PASS=0
 note() { printf '\n== %s ==\n' "$*"; }
 ok() { PASS=$((PASS + 1)); printf 'PASS %s: %s\n' "$PASS" "$*"; }
 
+proc_timeline() {
+  # procwatch.raw: "<time> <pid> <cmd...>" — collapse to one line per pid with
+  # first/last sighting so short-lived processes and their lifespan are visible.
+  awk '{
+    key = $2
+    if (!(key in first)) { first[key] = $1; cmd[key] = substr($0, index($0, $3)) }
+    last[key] = $1
+  } END {
+    for (k in first) printf "pid %-7s %s -> %s  %.160s\n", k, first[k], last[k], cmd[k]
+  }' procwatch.raw 2>/dev/null | sort -k3
+}
+
 dump_diagnostics() {
+  note "diagnostics: process timeline (first seen -> last seen)"
+  proc_timeline || true
+  note "diagnostics: manual-x11 log (manual.log)"
+  cat manual.log 2>/dev/null || true
   note "diagnostics: first-process log (first.log)"
   cat first.log 2>/dev/null || true
   note "diagnostics: negative-control log (negative.log)"
   cat negative.log 2>/dev/null || true
+  note "diagnostics: chromium log of the most recent process (electron-child.log)"
+  tail -n 80 electron-child.log 2>/dev/null || true
   note "diagnostics: weston log (tail)"
-  tail -n 60 weston.log 2>/dev/null || true
-  note "diagnostics: processes"
-  ps ax -o pid,ppid,stat,etime,args | grep -iE 'clawd|\.mount_|electron' | grep -v grep || true
+  tail -n 30 weston.log 2>/dev/null || true
+  note "diagnostics: live processes"
+  ps ax -o pid,ppid,stat,etime,args | grep -iE 'clawd|\.mount_|relauncher' | grep -v grep || true
   note "diagnostics: port 23333"
   ss -tlnp 2>/dev/null | grep 23333 || echo "(nothing listening)"
   note "diagnostics: X clients on ${XDISPLAY:-unset}"
@@ -87,7 +107,6 @@ has_x11_browser() { [ -n "$(browser_pids x11)" ]; }
 no_x11_browser() { [ -z "$(browser_pids x11)" ]; }
 state_ok() { curl -fsS --max-time 2 "$STATE_URL" >/dev/null; }
 state_gone() { ! curl -fsS --max-time 1 "$STATE_URL" >/dev/null 2>&1; }
-launch_gone() { ! kill -0 "$LAUNCH_PID" 2>/dev/null; }
 x_has_clawd() {
   xlsclients -display "$XDISPLAY" -l 2>/dev/null | grep -qi clawd ||
     xwininfo -root -tree -display "$XDISPLAY" 2>/dev/null | grep -qi clawd
@@ -136,8 +155,44 @@ export XDG_SESSION_TYPE=wayland
 export DISPLAY="$XDISPLAY"
 export LIBGL_ALWAYS_SOFTWARE=1 # headless runner: keep GL in software
 
-# ── positive case: plain launch must relaunch onto XWayland ─────────────────
-note "launching AppImage with NO arguments (reporter's scenario)"
+# Inherited by every process, including the relauncher's silenced child —
+# Chromium-level errors land in this file even when stdio is /dev/null.
+export ELECTRON_ENABLE_LOGGING=file
+export ELECTRON_LOG_FILE="$PWD/electron-child.log"
+
+# 10 Hz process sampler: catches even short-lived Clawd/relauncher processes.
+(
+  while :; do
+    t="$(date +%H:%M:%S.%2N)"
+    for d in /proc/[0-9]*; do
+      cmd="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
+      case "$cmd" in
+      *[Cc]lawd* | *relauncher*) printf '%s %s %s\n' "$t" "${d#/proc/}" "$cmd" ;;
+      esac
+    done
+    sleep 0.1
+  done
+) >procwatch.raw 2>/dev/null &
+PROCWATCH_PID=$!
+
+# ── phase A: manual --ozone-platform=x11 (reporter's known-good workaround) ──
+note "phase A: manual --ozone-platform=x11"
+"$APPIMAGE" --ozone-platform=x11 >manual.log 2>&1 &
+MANUAL_PID=$!
+
+poll 90 state_ok || fail "manual x11: state server $STATE_URL never answered"
+kill -0 "$MANUAL_PID" 2>/dev/null || fail "manual x11: process died"
+poll 60 x_has_clawd || fail "manual x11: no Clawd client/window on the X server"
+if grep -q "$RELAUNCH_MARK" manual.log; then
+  fail "manual x11 triggered the auto-relaunch (argv guard broken)"
+fi
+ok "manual --ozone-platform=x11 boots, healthy, window on X, no relaunch"
+
+note "phase A done — tearing down"
+kill_app
+
+# ── phase B: plain launch must relaunch onto XWayland ───────────────────────
+note "phase B: launching AppImage with NO arguments (reporter's scenario)"
 "$APPIMAGE" >first.log 2>&1 &
 LAUNCH_PID=$!
 
@@ -145,19 +200,20 @@ poll 30 grep -q "$RELAUNCH_MARK" first.log ||
   fail "first process never logged the XWayland relaunch line"
 ok "first process planned + logged the relaunch"
 
-poll 30 launch_gone || fail "throwaway first process still alive after 30s"
+poll 30 sh -c "! kill -0 $LAUNCH_PID 2>/dev/null" ||
+  fail "throwaway first process still alive after 30s"
 wait "$LAUNCH_PID"
 FIRST_RC=$?
 [ "$FIRST_RC" -eq 0 ] || fail "first process exited rc=$FIRST_RC (expected 0)"
 ok "throwaway first process exited 0"
 
-poll 90 has_x11_browser ||
+poll 45 has_x11_browser ||
   fail "no relaunched browser process with --ozone-platform=x11 on its cmdline"
 X11_PIDS="$(browser_pids x11 | sort | tr '\n' ' ')"
 ok "relaunched browser process up with --ozone-platform=x11 (pid(s): $X11_PIDS)"
 
-poll 90 state_ok || fail "state server $STATE_URL never answered"
-ok "GET /state answers — app is healthy"
+poll 90 state_ok || fail "state server $STATE_URL never answered after relaunch"
+ok "GET /state answers — relaunched app is healthy"
 
 poll 60 x_has_clawd ||
   fail "no Clawd client/window on the X server — not running as an XWayland client?"
@@ -172,22 +228,24 @@ RELAUNCH_LINES="$(grep -c "$RELAUNCH_MARK" first.log)"
   fail "expected exactly 1 relaunch log line, got $RELAUNCH_LINES"
 ok "stable: exactly one relaunch, pid set unchanged after 5s"
 
-note "positive case done — tearing down"
+note "phase B done — tearing down"
 kill_app
 
-# ── negative control: explicit native Wayland must NOT relaunch ─────────────
-note "launching with CLAWD_OZONE_PLATFORM=wayland (escape hatch)"
+# ── phase C: explicit native Wayland must NOT relaunch ──────────────────────
+note "phase C: launching with CLAWD_OZONE_PLATFORM=wayland (escape hatch)"
 CLAWD_OZONE_PLATFORM=wayland "$APPIMAGE" >negative.log 2>&1 &
 NEG_PID=$!
 
 poll 90 state_ok || fail "negative control: state server never answered under native Wayland"
 kill -0 "$NEG_PID" 2>/dev/null || fail "negative control: process died"
-! grep -q "$RELAUNCH_MARK" negative.log ||
+if grep -q "$RELAUNCH_MARK" negative.log; then
   fail "negative control relaunched despite CLAWD_OZONE_PLATFORM=wayland"
+fi
 no_x11_browser || fail "negative control: found a browser process with --ozone-platform=x11"
 ok "escape hatch works: native Wayland boot, no relaunch, app healthy"
 
 kill_app
+kill "$PROCWATCH_PID" 2>/dev/null || true
 kill "$WESTON_PID" 2>/dev/null || true
 
 note "ALL $PASS CHECKS PASSED"
