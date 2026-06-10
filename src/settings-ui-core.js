@@ -396,10 +396,6 @@
       return `${body.scrollHeight}px`;
     }
 
-    function isGroupConnected() {
-      return !!(document.body && document.body.contains(group));
-    }
-
     function setExpandedBodyHeight() {
       body.style.setProperty("--collapsible-body-height", measureCollapsibleBodyHeight());
     }
@@ -442,12 +438,11 @@
         if (collapsed) {
           body.style.setProperty("--collapsible-body-height", "0px");
         } else {
-          // Detached groups report scrollHeight=0 in some engines. Keep the
-          // body fully expanded until the post-mount RAF can measure a real height.
-          body.style.setProperty(
-            "--collapsible-body-height",
-            isGroupConnected() ? measureCollapsibleBodyHeight() : "none"
-          );
+          // Settled-open groups must NOT keep a pinned max-height: text zoom
+          // or window-width changes rewrap descriptions and grow the content,
+          // and a stale pinned height clips the bottom rows (overflow:
+          // hidden). A measured height is only needed while animating.
+          body.style.setProperty("--collapsible-body-height", "none");
         }
         return;
       }
@@ -493,11 +488,13 @@
     body.addEventListener("transitionend", (ev) => {
       if (ev.target !== body || ev.propertyName !== "max-height") return;
       group.classList.remove("expanding", "collapsing");
-      if (!collapsed) setExpandedBodyHeight();
+      // Release the pinned height once settled so later reflows (text zoom,
+      // window resize) can grow the body instead of clipping at the bottom.
+      if (!collapsed) body.style.setProperty("--collapsible-body-height", "none");
     });
     applyCollapsedState();
     requestAnimationFrame(() => {
-      if (!collapsed) setExpandedBodyHeight();
+      if (!collapsed) body.style.setProperty("--collapsible-body-height", "none");
     });
     return group;
   }

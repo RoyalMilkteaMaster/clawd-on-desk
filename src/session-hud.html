@@ -192,7 +192,11 @@ body { padding: 2px 3px 8px; }
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
   max-width: 58%;
-  min-width: 0;
+  /* Intentionally NO width-floor override here: with elapsed hidden the
+     chips are the only content, and letting .right shrink below its
+     min-content would clip them at the window edge. The elapsed span carries
+     its own zero floor, so the squeeze order stays: elapsed truncates first,
+     chips never clip. */
   overflow: hidden;
   white-space: nowrap;
 }
