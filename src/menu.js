@@ -309,7 +309,12 @@ module.exports = function initMenu(ctx) {
       callback: () => {
         ctx.menuOpen = false;
         if (owner && !owner.isDestroyed()) owner.hide();
-        if (ctx.win && !ctx.win.isDestroyed()) {
+        // ctx.petHidden guard: the menu's own Hide item may have just hidden
+        // the pet, and the click handler can fire on either side of this close
+        // callback — an unconditional showInactive() would resurrect a window
+        // setPetHidden() just hid. The show path re-asserts taskbar/mac flags
+        // itself (showPetWindows), so skipping here loses nothing.
+        if (ctx.win && !ctx.win.isDestroyed() && !ctx.petHidden) {
           ctx.win.showInactive();
           keepOutOfTaskbar(ctx.win);
           if (isMac) {
@@ -443,6 +448,11 @@ module.exports = function initMenu(ctx) {
       if (updateItem) template.push({ type: "separator" }, updateItem);
     }
     template.push(
+      { type: "separator" },
+      {
+        label: ctx.petHidden ? t("showPet") : t("hidePet"),
+        click: () => ctx.togglePetVisibility(),
+      },
       { type: "separator" },
       { label: t("quit"), click: () => requestAppQuit() },
     );
