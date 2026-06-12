@@ -44,7 +44,13 @@ const {
   normalizeTextScaleByDisplay,
 } = require("./text-scale");
 
-const CURRENT_VERSION = 10;
+const CURRENT_VERSION = 11;
+const DEFAULT_INTEGRATION_INSTALLED_IDS = Object.freeze(["claude-code", "codex"]);
+const DEFAULT_INTEGRATION_INSTALLED_SET = new Set(DEFAULT_INTEGRATION_INSTALLED_IDS);
+
+function isDefaultIntegrationInstalled(agentId) {
+  return DEFAULT_INTEGRATION_INSTALLED_SET.has(agentId);
+}
 
 // ── Schema ──
 // Each field has: type, default OR defaultFactory, optional enum/normalize/validate.
@@ -217,26 +223,26 @@ const SCHEMA = {
       // subagentPermissionsEnabled (#451): bubbles for PermissionRequests
       // fired inside a Task subagent. Only claude-code carries the flag —
       // normalizeAgents drops it for agents whose default entry lacks it.
-      "claude-code": { enabled: true, permissionsEnabled: true, subagentPermissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
-      "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "claude-code": { integrationInstalled: true, enabled: true, permissionsEnabled: true, subagentPermissionsEnabled: true, notificationHookEnabled: true },
+      "codex": { integrationInstalled: true, enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
+      "copilot-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "cursor-agent": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "gemini-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       // Antigravity is state-only post-D2 — Clawd never surfaces a permission
       // bubble for agy regardless of this flag (see server-route-permission.js
       // antigravity branch). Default kept as false so legacy reads don't see a
       // stale "true" implying bubbles are enabled.
-      "antigravity-cli": { enabled: true, permissionsEnabled: false },
-      "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "kimi-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "qwen-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "pi": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
-      "openclaw": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
-      "hermes": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "antigravity-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: false },
+      "codebuddy": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "kiro-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "kimi-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "qwen-code": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "opencode": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "pi": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "openclaw": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "hermes": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       // Qoder is state-only (Phase 1) — permission bubbles default off.
-      "qoder": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
+      "qoder": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
   },
@@ -410,6 +416,9 @@ function normalizeStaleTriple(out) {
 //   is reset off.
 function migrate(raw) {
   if (!raw || typeof raw !== "object") return raw;
+  const originalAgentIds = raw.agents && typeof raw.agents === "object" && !Array.isArray(raw.agents)
+    ? new Set(Object.keys(raw.agents))
+    : new Set();
   const out = { ...raw };
   if (out.version === undefined || out.version === null) {
     out.version = 1;
@@ -536,6 +545,25 @@ function migrate(raw) {
     if (!("sessionHudCleanupDetached" in out)) out.sessionHudCleanupDetached = false;
     out.version = 10;
   }
+  // v10 -> v11: agent integrations are installed on demand. Entries that were
+  // actually present in an old prefs file predate `integrationInstalled`, so
+  // keep them managed by Clawd. Missing entries fall through to v11 defaults
+  // instead of pretending that a never-seen/newer agent was installed.
+  if (out.version < 11) {
+    if (out.agents && typeof out.agents === "object") {
+      const defaults = SCHEMA.agents.defaultFactory();
+      for (const agentId of Object.keys(defaults)) {
+        if (!originalAgentIds.has(agentId)) continue;
+        const current = out.agents[agentId];
+        if (!current || typeof current !== "object") continue;
+        out.agents[agentId] = {
+          ...current,
+          integrationInstalled: true,
+        };
+      }
+    }
+    out.version = 11;
+  }
   if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
     out.version = CURRENT_VERSION;
   }
@@ -543,7 +571,14 @@ function migrate(raw) {
   return out;
 }
 
-const AGENT_FLAGS = ["enabled", "permissionsEnabled", "subagentPermissionsEnabled", "notificationHookEnabled", "nativeNotificationSoundEnabled"];
+const AGENT_FLAGS = [
+  "integrationInstalled",
+  "enabled",
+  "permissionsEnabled",
+  "subagentPermissionsEnabled",
+  "notificationHookEnabled",
+  "nativeNotificationSoundEnabled",
+];
 const CODEX_PERMISSION_MODES = ["native", "intercept"];
 
 function normalizeDismissedUpdateVersions(value) {
@@ -581,7 +616,12 @@ function normalizeAgents(value, defaultsValue) {
     const entry = value[id];
     if (!entry || typeof entry !== "object") continue;
     const base = (defaultsValue && defaultsValue[id])
-      || { enabled: true, permissionsEnabled: true, notificationHookEnabled: true };
+      || {
+        integrationInstalled: isDefaultIntegrationInstalled(id),
+        enabled: true,
+        permissionsEnabled: true,
+        notificationHookEnabled: true,
+      };
     const merged = { ...base };
     let touched = false;
     const allowedFlags = AGENT_FLAGS.filter((flag) => Object.prototype.hasOwnProperty.call(base, flag));
@@ -864,6 +904,7 @@ module.exports = {
   SCHEMA_KEYS,
   AGENT_FLAGS,
   CODEX_PERMISSION_MODES,
+  DEFAULT_INTEGRATION_INSTALLED_IDS,
   getDefaults,
   validate,
   migrate,

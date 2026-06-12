@@ -986,6 +986,28 @@ html, body {
   background: rgba(217, 119, 87, 0.12);
   color: var(--accent);
 }
+.agent-badge.integration {
+  background: rgba(16, 120, 87, 0.1);
+  color: #187253;
+}
+.agent-badge.integration.not-installed {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-secondary);
+}
+@media (prefers-color-scheme: dark) {
+  .agent-badge.integration {
+    color: #8ce99a;
+    background: rgba(140, 233, 154, 0.12);
+  }
+  .agent-badge.integration.not-installed {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-secondary);
+  }
+}
+.agent-integration-action {
+  min-width: 72px;
+  padding-inline: 8px;
+}
 
 /* ── Select (segmented) ── */
 .segmented {

@@ -65,6 +65,7 @@
       sessionCleanupControls: new Map(),
       agentSwitches: new Map(),
       agentPermissionModes: new Map(),
+      agentIntegrationActions: new Map(),
       animMapSwitches: new Map(),
       animMapReset: null,
       animOverrideTimingSliders: new Map(),
@@ -150,6 +151,13 @@
   function readAgentFlagValue(agentId, flag) {
     const entry = state.snapshot && state.snapshot.agents && state.snapshot.agents[agentId];
     return entry ? entry[flag] !== false : true;
+  }
+
+  function readAgentIntegrationInstalled(agentId) {
+    const entry = state.snapshot && state.snapshot.agents && state.snapshot.agents[agentId];
+    // Normalized v11 snapshots carry the explicit flag. The true fallback is
+    // only for old/mocked snapshots that predate on-demand installation.
+    return entry ? entry.integrationInstalled === true : true;
   }
 
   function readAgentPermissionMode(agentId) {
@@ -809,6 +817,7 @@
     state.mountedControls.sessionCleanupControls.clear();
     state.mountedControls.agentSwitches.clear();
     state.mountedControls.agentPermissionModes.clear();
+    state.mountedControls.agentIntegrationActions.clear();
     state.mountedControls.animMapSwitches.clear();
     state.mountedControls.animMapReset = null;
     state.mountedControls.animOverrideTimingSliders.clear();
@@ -1174,6 +1183,7 @@
     readGeneralSwitchVisual,
     agentSwitchStateId,
     readAgentFlagValue,
+    readAgentIntegrationInstalled,
     readAgentPermissionMode,
     getShortcutValue,
     getLang,

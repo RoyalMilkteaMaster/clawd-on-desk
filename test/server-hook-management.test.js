@@ -380,6 +380,23 @@ describe("server Claude hook management", () => {
     assert.deepStrictEqual(syncCalls, []);
   });
 
+  it("watcher does not re-sync missing Claude hooks after Claude integration is uninstalled", () => {
+    let shouldSyncClaude = true;
+    const { api, syncCalls, timers, getWatcher, setSettingsRaw } = makeServer({
+      shouldSyncAgentIntegration: (agentId) => (
+        agentId !== "claude-code" || shouldSyncClaude
+      ),
+    });
+
+    api.startClaudeSettingsWatcher();
+    shouldSyncClaude = false;
+    setSettingsRaw('{"hooks":{}}');
+    getWatcher().emitChange("settings.json");
+    timers.flush();
+
+    assert.deepStrictEqual(syncCalls, []);
+  });
+
   it("disconnect-style restart does not reinstall Claude hooks when management stays disabled", () => {
     const first = makeServer({ manageClaudeHooksAutomatically: false });
     first.api.startHttpServer();

@@ -4,7 +4,11 @@ const {
   AGENT_FLAGS,
   CODEX_PERMISSION_MODES,
 } = require("./prefs");
-const { getCodexPermissionMode, isAgentEnabled } = require("./agent-gate");
+const {
+  getCodexPermissionMode,
+  isAgentEnabled,
+  isAgentIntegrationInstalled,
+} = require("./agent-gate");
 const {
   requireBoolean,
   requireString,
@@ -26,6 +30,25 @@ const AUTO_REPAIRABLE_AGENT_IDS = new Set([
   "qoder",
 ]);
 
+const INSTALLABLE_AGENT_IDS = new Set([
+  "claude-code",
+  "codex",
+  "copilot-cli",
+  "cursor-agent",
+  "gemini-cli",
+  "antigravity-cli",
+  "codebuddy",
+  "kiro-cli",
+  "kimi-cli",
+  "qwen-code",
+  "opencode",
+  "pi",
+  "openclaw",
+  "hermes",
+  "qoder",
+]);
+const SETTABLE_AGENT_FLAGS = AGENT_FLAGS.filter((flag) => flag !== "integrationInstalled");
+
 // setAgentFlag is atomic single-agent, single-flag toggle.
 // Payload `{ agentId, flag, value }` where flag is in AGENT_FLAGS.
 const _validateAgentFlagId = requireString("setAgentFlag.agentId");
@@ -39,10 +62,10 @@ function setAgentFlag(payload, deps) {
   const { agentId, flag, value } = payload;
   const idCheck = _validateAgentFlagId(agentId);
   if (idCheck.status !== "ok") return idCheck;
-  if (typeof flag !== "string" || !AGENT_FLAGS.includes(flag)) {
+  if (typeof flag !== "string" || !SETTABLE_AGENT_FLAGS.includes(flag)) {
     return {
       status: "error",
-      message: `setAgentFlag.flag must be one of: ${AGENT_FLAGS.join(", ")}`,
+      message: `setAgentFlag.flag must be one of: ${SETTABLE_AGENT_FLAGS.join(", ")}`,
     };
   }
   // #451: the subagent sub-gate is claude-code-scoped. normalizeAgents already
@@ -77,7 +100,12 @@ function setAgentFlag(payload, deps) {
         if (typeof deps.clearSessionsByAgent === "function") deps.clearSessionsByAgent(agentId);
         if (typeof deps.dismissPermissionsByAgent === "function") deps.dismissPermissionsByAgent(agentId);
       } else {
-        if (typeof deps.syncIntegrationForAgent === "function") deps.syncIntegrationForAgent(agentId);
+        if (
+          isAgentIntegrationInstalled(snapshot, agentId)
+          && typeof deps.syncIntegrationForAgent === "function"
+        ) {
+          deps.syncIntegrationForAgent(agentId);
+        }
         if (typeof deps.startMonitorForAgent === "function") deps.startMonitorForAgent(agentId);
       }
     } else if (flag === "permissionsEnabled") {
@@ -104,6 +132,8 @@ function setAgentFlag(payload, deps) {
 }
 
 const _validateAgentPermissionModeId = requireString("setAgentPermissionMode.agentId");
+const _validateInstallAgentId = requireString("installAgentIntegration.agentId");
+const _validateUninstallAgentId = requireString("uninstallAgentIntegration.agentId");
 
 function setAgentPermissionMode(payload, deps) {
   if (!payload || typeof payload !== "object") {
@@ -145,6 +175,124 @@ function setAgentPermissionMode(payload, deps) {
   return { status: "ok", commit: { agents: nextAgents } };
 }
 
+function normalizeAgentIntegrationPayload(payload, validateAgentId, actionName) {
+  const agentId = typeof payload === "string" ? payload : payload && payload.agentId;
+  const idCheck = validateAgentId(agentId);
+  if (idCheck.status !== "ok") return idCheck;
+  if (!INSTALLABLE_AGENT_IDS.has(agentId)) {
+    return {
+      status: "error",
+      message: `No automatic integration ${actionName} is available for ${agentId}`,
+    };
+  }
+  return { status: "ok", agentId };
+}
+
+function resultMessage(result, fallback) {
+  return result && typeof result === "object" && typeof result.message === "string" && result.message
+    ? result.message
+    : fallback;
+}
+
+function buildAgentCommit(snapshot, agentId, patch) {
+  const currentAgents = (snapshot && snapshot.agents) || {};
+  const currentEntry = currentAgents[agentId] && typeof currentAgents[agentId] === "object"
+    ? currentAgents[agentId]
+    : {};
+  return {
+    agents: {
+      ...currentAgents,
+      [agentId]: {
+        ...currentEntry,
+        ...patch,
+      },
+    },
+  };
+}
+
+async function installAgentIntegration(payload, deps = {}) {
+  const normalized = normalizeAgentIntegrationPayload(payload, _validateInstallAgentId, "install");
+  if (normalized.status !== "ok") return normalized;
+  const { agentId } = normalized;
+  const snapshot = deps.snapshot || {};
+
+  if (agentId === "claude-code" && snapshot.manageClaudeHooksAutomatically === false) {
+    return {
+      status: "error",
+      message: "Claude hook management is disabled in Settings",
+    };
+  }
+  if (!deps || typeof deps.syncIntegrationForAgent !== "function") {
+    return { status: "error", message: "installAgentIntegration requires syncIntegrationForAgent dep" };
+  }
+
+  try {
+    const result = await deps.syncIntegrationForAgent(agentId);
+    if (result === false) {
+      return { status: "error", message: `No automatic integration install is available for ${agentId}` };
+    }
+    if (result && typeof result === "object" && result.status && result.status !== "ok") {
+      return {
+        status: "error",
+        message: resultMessage(result, `Failed to install ${agentId}`),
+      };
+    }
+    if (typeof deps.startMonitorForAgent === "function") deps.startMonitorForAgent(agentId);
+    return {
+      status: "ok",
+      message: resultMessage(result, `Installed ${agentId}`),
+      commit: buildAgentCommit(snapshot, agentId, {
+        integrationInstalled: true,
+        enabled: true,
+      }),
+    };
+  } catch (err) {
+    return {
+      status: "error",
+      message: `installAgentIntegration: ${err && err.message}`,
+    };
+  }
+}
+
+async function uninstallAgentIntegration(payload, deps = {}) {
+  const normalized = normalizeAgentIntegrationPayload(payload, _validateUninstallAgentId, "uninstall");
+  if (normalized.status !== "ok") return normalized;
+  const { agentId } = normalized;
+  const snapshot = deps.snapshot || {};
+  if (!deps || typeof deps.uninstallIntegrationForAgent !== "function") {
+    return { status: "error", message: "uninstallAgentIntegration requires uninstallIntegrationForAgent dep" };
+  }
+
+  try {
+    const result = await deps.uninstallIntegrationForAgent(agentId);
+    if (result === false) {
+      return { status: "error", message: `No automatic integration uninstall is available for ${agentId}` };
+    }
+    if (result && typeof result === "object" && result.status === "error") {
+      return {
+        status: "error",
+        message: resultMessage(result, `Failed to uninstall ${agentId}`),
+      };
+    }
+    if (typeof deps.stopMonitorForAgent === "function") deps.stopMonitorForAgent(agentId);
+    if (typeof deps.clearSessionsByAgent === "function") deps.clearSessionsByAgent(agentId);
+    if (typeof deps.dismissPermissionsByAgent === "function") deps.dismissPermissionsByAgent(agentId);
+    return {
+      status: "ok",
+      message: resultMessage(result, `Uninstalled ${agentId}`),
+      commit: buildAgentCommit(snapshot, agentId, {
+        integrationInstalled: false,
+        enabled: false,
+      }),
+    };
+  } catch (err) {
+    return {
+      status: "error",
+      message: `uninstallAgentIntegration: ${err && err.message}`,
+    };
+  }
+}
+
 async function repairAgentIntegration(payload, deps) {
   const agentId = typeof payload === "string" ? payload : payload && payload.agentId;
   const idCheck = _validateRepairAgentId(agentId);
@@ -168,6 +316,12 @@ async function repairAgentIntegration(payload, deps) {
   }
 
   const snapshot = deps && deps.snapshot;
+  if (!isAgentIntegrationInstalled(snapshot, agentId)) {
+    return {
+      status: "error",
+      message: `${agentId} integration is not installed in Settings; install it before repairing`,
+    };
+  }
   if (!isAgentEnabled(snapshot, agentId)) {
     return {
       status: "error",
@@ -223,7 +377,9 @@ async function repairAgentIntegration(payload, deps) {
 }
 
 module.exports = {
+  installAgentIntegration,
   setAgentFlag,
   setAgentPermissionMode,
+  uninstallAgentIntegration,
   repairAgentIntegration,
 };

@@ -216,6 +216,23 @@ describe("checkAgentIntegrations", () => {
     assert.strictEqual(detail.parentDirExists, false);
   });
 
+  it("reports not-managed before disabled for uninstalled agents", () => {
+    const descriptor = baseDescriptor({ agentId: "gemini-cli" });
+    const detail = runOne(descriptor, {
+      prefs: {
+        agents: {
+          "gemini-cli": {
+            integrationInstalled: false,
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(detail.status, "not-managed");
+    assert.strictEqual(detail.level, "info");
+  });
+
   it("keeps enabled Hermes missing install info-only when another integration is ok", () => {
     const okDescriptor = baseDescriptor({
       agentId: "ok-agent",

@@ -39,6 +39,7 @@
     "disabled",
     "manual-managed",
     "manual-only",
+    "not-managed",
     "not-installed",
   ]);
   const AGENT_ATTENTION_NAME_LIMIT = 3;

@@ -3,7 +3,11 @@
 const fs = require("fs");
 const path = require("path");
 
-const { isAgentEnabled, isAgentPermissionsEnabled } = require("../agent-gate");
+const {
+  isAgentEnabled,
+  isAgentIntegrationInstalled,
+  isAgentPermissionsEnabled,
+} = require("../agent-gate");
 const { getAgent } = require("../../agents/registry");
 const { findHookCommands } = require("../../hooks/json-utils");
 const { GEMINI_HOOK_EVENTS } = require("../../hooks/gemini-install");
@@ -26,6 +30,7 @@ const INFO_ONLY_STATUSES = new Set([
   "disabled",
   "manual-managed",
   "manual-only",
+  "not-managed",
   "not-installed",
 ]);
 const REPAIRABLE_AGENT_STATUSES = new Set(["not-connected", "broken-path"]);
@@ -1466,6 +1471,13 @@ function checkPiExtensionMode(descriptor, options) {
 
 function checkAgent(descriptor, options) {
   const prefs = options.prefs || {};
+  if (!isAgentIntegrationInstalled(prefs, descriptor.agentId)) {
+    return makeDetail(descriptor, "not-managed", {
+      level: "info",
+      detail: "This integration is not installed in Settings",
+    });
+  }
+
   if (!isAgentEnabled(prefs, descriptor.agentId)) {
     return makeDetail(descriptor, "disabled", {
       level: "info",

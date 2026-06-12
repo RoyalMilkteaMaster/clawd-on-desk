@@ -2,6 +2,9 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const { createIntegrationSyncRuntime } = require("../src/integration-sync");
 
@@ -36,6 +39,7 @@ function makeRuntime(overrides = {}) {
       return { status: "ok", message: "done" };
     },
     syncHermesPluginImpl: () => calls.push({ name: "hermes" }),
+    syncQoderHooksImpl: () => calls.push({ name: "qoder" }),
     ...(overrides.ctx || {}),
   };
   const runtime = createIntegrationSyncRuntime({
@@ -87,6 +91,32 @@ describe("integration sync runtime", () => {
       "pi",
       "openclaw",
       "hermes",
+      "qoder",
+    ]);
+  });
+
+  it("startup sync uses installed-and-enabled intent instead of enabled alone", () => {
+    const uninstalled = new Set(["claude-code", "copilot-cli", "pi"]);
+    const { runtime, calls } = makeRuntime({
+      isAgentEnabled: () => true,
+      shouldSyncAgentIntegration: (agentId) => !uninstalled.has(agentId),
+    });
+
+    runtime.syncEnabledStartupIntegrations();
+
+    assert.deepStrictEqual(calls.map((entry) => entry.name), [
+      "gemini",
+      "antigravity",
+      "cursor",
+      "codebuddy",
+      "kiro",
+      "kimi",
+      "qwen",
+      "codex",
+      "opencode",
+      "openclaw",
+      "hermes",
+      "qoder",
     ]);
   });
 
@@ -115,6 +145,56 @@ describe("integration sync runtime", () => {
 
     assert.ok(result === true || (result && typeof result === "object"));
     assert.deepStrictEqual(calls.map((entry) => entry.name), ["copilot"]);
+  });
+
+  it("uninstallIntegrationForAgent routes through the matching marker-scoped cleaner", () => {
+    const uninstallCalls = [];
+    const { runtime } = makeRuntime({
+      ctx: {
+        uninstallIntegrationImpls: {
+          "copilot-cli": (options) => {
+            uninstallCalls.push({ name: "copilot-uninstall", options });
+            return { removed: 0, changed: false };
+          },
+        },
+      },
+    });
+
+    const result = runtime.uninstallIntegrationForAgent("copilot-cli");
+
+    assert.deepStrictEqual(result, { removed: 0, changed: false });
+    assert.deepStrictEqual(uninstallCalls, [{ name: "copilot-uninstall", options: { silent: true } }]);
+  });
+
+  it("uninstallIntegrationForAgent passes Codex cleanup markers on the real fallback path", () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-codex-cleanup-"));
+    try {
+      const hooksPath = path.join(homeDir, ".codex", "hooks.json");
+      fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+      fs.writeFileSync(hooksPath, JSON.stringify({
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: '"/node" "/app/hooks/codex-hook.js" SessionStart' }] },
+            { hooks: [{ type: "command", command: '"/node" "/other/user-hook.js" SessionStart' }] },
+          ],
+        },
+      }, null, 2), "utf8");
+      const { runtime } = makeRuntime({
+        ctx: { cleanupHomeDir: homeDir },
+      });
+
+      const result = runtime.uninstallIntegrationForAgent("codex");
+      const next = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+
+      assert.deepStrictEqual(
+        { removed: result.removed, changed: result.changed },
+        { removed: 1, changed: true }
+      );
+      assert.strictEqual(next.hooks.SessionStart.length, 1);
+      assert.ok(next.hooks.SessionStart[0].hooks[0].command.includes("user-hook.js"));
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
   });
 
   it("repairIntegrationForAgent('copilot-cli') routes through syncCopilotHooks (no separate repair)", () => {

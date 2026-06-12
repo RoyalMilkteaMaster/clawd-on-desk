@@ -84,8 +84,10 @@ const {
   resetAllShortcuts,
 } = require("./settings-actions-shortcuts");
 const {
+  installAgentIntegration,
   setAgentFlag,
   setAgentPermissionMode,
+  uninstallAgentIntegration,
   repairAgentIntegration,
 } = require("./settings-actions-agents");
 const {
@@ -1129,6 +1131,19 @@ async function cleanupIntegrationsCommand(_payload, deps = {}) {
       agents = result.commit.agents;
       agentsChanged = true;
     }
+    const currentEntry = agents[agentId] && typeof agents[agentId] === "object"
+      ? agents[agentId]
+      : {};
+    if (currentEntry.integrationInstalled !== false) {
+      agents = {
+        ...agents,
+        [agentId]: {
+          ...currentEntry,
+          integrationInstalled: false,
+        },
+      };
+      agentsChanged = true;
+    }
   }
 
   let cleanup;
@@ -1212,7 +1227,9 @@ const commandRegistry = {
   installHooks,
   uninstallHooks,
   cleanupIntegrations: cleanupIntegrationsCommand,
+  installAgentIntegration,
   repairAgentIntegration,
+  uninstallAgentIntegration,
   repairLocalServer,
   repairDoctorIssue,
   resizePet,

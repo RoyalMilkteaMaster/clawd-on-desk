@@ -136,6 +136,10 @@ function createAgentRuntimeMain(options = {}) {
     return callServer("stopIntegrationForAgent", agentId);
   }
 
+  function uninstallIntegrationForAgent(agentId) {
+    return callServer("uninstallIntegrationForAgent", agentId);
+  }
+
   function clearSessionsByAgent(agentId) {
     const state = getStateRuntime();
     return state && typeof state.clearSessionsByAgent === "function"
@@ -231,6 +235,7 @@ function createAgentRuntimeMain(options = {}) {
     syncIntegrationForAgent,
     repairIntegrationForAgent,
     stopIntegrationForAgent,
+    uninstallIntegrationForAgent,
     clearSessionsByAgent,
     dismissPermissionsByAgent,
     updateSessionFromServer,

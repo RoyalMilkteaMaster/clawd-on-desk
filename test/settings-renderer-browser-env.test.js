@@ -3930,6 +3930,13 @@ describe("settings renderer browser environment", () => {
     assert.ok(!agentsSource.includes("codex-permission-mode-transitioning"));
   });
 
+  it("confirms before uninstalling an agent integration", () => {
+    const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
+    const i18nSource = fs.readFileSync(path.join(SRC_DIR, "settings-i18n.js"), "utf8");
+    assert.ok(agentsSource.includes('window.confirm(t("agentIntegrationUninstallConfirm"))'));
+    assert.ok(i18nSource.includes("agentIntegrationUninstallConfirm"));
+  });
+
   it("keeps Agent management switch broadcasts in place even when Codex permission rows are mounted", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {

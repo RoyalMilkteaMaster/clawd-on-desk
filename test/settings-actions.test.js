@@ -888,7 +888,7 @@ describe("hook commands", () => {
         calls.push(["cleanup", options.source]);
         return {
           mode: "apply",
-          summary: { agentsChecked: 14, agentsAffected: 2, entriesRemoved: 3, skipped: 12, failed: 0 },
+          summary: { agentsChecked: 15, agentsAffected: 2, entriesRemoved: 3, skipped: 13, failed: 0 },
         };
       },
     });
@@ -897,6 +897,7 @@ describe("hook commands", () => {
     assert.strictEqual(result.cleanup.summary.entriesRemoved, 3);
     for (const agentId of MANAGED_CLEANUP_AGENT_IDS) {
       assert.strictEqual(result.commit.agents[agentId].enabled, false, `${agentId} should be disabled`);
+      assert.strictEqual(result.commit.agents[agentId].integrationInstalled, false, `${agentId} should be uninstalled`);
     }
     assert.deepStrictEqual(calls.at(-1), ["cleanup", "about"]);
     assert.deepStrictEqual(calls[0], ["stopIntegration", "claude-code"]);
@@ -936,8 +937,11 @@ describe("doctor repair commands", () => {
 
   it("accepts Copilot CLI through the standard auto-repair path", async () => {
     const calls = [];
+    const snapshot = prefs.getDefaults();
+    snapshot.agents["copilot-cli"].integrationInstalled = true;
+    snapshot.agents["copilot-cli"].enabled = true;
     const r = await commandRegistry.repairAgentIntegration({ agentId: "copilot-cli" }, {
-      snapshot: prefs.getDefaults(),
+      snapshot,
       repairIntegrationForAgent: (agentId) => {
         calls.push(agentId);
         return { status: "ok", added: 10, updated: 0 };

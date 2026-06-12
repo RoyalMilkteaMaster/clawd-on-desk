@@ -6,11 +6,13 @@ const assert = require("node:assert");
 const {
   getCodexPermissionMode,
   isAgentEnabled,
+  isAgentIntegrationInstalled,
   isAgentPermissionsEnabled,
   isAgentSubagentPermissionsEnabled,
   isAgentNotificationHookEnabled,
   isCodexNativeNotificationSoundEnabled,
   isCodexPermissionInterceptEnabled,
+  shouldSyncAgentIntegration,
 } = require("../src/agent-gate");
 const { commandRegistry } = require("../src/settings-actions");
 const prefs = require("../src/prefs");
@@ -54,6 +56,36 @@ describe("isAgentEnabled", () => {
   it("treats malformed agent entries as enabled", () => {
     assert.strictEqual(isAgentEnabled({ agents: { codex: "nope" } }, "codex"), true);
     assert.strictEqual(isAgentEnabled({ agents: { codex: null } }, "codex"), true);
+  });
+});
+
+describe("isAgentIntegrationInstalled", () => {
+  it("defaults true for missing legacy snapshots", () => {
+    assert.strictEqual(isAgentIntegrationInstalled(null, "copilot-cli"), true);
+    assert.strictEqual(isAgentIntegrationInstalled({ lang: "en" }, "copilot-cli"), true);
+    assert.strictEqual(isAgentIntegrationInstalled({ agents: { "copilot-cli": {} } }, "copilot-cli"), true);
+  });
+
+  it("reads explicit installed intent from normalized prefs", () => {
+    const snap = prefs.getDefaults();
+    assert.strictEqual(isAgentIntegrationInstalled(snap, "claude-code"), true);
+    assert.strictEqual(isAgentIntegrationInstalled(snap, "codex"), true);
+    assert.strictEqual(isAgentIntegrationInstalled(snap, "copilot-cli"), false);
+  });
+
+  it("combines installed intent and enabled for startup sync", () => {
+    assert.strictEqual(
+      shouldSyncAgentIntegration({ agents: { codex: { integrationInstalled: true, enabled: true } } }, "codex"),
+      true
+    );
+    assert.strictEqual(
+      shouldSyncAgentIntegration({ agents: { codex: { integrationInstalled: false, enabled: true } } }, "codex"),
+      false
+    );
+    assert.strictEqual(
+      shouldSyncAgentIntegration({ agents: { codex: { integrationInstalled: true, enabled: false } } }, "codex"),
+      false
+    );
   });
 });
 
@@ -307,6 +339,16 @@ describe("setAgentFlag command", () => {
     assert.ok(r.message.includes("flag"));
   });
 
+  it("does not let the generic flag command fake installed state", () => {
+    const { deps } = makeDeps();
+    const r = commandRegistry.setAgentFlag(
+      { agentId: "copilot-cli", flag: "integrationInstalled", value: true },
+      deps
+    );
+    assert.strictEqual(r.status, "error");
+    assert.ok(r.message.includes("flag"));
+  });
+
   it("rejects non-boolean value", () => {
     const { deps } = makeDeps();
     const r = commandRegistry.setAgentFlag(
@@ -357,6 +399,26 @@ describe("setAgentFlag command", () => {
     assert.deepStrictEqual(calls.startMonitorForAgent, ["codex"]);
     assert.strictEqual(calls.stopMonitorForAgent.length, 0);
     assert.strictEqual(r.commit.agents.codex.enabled, true);
+  });
+
+  it("enabling an uninstalled agent starts the monitor without syncing integration files", () => {
+    const seeded = prefs.getDefaults();
+    seeded.agents["copilot-cli"] = {
+      integrationInstalled: false,
+      enabled: false,
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
+    };
+    const { deps, calls } = makeDeps({ snapshot: seeded });
+    const r = commandRegistry.setAgentFlag(
+      { agentId: "copilot-cli", flag: "enabled", value: true },
+      deps
+    );
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls.syncIntegrationForAgent, []);
+    assert.deepStrictEqual(calls.startMonitorForAgent, ["copilot-cli"]);
+    assert.strictEqual(r.commit.agents["copilot-cli"].enabled, true);
+    assert.strictEqual(r.commit.agents["copilot-cli"].integrationInstalled, false);
   });
 
   it("disabling Claude Code stops its integration watcher before commit", () => {
@@ -503,7 +565,13 @@ describe("setAgentFlag command", () => {
   it("missing side-effect deps are tolerated (simulates hook-only agent)", () => {
     // Hook-based agents like Copilot / Cursor have no monitor — the command
     // should still succeed; the route layer enforces the gate.
-    const { deps } = makeDeps();
+    const seeded = prefs.getDefaults();
+    seeded.agents["copilot-cli"] = {
+      ...seeded.agents["copilot-cli"],
+      integrationInstalled: true,
+      enabled: true,
+    };
+    const { deps } = makeDeps({ snapshot: seeded });
     delete deps.startMonitorForAgent;
     delete deps.stopMonitorForAgent;
     const r = commandRegistry.setAgentFlag(

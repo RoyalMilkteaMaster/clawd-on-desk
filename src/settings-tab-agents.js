@@ -59,6 +59,7 @@
   }
 
   function buildAgentMasterRow(agent) {
+    let integrationBadge = null;
     return buildAgentSwitchRow({
       agent,
       flag: "enabled",
@@ -81,13 +82,26 @@
         esBadge.className = "agent-badge";
         esBadge.textContent = t(esKey);
         badges.appendChild(esBadge);
+        integrationBadge = document.createElement("span");
+        integrationBadge.className = "agent-badge integration";
+        badges.appendChild(integrationBadge);
         if (agent.capabilities && agent.capabilities.permissionApproval) {
           const permBadge = document.createElement("span");
           permBadge.className = "agent-badge accent";
           permBadge.textContent = t("badgePermissionBubble");
           badges.appendChild(permBadge);
         }
+        syncAgentIntegrationBadge(integrationBadge, agent.id);
         text.appendChild(badges);
+      },
+      buildExtraControls: (ctrl) => {
+        const button = buildAgentIntegrationActionButton(agent);
+        const meta = state.mountedControls.agentIntegrationActions.get(agent.id);
+        if (meta) {
+          meta.badge = integrationBadge;
+          meta.syncFromSnapshot();
+        }
+        ctrl.appendChild(button);
       },
     });
   }
@@ -287,7 +301,68 @@
     sw.setAttribute("tabindex", disabled ? "-1" : "0");
   }
 
-  function buildAgentSwitchRow({ agent, flag, extraClass, disabled = false, buildText }) {
+  function syncAgentIntegrationBadge(badge, agentId) {
+    if (!badge) return;
+    const installed = readers.readAgentIntegrationInstalled(agentId);
+    badge.classList.toggle("not-installed", !installed);
+    badge.textContent = t(installed ? "agentIntegrationInstalled" : "agentIntegrationNotInstalled");
+  }
+
+  function syncAgentIntegrationAction(meta) {
+    if (!meta || !meta.button) return;
+    const installed = readers.readAgentIntegrationInstalled(meta.agentId);
+    meta.button.disabled = false;
+    meta.button.classList.remove("pending");
+    meta.button.textContent = t(installed ? "agentIntegrationUninstall" : "agentIntegrationInstall");
+    meta.button.setAttribute(
+      "aria-label",
+      t(installed ? "agentIntegrationUninstall" : "agentIntegrationInstall")
+    );
+    if (meta.badge) syncAgentIntegrationBadge(meta.badge, meta.agentId);
+  }
+
+  function buildAgentIntegrationActionButton(agent) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "soft-btn agent-integration-action";
+    const meta = {
+      button,
+      agentId: agent.id,
+      badge: null,
+    };
+    meta.syncFromSnapshot = () => syncAgentIntegrationAction(meta);
+    syncAgentIntegrationAction(meta);
+    button.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (button.disabled) return;
+      const installed = readers.readAgentIntegrationInstalled(agent.id);
+      const command = installed ? "uninstallAgentIntegration" : "installAgentIntegration";
+      if (installed && typeof window.confirm === "function" && !window.confirm(t("agentIntegrationUninstallConfirm"))) {
+        return;
+      }
+      button.disabled = true;
+      button.classList.add("pending");
+      button.textContent = t("agentIntegrationWorking");
+      window.settingsAPI.command(command, { agentId: agent.id }).then((result) => {
+        if (!result || result.status !== "ok") {
+          const msg = (result && result.message) || "unknown error";
+          ops.showToast(t("toastSaveFailed") + msg, { error: true });
+          syncAgentIntegrationAction(meta);
+          return;
+        }
+        const key = installed ? "toastAgentIntegrationUninstalled" : "toastAgentIntegrationInstalled";
+        ops.showToast(t(key));
+      }).catch((err) => {
+        ops.showToast(t("toastSaveFailed") + (err && err.message), { error: true });
+      }).finally(() => {
+        syncAgentIntegrationAction(meta);
+      });
+    });
+    state.mountedControls.agentIntegrationActions.set(agent.id, meta);
+    return button;
+  }
+
+  function buildAgentSwitchRow({ agent, flag, extraClass, disabled = false, buildText, buildExtraControls }) {
     const row = document.createElement("div");
     row.className = extraClass ? `row ${extraClass}` : "row";
 
@@ -298,6 +373,9 @@
 
     const ctrl = document.createElement("div");
     ctrl.className = "row-control";
+    if (typeof buildExtraControls === "function") {
+      buildExtraControls(ctrl);
+    }
     const sw = document.createElement("div");
     sw.className = "switch";
     sw.setAttribute("role", "switch");
@@ -354,6 +432,9 @@
     for (const [, meta] of state.mountedControls.agentPermissionModes) {
       if (!meta || !meta.row || !document.body.contains(meta.row)) return false;
     }
+    for (const [, meta] of state.mountedControls.agentIntegrationActions) {
+      if (!meta || !meta.button || !document.body.contains(meta.button)) return false;
+    }
     for (const [id, meta] of state.mountedControls.agentSwitches) {
       state.transientUiState.agentSwitches.delete(id);
       if (meta.flag !== "enabled") {
@@ -362,6 +443,9 @@
       helpers.setSwitchVisual(meta.element, readers.readAgentFlagValue(meta.agentId, meta.flag), { pending: false });
     }
     for (const [, meta] of state.mountedControls.agentPermissionModes) {
+      meta.syncFromSnapshot();
+    }
+    for (const [, meta] of state.mountedControls.agentIntegrationActions) {
       meta.syncFromSnapshot();
     }
     return true;

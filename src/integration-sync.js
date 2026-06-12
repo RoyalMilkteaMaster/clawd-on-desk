@@ -4,7 +4,10 @@ function createIntegrationSyncRuntime(options = {}) {
   const ctx = options.ctx || {};
   const getHookServerPort = options.getHookServerPort;
   const shouldManageClaudeHooks = options.shouldManageClaudeHooks;
-  const isAgentEnabled = options.isAgentEnabled;
+  const isAgentEnabled = typeof options.isAgentEnabled === "function" ? options.isAgentEnabled : (() => true);
+  const shouldSyncAgentIntegration = typeof options.shouldSyncAgentIntegration === "function"
+    ? options.shouldSyncAgentIntegration
+    : isAgentEnabled;
   const startClaudeSettingsWatcher = options.startClaudeSettingsWatcher;
   const stopClaudeSettingsWatcher = options.stopClaudeSettingsWatcher;
 
@@ -365,13 +368,47 @@ function createIntegrationSyncRuntime(options = {}) {
     return stopClaudeSettingsWatcher();
   }
 
+  function uninstallIntegrationForAgent(agentId) {
+    try {
+      if (
+        ctx.uninstallIntegrationImpls
+        && typeof ctx.uninstallIntegrationImpls === "object"
+        && typeof ctx.uninstallIntegrationImpls[agentId] === "function"
+      ) {
+        if (agentId === "claude-code") stopClaudeSettingsWatcher();
+        return ctx.uninstallIntegrationImpls[agentId]({ silent: true });
+      }
+      const {
+        AGENT_CLEANERS,
+        buildCleanupOptionsForHome,
+      } = require("../hooks/cleanup-integrations.js");
+      const uninstall = AGENT_CLEANERS && AGENT_CLEANERS[agentId];
+      if (typeof uninstall !== "function") return false;
+      if (agentId === "claude-code") stopClaudeSettingsWatcher();
+      const cleanupOptions = ctx.cleanupOptions && typeof ctx.cleanupOptions === "object"
+        ? ctx.cleanupOptions
+        : {};
+      const plan = buildCleanupOptionsForHome(ctx.cleanupHomeDir || ctx.homeDir, cleanupOptions);
+      const agentOptions = plan.byAgent && plan.byAgent[agentId];
+      if (!agentOptions) return false;
+      const result = uninstall({ ...agentOptions, silent: true });
+      return result && typeof result === "object" ? result : true;
+    } catch (err) {
+      console.warn(`Clawd: failed to uninstall ${agentId} integration:`, err.message);
+      return {
+        status: "error",
+        message: err && err.message ? err.message : `Failed to uninstall ${agentId} integration`,
+      };
+    }
+  }
+
   function syncEnabledStartupIntegrations() {
-    if (shouldManageClaudeHooks() && isAgentEnabled("claude-code")) {
+    if (shouldManageClaudeHooks() && shouldSyncAgentIntegration("claude-code")) {
       syncClawdHooks();
       startClaudeSettingsWatcher();
     }
     for (const [agentId, sync] of Object.entries(AGENT_INTEGRATION_SYNCERS)) {
-      if (isAgentEnabled(agentId)) sync();
+      if (shouldSyncAgentIntegration(agentId)) sync();
     }
   }
 
@@ -396,6 +433,7 @@ function createIntegrationSyncRuntime(options = {}) {
     syncIntegrationForAgent,
     repairIntegrationForAgent,
     stopIntegrationForAgent,
+    uninstallIntegrationForAgent,
     syncEnabledStartupIntegrations,
   };
 }
