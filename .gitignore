@@ -35,6 +35,8 @@ docs/**
 !docs/investigations/
 !docs/investigations/permission-hook-fail-deny-investigation.md
 !docs/investigations/codex-subagent-session-meta.md
+!docs/investigations/windows-audit-2026-06-23.md
+!docs/investigations/windows-audit-2026-06-23.raw.json
 !docs/project/
 !docs/project/agent-runtime-architecture.md
 !docs/project/release-process.md

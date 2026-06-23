@@ -1,0 +1,798 @@
+{
+  "summary": "彻底审计 Windows 版桌宠的所有潜在问题（10 维度 finder + 对抗式验证 + 优先级汇总）",
+  "agentCount": 46,
+  "logs": [
+    "Windows 审计启动：10 个维度,find → 对抗式验证 → 汇总",
+    "审计完成：35 条原始发现 → 28 条经验证为真 → 28 条真实且未修复(0 条其实已修,已排除)"
+  ],
+  "result": {
+    "totalRawFindings": 35,
+    "verifiedRealCount": 28,
+    "openCount": 28,
+    "staleAlreadyFixedCount": 0,
+    "openFindings": [
+      {
+        "title": "No DWM cloaking detection or recovery: pet stays logically visible but invisible on screen until restart",
+        "file": "src/topmost-runtime.js:179-213",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "symptom": "After lock/unlock, RDP reconnect, fast user switching, or some explorer/DWM events, the pet vanishes from the screen even though the app thinks it is shown (isVisible()===true, petHidden===false). The right-click menu still says \"Hide Pet\" and toggling visibility does not bring it back. Only an app restart recovers it. This is the exact #525 report.",
+        "whyWindowsSpecific": "DWM window cloaking (DWMWA_CLOAKED) is a Windows-only compositor mechanism. A window can be DWM-cloaked while ShowWindow still reports it visible; nothing on mac/Linux behaves this way.",
+        "evidence": "The only periodic visibility maintenance is the Windows topmost watchdog, whose body `reassertWindowAndTaskbar` (topmost-runtime.js:179-183) does only `win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)` + `keepOutOfTaskbar(win)`. SetWindowPos(HWND_TOPMOST) does not clear a DWM cloak, and there is no `showInactive()`/hide-show recovery anywhere in the maintenance loop. `grep -rn cloak|DwmGetWindowAttribute|isWindowCloaked src/` returns zero hits in main. The fix (PR #496, commit 09ae930 `Fix Windows pet window display recovery`, branch origin/pr/496) adds `_isWindowCloaked` via koffi `DwmGetWindowAttribute` + `recoverCloakedWindow(win){ win.hide() }` but is NOT merged into main (verified via `git log --all -S isWindowCloaked` matching only the unmerged commit).",
+        "confidence": "high",
+        "relatedIssue": "#525 (= unmerged PR #496); #184",
+        "dimension": "cloaking",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真实、未修、Windows 特有,确认通过实读代码+git 史(非凭记忆)。(1) src/topmost-runtime.js:179-183 reassertWindowAndTaskbar 体确实只有 win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)+keepOutOfTaskbar(win);watchdog(185-212)仅循环调它+keepOutOfTaskbar。SetWindowPos(HWND_TOPMOST) 不清 DWMWA_CLOAKED,发现的证据引用准确。(2) 全 main 零 cloak 处理:grep -ciE cloak 在 pet-window-runtime.js/topmost-runtime.js/main.js 均为 0。其余 recovery 腿也不解 cloak——scheduleHwndRecovery(topmost-runtime.js:103-118)只 reassertWinTopmost+位置 nudge,无 hide()/show();showPetWindows(pet-window-runtime.js:190-201)虽有 showInactive() 但只在显式 show/toggle/bringPetToPrimaryDisplay 触发,非周期性;display 处理器(741-789)走 applyPetWindowBounds/reapplyMacVisibility(后者 if(!isMac) 提前返回),无 Win hide/show 循环。故无任何被动路径能从 cloak 恢复,『重启才好』成立(重启重建窗口)。(3) Windows 特有:DWMWA_CLOAKED 是 Win-only DWM 概念,reapplyMacVisibility 对非 mac 直接 return。(4) 未修:git log --all -S isWindowCloaked / -S DwmGetWindowAttribute 仅命中 09ae930,该 commit 只在 remotes/origin/pr/496;git merge-base --is-ancestor 09ae930 main = NOT in main;按 subject/496 搜 main log 为空(排除 squash/rebase 合入)。koffi ^2.15.2 已是依赖且 main.js:151 已用,故修法可行但缺席。诚实补充:即便 PR #496 的修法也只把 recoverCloakedWindow 接进 showPetWindows()(需用户 toggle 才恢复),并未给周期 watchdog 加 cloak 恢复——但这不改对 main 的判定(main 连探测都没有)。匹配 #525(=未合 PR #496)。",
+          "fixSketch": "沿用 PR #496 思路但接进周期 watchdog 才能真正自愈,而非仅 show 时:在 topmost-runtime.js 用已有 koffi(main.js:151 已加载)封 _isWindowCloaked(win)=DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED=14)。注意 PR #496 自身的指针 bug(把 getNativeWindowHandle() 原始 Buffer 直接当 void* 传——见 MEMORY 里 pr-496 复核),正解用 repo 既有 nativeHandleToPointer / handle.readBigUInt64LE(0)。然后在 startTopmostWatchdog 的每轮里:对 getWin()/getHitWin(),若 !petHidden 且 isWindowCloaked(win) 为真,执行 hide→showInactive 一次性 un-cloak(再 reassert topmost + syncHitWin + setForceEyeResend 让眼睛/命中层重对齐)。务必只在 isWin、!petHidden、!isDragLocked/!miniTransitioning 下做,避免与拖动/mini 抢写。真 Windows 机验证(锁屏/解锁、RDP 重连、快速用户切换三场景),CI/纯 review 不可放行。"
+        }
+      },
+      {
+        "title": "No resume / unlock-screen / RDP visibility re-assertion listener (powerMonitor unused)",
+        "file": "src/main.js:3431-3436",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "After the machine wakes from sleep, the session is unlocked, or an RDP/console session is reattached, the pet may be misplaced, hidden, or cloaked with no automatic recovery — it only self-heals on the next user-triggered show/move or app restart.",
+        "whyWindowsSpecific": "Sleep/resume, lock/unlock and RDP session-attach are the dominant triggers for DWM cloaking and topmost loss on Windows; on these transitions Windows recreates shell/compositor state. Electron exposes `powerMonitor` ('resume','unlock-screen') and BrowserWindow session events for exactly this, but none are wired.",
+        "evidence": "`grep -rn \"powerMonitor|unlock-screen|lock-screen|on('resume'|'suspend'\" src/` returns zero matches. Visibility recovery is wired only to `display-metrics-changed`/`display-added`/`display-removed` (main.js:3434-3436) and the 5s topmost watchdog — none fire on resume/unlock and none call `showInactive()` or clear a cloak. The render window registers Windows `query-session-end`/`session-end` (pet-window-runtime.js:493-494) only to flush prefs, not to re-assert visibility. Distinct from #525/PR#496: even PR #496 adds no resume listener, so this gap survives that fix.",
+        "confidence": "medium",
+        "relatedIssue": "#525, #184",
+        "dimension": "cloaking",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实存在,但严重度从 medium 下调到 low。核实(全部基于当前 HEAD/working tree,非记忆):\n\n【isReal=true】当前 main 无任何 powerMonitor/resume/unlock-screen 监听器。`grep -rln powerMonitor src/` rc=1(无匹配),`git grep powerMonitor HEAD` rc=1。可见性/位置恢复只接在:(a) display-metrics-changed/display-added/display-removed(src/main.js:3434-3436);(b) 5s topmost 看门狗(src/topmost-runtime.js:185-213,TOPMOST_WATCHDOG_MS=5000)。这些都不会在 sleep-resume / unlock / RDP session-attach 时触发。renderWin 的 query-session-end/session-end(src/pet-window-runtime.js:493-494)仅 flushForSessionEnd→flushRuntimeStateToPrefs(:484-488)刷 prefs,不重申可见性——与发现描述一致。会 showInactive 的 showPetWindows()(:191-200)/main.js:3630 只来自用户手动取消隐藏 与 second-instance 重启,均非电源事件触发。\n\n【未踩 PR #496 陷阱】git log -S powerMonitor 只命中一个 commit 0547e35 \"fix(tick): re-arm cursor tracking on system resume (#408)\",它确实 add 了 powerMonitor.on('resume')/('unlock-screen') + handleSystemWake/resumeFromSystemWake/forceMainTickNow。但:`git merge-base --is-ancestor 0547e35 HEAD` = NO;该 commit 只在未合并分支 fix/408-eye-tracking-after-resume 上;`gh pr view 499` = state OPEN, mergedAt null;`git log main -S resumeFromSystemWake` 为空(从未以任何 squash hash 落 main)。故 alreadyFixedOnMain=false。同理 PR #496 的 DWM cloaking 探针也未在 main(src 内 cloak/DWM 仅 dashboard.js:125 与 renderer.js:1321 的注释,非 cloaking API),所以 main 上确无任何 cloak-clear 恢复。\n\n【isWindowsSpecific=true】看门狗自身 `if (!isWin || topmostWatchdog) return`(src/topmost-runtime.js:185-186),topmost-loss 问题类被代码本身当作 Windows-only;powerMonitor resume/unlock 与 RDP session-attach 触发 DWM cloaking 也是 Windows 主导行为。\n\n【severity 下调依据】发现把 \"topmost loss\" 与 \"hidden/cloaked/misplaced\" 捆在一起。但 5s 看门狗的 reassertWindowAndTaskbar(src/topmost-runtime.js:179-183)每 5s 对 win 与 hitWin 执行 setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)+keepOutOfTaskbar——所以 resume 后的 *置顶丢失* 会在 ~5s 内自愈,这部分被高估了。真正未被覆盖的只有:看门狗不调用 showInactive()(无法救被隐藏/cloaked 的窗)、无 cloak 清除、不重申位置、不重新 arm 光标追踪/唤醒态。这些是较低频的边缘,故 low 而非 medium/invalid。",
+          "fixSketch": "在 createWindow 内注册一次(去抖+幂等,因 Windows 会连发 resume/unlock-screen):powerMonitor.on('resume', reassertOnWake) 与 powerMonitor.on('unlock-screen', reassertOnWake);reassertOnWake 中(若 !petHidden)对 renderWin/hitWin 调 showInactive()+keepOutOfTaskbar()+setAlwaysOnTop(true, WIN_TOPMOST_LEVEL),并 syncHitWin() 重申位置;可顺带 scheduleHwndRecovery()。可直接采用未合并 PR #499 (0547e35) 已写好的 handleSystemWake 骨架,但需补可见性/位置重申(#499 当前只 re-arm 光标/tick/sleep 态,未含 showInactive/cloak/位置)。建议用 try/catch 包裹注册(powerMonitor 在极端环境可抛),与 0547e35 一致。合并前需真 Windows 机验证(sleep-resume / 锁屏解锁 / RDP 重连三场景),符合本仓 verify-on-real-hardware 规矩。"
+        }
+      },
+      {
+        "title": "second-instance re-launch re-shows the pet while petHidden stays true → state desync",
+        "file": "src/main.js:3628-3642",
+        "severity": "medium",
+        "kind": "confirmed-bug",
+        "symptom": "If the user has hidden the pet (right-click → Hide Pet) and then re-launches Clawd (taskbar pin, Start menu, desktop shortcut, a `clawd://` link, or drag-folder-to-launch), the pet windows reappear on screen but the app still believes it is hidden: the tray/context menu shows \"Show Pet\" on an already-visible pet, and the floating bubbles / session HUD stay suppressed. Clicking \"Show Pet\" is needed to resync, which is confusing.",
+        "whyWindowsSpecific": "On macOS the re-entry path is `app.on('activate')` → `macHideController.onActivate()` (hide-aware, main.js:3701). On Windows the single-instance re-entry is `app.on('second-instance')`, fired by every taskbar/Start/shortcut re-launch and by URL/drag handlers, and it calls showInactive() directly with no petHidden awareness.",
+        "evidence": "The handler unconditionally does `win.showInactive()` + `hitWin.showInactive()` (main.js:3630,3634), bypassing `setPetHidden()`, so `petHidden` is never flipped, `showFloatingSurfacesForPet()` is never called, and the tray/context menu is not rebuilt. The menu label is derived from this flag — `label: ctx.petHidden ? t(\"showPet\") : t(\"hidePet\")` (menu.js:256,468) — so it goes stale. The codebase already guards the parallel menu-close re-show path with `if (... && !ctx.petHidden)` (menu.js:341-348, comment warns an unconditional showInactive() would \"resurrect a window setPetHidden() just hid\"); the second-instance path was not given the same guard.",
+        "confidence": "high",
+        "relatedIssue": "none",
+        "dimension": "cloaking",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真 bug,当前 main 未修。second-instance 处理器(src/main.js:3628-3642)无条件 `win.showInactive()`(3630)+`hitWin.showInactive()`(3634)直接重显两个桌宠窗口,全程不读不写 petHidden。setPetHidden 才是承载状态机的入口:它在变可见时调 showPetWindows+showFloatingSurfacesForPet+syncSessionHudVisibilityAndBubbles+buildTrayMenu+buildContextMenu 并把 petHidden 置回 false(src/pet-window-runtime.js:215-238);second-instance 把这些全绕过了。结果 petHidden 仍为 true → 菜单标签停在 t('showPet')(src/menu.js:256,468 由 ctx.petHidden 派生)、气泡/会话 HUD 仍被压制,需手点 Show Pet 才能 resync。隐藏态确实可达:Hide Pet → ctx.togglePetVisibility()(menu.js:257/469)→ togglePetVisibility()(main.js:905-907)→ setPetHidden(true) 置 petHidden=true(pet-window-runtime.js:231)。处理器尾部的 reapplyMacVisibility() 在 Windows 是硬 no-op(`if(!isMac) return;` src/topmost-runtime.js:63),救不了。平行的菜单关闭路径恰好有 `!ctx.petHidden` 守卫并附注释警告『unconditional showInactive() would resurrect a window setPetHidden() just hid』(menu.js:341-356)——second-instance 路径正缺这一守卫。Windows 特性成立:mac 的再入口是 app.on('activate')→macHideController.onActivate()(main.js:3701),它 hide-aware,检 isPetHidden() 后调 setPetHidden(false) 正确 resync(src/mac-hide.js:122-132);而 Windows 单实例再入口靠 second-instance(taskbar pin/开始菜单/快捷方式/clawd:// 链接/拖文件夹启动均触发)。已查 git 历史:这两行 showInactive 仅被机械重构动过(311692c/1ee7333/2d13b9e/28d1cdc 提取 runtime),从未加守卫,非已修。唯一修正:处理器本身平台无关,Linux 再入口也走它,所以底层缺口并非由 process.platform==='win32' 门控;但 mac 已有独立 hide-aware 路径不受影响,Windows 是主受害平台,故按 Windows 维度判定成立。严重度维持 medium(纯 UI/状态错位,无崩溃无隐私,一键 Show Pet 可恢复)。",
+          "fixSketch": "在 second-instance 处理器(src/main.js:3628)按 petHidden 分流:若 petWindowRuntime.isPetHidden() 为 true,则改调 petWindowRuntime.setPetHidden(false)(走完整 resync:重显窗口+floating surfaces+HUD/bubbles+重建 tray/context 菜单),而不是裸 showInactive();若未隐藏,保持现有 showInactive()+keepOutOfTaskbar 行为不变。等价做法是给现有两段 showInactive 套 `if (!petWindowRuntime.isPetHidden())` 守卫(与 menu.js:348 同构)并在 hidden 分支显式调 setPetHidden(false)。补一条单测覆盖『petHidden=true 时 second-instance 触发后 petHidden 翻 false 且 buildContextMenu 被调』。"
+        }
+      },
+      {
+        "title": "hitWin is focusable on Windows → clicking the pet steals foreground focus from fullscreen apps/games",
+        "file": "src/pet-window-runtime.js:543-545",
+        "severity": "medium",
+        "kind": "design-tradeoff",
+        "symptom": "Clicking/dragging the pet while a fullscreen game or app is focused briefly pulls foreground focus to the pet's input window, which can minimize/disrupt exclusive-fullscreen games or interrupt the focused app (#538). The opposing report #545 (clicks pass through, can't drag) is the symptom of the inverse choice, so the two issues pull in opposite directions.",
+        "whyWindowsSpecific": "`focusable: !isLinux` makes the hit window activatable specifically on Windows (and mac) to dodge `WS_EX_NOACTIVATE` input-routing bugs — a Windows window-style concern. The render window is `setFocusable(false)`; only the Windows/mac hit window opts into activation.",
+        "evidence": "pet-window-runtime.js:543-545: `// KEY EXPERIMENT: allow activation to avoid WS_EX_NOACTIVATE input routing bugs. Linux keeps the old non-focusable behavior. focusable: !isLinux`. Project docs explicitly accept the cost: docs/project/theme-state-ui.md:152 `hitWin.focusable: true：输入窗口允许激活，这是修复拖拽 bug 的关键` and :163 (Known Limits) `hitWin 点击会短暂抢焦点，这是当前可接受代价`. So #538 is the known cost of the #545/drag fix — a genuine tradeoff, not a plain bug. `setIgnoreMouseEvents(false)` is PERMANENT on hitWin (pet-window-runtime.js:558).",
+        "confidence": "high",
+        "relatedIssue": "#538, #545",
+        "dimension": "cloaking",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真实存在,且是当前 main 上有意接受的设计取舍(非未修 bug)。逐行核对:src/pet-window-runtime.js:543-545 一字不差地是 `// KEY EXPERIMENT: allow activation to avoid WS_EX_NOACTIVATE input routing bugs. Linux keeps the old non-focusable behavior.` + `focusable: !isLinux,`。hitWin 在 Windows 上同时拿到 focusable:true 且 setAlwaysOnTop(true,\"pop-up-menu\")(:562),并 setIgnoreMouseEvents(false)(:558,注释标 PERMANENT,唯一的 true 切换在 :707/709 设置预览保护内、:726/728 复位)→ 一个可激活+置顶+接收所有鼠标的窗口,点它必然激活并抢前台,会打断独占全屏游戏(#538)。\n\nWindows 特有判定成立(带 mac 细节):focusable:!isLinux 在 Win 和 mac 都置可激活,但 mac 紧接着 :559 `if (isMac) hitWin.setFocusable(false);` 又关掉了 → 实际只有 Windows 的命中窗保持可激活(Linux=false,mac=立即回 false)。render 窗本身 :462 setFocusable(false) 不抢焦点。根因 WS_EX_NOACTIVATE 输入路由本就是 Windows 窗口样式问题。\n\n未修确认(吸取 PR #496 教训,实查): git log -S \"focusable: !isLinux\" 仅命中 311692c(2026-05-07 抽取),git blame -L543,545 三行全钉在 311692cd,从未改过;git log --grep 538/545 无相关提交(36f6544 的 538 是 commit hash 子串,内容是 context-menu guard,无关);gh pr list --search 538/545 全空(无 open/merged PR);click 路径上无任何 restoreFocus/GetForegroundWindow 之类焦点恢复机制(已 grep pet-window-runtime.js + hit-renderer.js)。文档反而把它写成永久 Known Limit 明确接受:docs/project/theme-state-ui.md:152 `hitWin.focusable: true:输入窗口允许激活,这是修复拖拽 bug 的关键`、:163 `hitWin 点击会短暂抢焦点,这是当前可接受代价`,且 :14 解释架构正是为解 Windows 拖拽失效。hit-renderer.js:255-256 亦印证窗口置顶高于全屏 app 是有意为之。\n\n结论:这是真实、可达、Windows 特有、且当前未缓解的取舍症状(#538 与 #545 是同一激活选择的两个反向极)。维持 medium:对全屏游戏用户有真实打断,但属项目明知并书面接受的 tradeoff,而非意外缺陷,不应上调。",
+          "fixSketch": "这是 #538(抢焦点)与 #545(穿透不可拖)的对立两极,任何修复都要同时满足\"能接收拖动\"且\"不夺前台\",不能简单把 focusable 翻回 false(那会复发 #545/WS_EX_NOACTIVATE 拖拽死路径)。可行方向(均需真 Windows 机验证,勿凭代码合并): (1) 保持 focusable:true 但在 hitWin 上加 WS_EX_NOACTIVATE 之外的\"点完即归还前台\"——在 pointerdown/dragEnd 后用已有的 koffi FFI(main.js:147 AllowSetForegroundWindow/user32)记录 GetForegroundWindow 并在交互结束 SetForegroundWindow 还回原窗,避免持续占据前台;(2) 仅当检测到前台为独占全屏(QueryFullScreenWindow / 比较 monitor rect)时,临时降级为穿透+禁拖,退出全屏恢复;(3) 给用户一个\"全屏时让桌宠点击穿透\"开关(契合现有 settings-preview 的 setIgnoreMouseEvents 切换基建,:707-728)。无论选哪条,都要更新 docs/project/theme-state-ui.md:163 的 Known Limit 表述,并补 #545 回归测试防反向回退。"
+        }
+      },
+      {
+        "title": "hitWin 在 Windows 上 focusable:true,与每 5s 无条件 reassert topmost 叠加,抢全屏应用/游戏焦点(#538);改成 focusable:false 又会回到当初要规避的输入路由 bug(#545 张力)",
+        "file": "src/pet-window-runtime.js:545",
+        "severity": "high",
+        "kind": "design-tradeoff",
+        "symptom": "运行全屏游戏/应用时,桌宠每隔约 5 秒让全屏应用失焦并被最小化回桌面,全屏应用几乎无法使用(#538)。反方向若把 hitWin 设为不可激活,可能回到点击/拖动被路由错乱、命中层吃不到事件(#545 穿透/拖不动)。",
+        "whyWindowsSpecific": "`focusable: !isLinux` 只在 Windows/mac 生效;配合的每 5s 无条件 setAlwaysOnTop(\"pop-up-menu\") watchdog 只在 isWin 启动(topmost-runtime.js:186)。Windows 上 setAlwaysOnTop 到 pop-up-menu 会短暂激活该窗、踢掉前台全屏;mac 走 NSWindowCollectionBehavior 共存,Linux 的 hitWin 本就 focusable:false。纯 Windows 激活/z-order 语义。",
+        "evidence": "pet-window-runtime.js:543-545 注释自承 `// KEY EXPERIMENT: allow activation to avoid WS_EX_NOACTIVATE input routing bugs.` + `focusable: !isLinux,`。test/pet-window-runtime.test.js:163 `assert.equal(instances[0].options.focusable, true)` 锁死 Windows=可激活,任何 focusable:false 改动先撞这条测试。#538 报告人给出『fix: focusable:false + win-fullscreen-detect.js』,但 `ls src/win-fullscreen-detect.js` 不存在、`grep GetForegroundWindow src/` 仅命中 focus.js(终端聚焦)=修复未进仓。",
+        "confidence": "high",
+        "relatedIssue": "#538, #545",
+        "dimension": "input-drag",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真实存在、未修、Windows 特有。(1) hitWin 在 Windows 可激活:src/pet-window-runtime.js:545 `focusable: !isLinux`,543-544 注释自承是为规避 WS_EX_NOACTIVATE 输入路由 bug 的『KEY EXPERIMENT』。(2) 每 5s 无条件抢 topmost:src/topmost-runtime.js:185-212 startTopmostWatchdog,TOPMOST_WATCHDOG_MS=5_000(:9),对 getWin()/getHitWin() 各做 setAlwaysOnTop(true,\"pop-up-menu\")(WIN_TOPMOST_LEVEL :7);仅 isWin 启动(:186),由 main.js:3432 接线。关键:watchdog 里没有任何前台/全屏判定——:193/199/204 的 isVisible() 只针对 bubble/HUD 子窗,不是前台应用检查。可激活窗口在 Windows 每 5s 被强推 pop-up-menu topmost = 典型抢前台模式,与 #538『全屏应用每约 5s 失焦最小化』症状一致。(3) 测试硬锁:test/pet-window-runtime.test.js:163 assert.equal(instances[0].options.focusable, true),所在用例名即『Windows drag focusability contract』(:152),任何 focusable:false 先撞这条(:289 另锁 Linux=false)。(4) reporter 宣称的修复未进仓:`ls src/win-fullscreen-detect.js` 不存在;`grep GetForegroundWindow src/` 仅命中 src/focus.js:93,551(终端聚焦 WinFocus,与 z-order 无关)。(5) 用 git log -S 与 grep 实查未发现修复:唯一相关的 1177e2d『fix: recover pet after fullscreen window switches』(PR #271 / baaf675)方向相反——它给 topmost-runtime.js 加 applyFreshNudge/restorePendingNudge 让桌宠在全屏切换后『重新冒到最上层』,恰恰强化而非抑制抢焦。无任何全屏时抑制 watchdog 的逻辑。Windows 特有:focusable 只排除 Linux、watchdog isWin-gated、mac 走 screen-saver+NSWindowCollectionBehavior 共存(:8)、Linux hitWin=focusable:false。这是 #545 与 #538 之间的真实张力,不是已修/不可达/假阳性。",
+          "fixSketch": "不能裸翻 focusable:false(会回退 #545 输入路由 bug 且先撞 test:163)。正解=给 watchdog 加前台感知,只在桌宠不应抢焦时跳过 reassert:在 topmost-runtime.js 的 setInterval 回调里(:187 之前),用一个 native 探针(koffi 调 user32 GetForegroundWindow + DwmGetWindowAttribute/查前台窗矩形是否覆盖整屏,或用 SHQueryUserNotificationState 判 QUNS_RUNNING_D3D_FULL_SCREEN/QUNS_PRESENTATION_MODE)判断当前前台是否为独占/全屏应用;若是,则本周期 skip 掉对 getWin()/getHitWin() 的 setAlwaysOnTop(改为不动 z-order,仅在前台恢复后再 reassert)。这正是 reporter 提议但未落仓的 win-fullscreen-detect.js 思路。落地时同步更新 test:163 的 contract 测试(保留 focusable:true,新增『全屏前台时不 reassert topmost』的单测,用注入的 fake 探针驱动)。务必真 Windows 机+真全屏游戏 smoke 验证(参照仓库一贯的真机门禁),因为前台/全屏判定与 z-order 抢占是纯 Windows 激活语义,CI/代码审查无法证伪。"
+        }
+      },
+      {
+        "title": "topmost watchdog 每 5s 对 focusable 的 hitWin 调 setAlwaysOnTop,不看前台是否全屏 —— #538 的直接触发机制,修复(win-fullscreen-detect)未落地",
+        "file": "src/topmost-runtime.js:181",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "symptom": "全屏应用/游戏每约 5 秒被打断一次(失焦/最小化)。周期与 watchdog 的 5000ms 吻合,正是 #538『every ~5 seconds』。",
+        "whyWindowsSpecific": "watchdog 仅 Windows 启动(startTopmostWatchdog 顶部 `if (!isWin ...) return`),`reassertWindowAndTaskbar` 无条件 `win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)`(:181),对 getHitWin() 也照打(:189)。Windows 缺少 mac 那套全屏共存,只靠 pop-up-menu 窗口级不足以与全屏应用共处。",
+        "evidence": "topmost-runtime.js:9 `const TOPMOST_WATCHDOG_MS = 5_000;`;:185-189 `startTopmostWatchdog(){ ... setIntervalFn(()=>{ reassertWindowAndTaskbar(getWin()); reassertWindowAndTaskbar(getHitWin()); ... }, watchdogMs)}`;:179-183 `reassertWindowAndTaskbar(win){ ... win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL); ... }`,无任何前台全屏检测分支。修复文件 src/win-fullscreen-detect.js 不存在。",
+        "confidence": "high",
+        "relatedIssue": "#538",
+        "dimension": "input-drag",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真实存在,未修,Windows 特有。实查证据:(1) src/win-fullscreen-detect.js 不存在(ls 报 No such file;git log --all -S \"win-fullscreen\" / --grep=538 / --grep=fullscreen 全 0 命中,除 mac NSPanel 与 PR#271 `1177e2d`「recover pet after fullscreen window switches」——那是切走后恢复,非 watchdog 期间抑制)。(2) src/topmost-runtime.js:9 `TOPMOST_WATCHDOG_MS = 5_000`;:185-212 startTopmostWatchdog 用 setInterval(..., watchdogMs) 每 tick 调 reassertWindowAndTaskbar(getWin()) 与 reassertWindowAndTaskbar(getHitWin())(:188-189);:179-183 reassertWindowAndTaskbar 无条件 `win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)`(WIN_TOPMOST_LEVEL=\"pop-up-menu\",:7),函数体与 tick 体内均无任何前台/全屏检测分支。(3) Windows 限定::186 `if (!isWin || topmostWatchdog) return;`;hitWin 在 pet-window-runtime.js:545 `focusable: !isLinux`(Windows 为可激活的 setShape 顶层窗,showInactive,:557-562),mac 走 screen-saver+setVisibleOnAllWorkspaces 共存(:62-89)而 Windows 无此腿。(4) test/topmost-runtime.test.js:269 仅断言 watchdog 按 TOPMOST_WATCHDOG_MS 重置 setAlwaysOnTop,无任何「前台全屏时跳过」的代码或测试。周期 5000ms 与 #538『every ~5 seconds』吻合。唯一保留:确切症状(夺焦 vs 打断独占全屏)取决于前台 app 全屏模式——setAlwaysOnTop 本身不直接夺焦,但可激活的顶层覆盖窗周期性盖住独占全屏会被 DWM 踢出全屏,正是该类 bug 的经典成因;不影响 isReal 判定。",
+          "fixSketch": "在 reassertWindowAndTaskbar(及 reassertWinTopmost/guardAlwaysOnTop 的重打路径)前加一个 Windows 前台全屏探测短路:经 koffi/FFI 调 GetForegroundWindow + GetWindowRect 与 monitor work area/全屏标志比对(repo 已在 src/main.js:152、src/focus.js 装载 user32.dll,可复用同样 koffi 加载方式),判定『当前前台是覆盖整屏的他进程窗口』时,本轮 watchdog 跳过对 getWin()/getHitWin() 的 setAlwaysOnTop 重置(可仍保留 keepOutOfTaskbar/skipTaskbar 这类不夺焦的维护)。把探测做成可降级(FFI 不可用即维持现状),并加单测:fullscreen-foreground=true 时断言 hitWin/win 无 setAlwaysOnTop 调用,普通桌面态保持现有断言。这正是缺失的 win-fullscreen-detect.js 应承担的职责。"
+        }
+      },
+      {
+        "title": "render 窗口 always-on-top-changed guard 只把 render 自己重新顶到最上,把 hitWin 压到 render 之下(短暂 z-order 反转)",
+        "file": "src/topmost-runtime.js:155",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "前台应用抢占/全屏切换使 Windows 撤掉桌宠 always-on-top 后,有一段时间(直到 ~1s 后 hwnd recovery 或下次 5s watchdog)render 窗位于 hitWin 之上。render 是 click-through 纯显示层,命中测试虽仍会穿到下面 hitWin,但这个『hitWin 必须在最上』不变量被破坏;叠加其它因素(dragLocked 卡死/hitWin 自身掉 topmost)时更易表现为点击穿透/拖不动。",
+        "whyWindowsSpecific": "guardAlwaysOnTop 整个只在 isWin 挂载(topmost-runtime.js:152 `if (!isWin ...) return`),依赖 Windows always-on-top-changed 事件与 setAlwaysOnTop 重插到 topmost band 顶部的语义。mac/Linux 不走。",
+        "evidence": "topmost-runtime.js:153-155 `winToGuard.on(\"always-on-top-changed\", (_event, isOnTop) => { if (isOnTop ...) return; winToGuard.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL); ...` — winToGuard 是 render(getWin())时这句把 render 顶到最上;随后只 `syncHitWin()`(:173)更新 hitWin bounds/shape,不重新抬升 hitWin z-order。让 hitWin 回到 render 之上要等 scheduleHwndRecovery→reassertWinTopmost(先 win 后 hitWin,:58-59)或下次 watchdog。两 guard 分别挂 render(main.js:3431)和 hitWin(createHitWindow 内)。",
+        "confidence": "medium",
+        "relatedIssue": "#545, #176",
+        "dimension": "input-drag",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "机制属实但危害被夸大 → 降到 low(不是 medium 的输入丢失隐患)。\\n\\n【代码机制确实存在,逐行核过当前 main】render 的 always-on-top-changed guard 在 topmost-runtime.js:153-176:isOnTop=false 时只对 winToGuard(=render)`setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)`(:155),随后只 `syncHitWin()`(:173)。而 syncHitWin(pet-window-runtime.js:391-414)只 `hitWin.setBounds`(:406)+条件 `setShape`(:411),全程不碰 hitWin z-order/setAlwaysOnTop。hitWin 被重新抬升只发生在更晚的 `scheduleHwndRecovery`(:174)→ ~1s 后 `reassertWinTopmost`(:58-59 先 win 后 hitWin),或 5s watchdog(:185-212)。两 guard 确实分别挂:render 在 main.js:3431 `guardAlwaysOnTop(win)`,hitWin 在 pet-window-runtime.js:566。test/topmost-runtime.test.js:95 把『此路径只重断言 render 一次』固化为预期行为。所以『render 短暂位于 hitWin 之上』的 z-order 反转描述对 main 是准确的,且确为 Windows 特有(:152 `if (!isWin...) return`)。\\n\\n【但断言的危害(点击穿透/拖不动)不可达——单凭此因】render 永久 `setIgnoreMouseEvents(true)`(tick.js:60『set once, never toggle』)且 `setFocusable(false)`(pet-window-runtime.js:462);全仓 `setIgnoreMouseEvents(false)` 只对 hitWin(:558 永久 / :728 settings 预览恢复),render 从不接鼠标。一个 click-through 窗即便压在 hitWin 上也不截获指针,事件穿透到 hitWin;拖动由 hitWin 内容上的 pointerdown 发起(hit-renderer.js:75),同样与 render 的 z 位无关。发现自己也承认『命中测试仍会穿到下面 hitWin』,只在『叠加 dragLocked 卡死 / hitWin 自身掉 topmost 等其它因素』时才表现为问题——那是另外的独立 bug,不是本条单独能造成的。故本条是不变量卫生/健壮性 nit,而非可触发的输入路由缺陷。\\n\\n【未修也非回归】当前 main 仍是此结构,且这是 1177e2d『fix: recover pet after fullscreen window switches』有意设计、被测试锁定的行为。真正治『被遮挡后拖不动』的 65453fa(owner focus cycle)并未合入 main;#545(无法拖动)/#176(窗口层级策略)均 OPEN——更广义的拖动失效痛点确实未解,但其根因不是这条 render-above-hitWin 反转。标 low 而非 invalid:因为描述的代码机制真实存在(invalid 会误判为代码不存在),只是把一个良性不变量 nit 包装成了 medium 输入隐患。",
+          "fixSketch": "低价值硬化(非必需):在 render 的 guard 重断言路径里,顺手把 hitWin 也重新抬到 topmost band 顶,消除短暂反转——即在 topmost-runtime.js guardAlwaysOnTop 内 render 分支的 `syncHitWin()`(:173)之前/之后调用 `reassertWinTopmost()`(它已是先 win 后 hitWin,:58-59),而不是等 ~1s 的 scheduleHwndRecovery。需同步更新 test/topmost-runtime.test.js:95(该用例当前断言此路径只对 render setAlwaysOnTop 一次)。但要明确:这只恢复『hitWin 在最上』的不变量整洁度,并不会修复 #545『无法拖动』——后者的真因在 DWM 指针捕获被破坏(见未合入的 65453fa owner-focus-cycle 思路),应单列跟进,别把两者混为一谈。"
+        }
+      },
+      {
+        "title": "hitWin 渲染进程崩溃时未清 dragLocked,主进程拖拽锁卡死 → syncHitWin 永久早退 → 命中层与桌宠错位 → 点击穿透到后面应用",
+        "file": "src/main.js:3337",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "拖动中 hitWin renderer 进程挂掉(reload 后 DOM isDragging 复位但主进程 dragLocked 仍 true),之后桌宠再移动时 hitWin 不跟随,命中矩形/setShape 区域漂移到桌宠像素之外,落在桌宠上的点击穿透到背后应用—与 #545『直接穿透到后面的应用』一致(崩溃边缘场景)。",
+        "whyWindowsSpecific": "Windows 上 hitWin 是唯一输入面(focusable:true、永久 setIgnoreMouseEvents(false));render 层不接事件。hitWin renderer 崩了就没人发 drag-lock(false)。render 窗口崩溃路径已 setDragLocked(false) 自愈,hitWin 崩溃路径没有—不对称缺口。",
+        "evidence": "hitWin 崩溃处理仅 main.js:3337-3340 `onRenderProcessGone: (details, ownedHitWin) => { safeConsoleError(\"hitWin renderer crashed:\", details.reason); petWindowRuntime.reloadWindowWebContents(ownedHitWin); }`,无 setDragLocked(false)。对照 render 崩溃 main.js:3422-3429 含 `petWindowRuntime.setDragLocked(false);`。dragLock 释放仅由 hit-renderer.js:108-148 的 pointerup/pointercancel/lostpointercapture/`blur` 经 IPC 触发(pet-interaction-ipc.js:87-96),renderer 进程死时都不会发出。dragLocked 定义 pet-window-runtime.js:100,早退点 :397 `if (dragLocked) return;`。",
+        "confidence": "medium",
+        "relatedIssue": "#545",
+        "dimension": "input-drag",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真实存在,未修。行号在发现里略有偏移但结构准确。hitWin renderer 崩溃处理 main.js:3337-3340 只 safeConsoleError + reloadWindowWebContents(ownedHitWin),无 setDragLocked(false);对照 render 崩溃 main.js:3422-3429 显式调 petWindowRuntime.setDragLocked(false)(:3425)——不对称缺口属实。链路:pointerdown→hit-renderer.js:85 dragLock(true)→pet-interaction-ipc.js:88 dragLocked=true;crash 后 reload 的新 hit-renderer 初始化 isDragging=false(hit-renderer.js:39),stopDrag 被 :109 `if(!isDragging) return` 挡住,唯一发 dragLock(false) 的 :112 永不触发;did-finish-load→syncHitStateAfterLoad(main.js:940)也不复位。dragLocked 永久 true→每次 pet move/resize 的 syncFloatingWindowsAfterPetBoundsChange(pet-window-runtime.js:737)→syncHitWin 在 :397 `if(dragLocked) return` 早退;tick 路径 tick.js:205 也被 `!dragLocked` 门住且根本不重定位 hitWin。无任何 watchdog/timer 复位 dragLocked(grep 全仓只有三处 setDragLocked(false):pet-interaction-ipc.js:128 drag-end finally、:88 IPC、main.js:3425 render 崩溃,均不在 hitWin 崩溃路径)。git log -L 3337,3340:src/main.js 证实该 handler 自 f9cd476(#220 era)起只有 log+reload,311692c 重构、149cf59 加固 reload,从未加 setDragLocked(false)——非任何已合并 PR 所修。Windows 特有:hitWin 是唯一输入面(focusable:true、永久 setIgnoreMouseEvents(false)、setShape 盖像素),render 层不接事件,与 #545『穿透到后面应用』一致;mac 输入模型不同(render=screen-saver、hitWin 非 focusable)。测试无覆盖此恢复(pet-window-runtime.test.js:191 只验 reload helper;renderer-low-power.test.js:249 只验 render 崩溃复位)。严重度定 medium 偏低:症状真实且对应已报 issue,但可达性低——hit.html 是极简单 div、零 SVG/object/动态 DOM churn,hitWin renderer 崩溃罕见且需外部触发(OOM/GPU kill/注入 DLL)恰落在拖拽中窄窗口,故非 invalid 但非常规路径。",
+          "fixSketch": "把 hitWin 崩溃处理改成与 render 崩溃对称:在 main.js:3337-3340 的 onRenderProcessGone 里、reloadWindowWebContents(ownedHitWin) 之前(或之后)补 petWindowRuntime.setDragLocked(false) 并 clearDragSnapshot()。更稳妥可同时在 syncHitStateAfterLoad / hitWin 的 did-finish-load 里防御性清一次锁,使任何未来 hitWin reload 自愈。可加一条测试断言 hitWin onRenderProcessGone 含 setDragLocked(false)(对齐 renderer-low-power.test.js 风格)。"
+        }
+      },
+      {
+        "title": "hitWin focusable:true 在全屏/独占游戏前台时,点击桌宠会抢走游戏焦点(#545↔#538 的固有对立面)",
+        "file": "src/pet-window-runtime.js:545",
+        "severity": "high",
+        "kind": "design-tradeoff",
+        "symptom": "用户在玩全屏(尤其独占全屏)游戏或看全屏视频时,点一下叠在上面的桌宠/HUD,焦点被夺走;独占全屏游戏可能被最小化、掉帧、闪一下变回窗口模式或丢输入。",
+        "whyWindowsSpecific": "hitWin 的 `focusable: !isLinux` 在 Windows 上恒为 true(Linux 才是 false,mac 创建后又 setFocusable(false))。这正是为修 #545『拖动失效/鼠标穿透』而刻意保留的:Windows 上 WS_EX_NOACTIVATE+layered+Chromium child HWND 组合在 z-order 变化后走进激活死路径,所以输入窗必须可激活才能稳定接管拖动。代价就是可激活窗被点 → 抢前台焦点。AGENTS.md:169 与 theme-state-ui.md:163 把这条张力明确写成了有意 tradeoff。修 #545 与修 #538 在当前架构下直接互斥。",
+        "evidence": "pet-window-runtime.js:543-545 `// KEY EXPERIMENT: allow activation to avoid WS_EX_NOACTIVATE input routing bugs. Linux keeps the old non-focusable behavior.` `focusable: !isLinux,`;:558 `hitWin.setIgnoreMouseEvents(false); // PERMANENT`;:562 `if (isWin) hitWin.setAlwaysOnTop(true, topmostLevel)` 把这个可激活窗顶到 pop-up-menu 层(全屏之上)。文档 AGENTS.md:169 + docs/project/theme-state-ui.md:163 明确记为可接受代价。focusable 这条线自 311692c(2026-05-07)起未变,早于 #538 报告,确属当前活跃行为而非已修。",
+        "confidence": "high",
+        "relatedIssue": "#538(对立 #545)",
+        "dimension": "focus-fullscreen",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真实存在,且确为 Windows 特有。逐行核实(origin/main=0dec5f8,文件与当前分支 byte-identical,diff 为空):(1) src/pet-window-runtime.js:545 `focusable: !isLinux` → Windows 上恒 true;(2) :559 `if (isMac) hitWin.setFocusable(false)` 只在 mac 把焦点能力收掉,Windows 不收 → 唯独 Windows 的 hitWin 保持可激活;(3) :558 `setIgnoreMouseEvents(false) // PERMANENT` hitWin 实接所有点击;(4) :562 `if (isWin) hitWin.setAlwaysOnTop(true, topmostLevel)`,topmostLevel 经 main.js:653 WIN_TOPMOST_LEVEL → topmost-runtime.js:7 = \"pop-up-menu\"(全屏之上),把这个可激活窗顶到全屏游戏上方。因此独占全屏游戏前台时点桌宠会抢前台焦点,Windows 特有(Linux focusable=false 不接、mac post-create setFocusable(false))。未修:git blame + git log -S 'focusable: !isLinux' 均指向 311692c(2026-05-07)且此后未变,早于 #538。全仓 grep 无任何针对 hitWin 的 fullscreen/exclusive/foreground-restore 焦点缓解;focus.js/main.js 的 SetForegroundWindow 是反方向的终端聚焦功能;hit-renderer.js:148 blur 只 stopDrag、handleClick 只跑 poke/flail,均不回还焦点;PR #271(1177e2d)只恢复桌宠自身 z-order,不阻止抢焦点。文档明确登记为有意 tradeoff:AGENTS.md:169『hitWin.focusable=true 是修复 Windows 拖拽 bug 的关键,不要轻易改回去』+ docs/project/theme-state-ui.md:163『hitWin 点击会短暂抢焦点,这是当前可接受代价』。降一档至 medium:症状真实但属已知/已文档化/刻意接受的代价,是 #545 拖拽修复的直接对立面(当前双窗架构下互斥),非未知 latent bug、非崩溃、非回归,且仅命中独占全屏场景。",
+          "fixSketch": "无法在不重伤 #545 拖拽可靠性的前提下简单消除(focusable 是 WS_EX_NOACTIVATE z-order 输入路由 bug 的 workaround)。可行缓解方向:(a) Windows 上对 hitWin 仅在拖拽生命周期内临时切 focusable,点击/poke 用不激活路径——但这正是当初放弃的不稳定路线,需真机重测 z-order 抢管是否仍稳;(b) 用 koffi FFI 检测前台是否为独占全屏窗口(GetForegroundWindow + 比较 monitor rect / 查询 fullscreen 标志),若是则该次交互后立即把焦点 SetForegroundWindow 还给原前台窗(复用 main.js:153 的 AllowSetForegroundWindow 机制),把\"抢焦点\"窗口收窄到一帧;(c) 提供用户开关:全屏游戏期间自动隐藏/穿透桌宠(petHidden 已有,可加 fullscreen-aware 自动触发)。三者均须 Windows 真机验证(见 verify-platform-fixes-on-real-hardware),(a) 风险最高、(b) 最对症但要 FFI、(c) 最稳但是退让式体验。"
+        }
+      },
+      {
+        "title": "topmost 看门狗 + always-on-top 1px nudge 无条件把桌宠顶到全屏游戏之上,可触发独占全屏掉出/闪烁",
+        "file": "src/topmost-runtime.js:185",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "symptom": "全屏(独占)游戏运行时,桌宠每 ~5s 被强制重新顶到最上层;一旦游戏抢走 topmost 触发 always-on-top-changed,桌宠会被 1px『推一下再推回』来夺回置顶。叠加结果:独占全屏游戏周期性掉帧/闪烁、被拉成窗口化、或前台被打断。",
+        "whyWindowsSpecific": "整套 reassert/nudge 全程 if (!isWin) return 门控,是 Windows 专属。WIN_TOPMOST_LEVEL = pop-up-menu(topmost-runtime.js:7)层级在全屏应用之上;Windows 独占全屏(DirectX exclusive fullscreen)对『有别的 topmost 窗强行置顶/移动』极敏感,经典表现就是掉出独占模式。reassertWindowAndTaskbar(getWin())/(getHitWin()) 在 5s 看门狗里无条件跑,全程没有任何前台是否全屏/是否游戏的判断;startTopmostWatchdog() 一启动就常驻,stopTopmostWatchdog 除退出 cleanup 外在 main.js 里从不调用(DND、低功耗/睡眠、游戏前台都不会停)。",
+        "evidence": "topmost-runtime.js:185-189 `startTopmostWatchdog(){ ... topmostWatchdog = setIntervalFn(() => { reassertWindowAndTaskbar(getWin()); reassertWindowAndTaskbar(getHitWin()); ...`(watchdogMs 默认 5_000,:9);:151-176 guardAlwaysOnTop:always-on-top-changed 里若失去置顶就 setAlwaysOnTop(true, WIN_TOPMOST_LEVEL) 并对 renderWin 触发 nudge;main.js:3431-3432 `guardAlwaysOnTop(win); startTopmostWatchdog();` 窗口建好后立即常驻。grep 确认 src/ 全树无 GetForegroundWindow 用于判断前台全屏/游戏来抑制置顶(focus.js 里的只用于终端聚焦确认)。git log 全树无 538/game/fullscreen-guard 相关提交。",
+        "confidence": "medium",
+        "relatedIssue": "#538",
+        "dimension": "focus-fullscreen",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "机制属实、Windows 特有、当前 main 未修——但严重度被高估,下调 high→medium。\n\nREAL+未修(逐行核实 src/topmost-runtime.js 当前内容,行号与发现一致):\n- startTopmostWatchdog() topmost-runtime.js:185-213,每 watchdogMs(默认 TOPMOST_WATCHDOG_MS=5000,:9)无条件跑 reassertWindowAndTaskbar(getWin())/(getHitWin()),后者 :179-183 调 win.setAlwaysOnTop(true,\"pop-up-menu\")(:181)+keepOutOfTaskbar。整段除 if(!isWin)return(:186)外无任何前台/全屏/游戏判断。\n- guardAlwaysOnTop :151-176:always-on-top-changed 里失去置顶则 setAlwaysOnTop(true,\"pop-up-menu\")(:155),并对 renderWin 触发 1px nudge(applyFreshNudge :143-149 把宠物窗移到 x+1 再移回 x;applyPetWindowPosition pet-window-runtime.js:180 动的是宠物窗,不是游戏窗)。\n- WIN_TOPMOST_LEVEL=\"pop-up-menu\"(:7),Windows HWND_TOPMOST 带,高于普通窗。\n- 接线无条件:main.js:3431-3432 窗口建好即 guardAlwaysOnTop(win);startTopmostWatchdog()。\n\nWindows 特有:reassert/nudge 全程 if(!isWin)return 门控;mac 走 MAC_TOPMOST_LEVEL=\"screen-saver\"+reapplyMacVisibility 另一条路(:62-89)。\n\n未修——已实查防误判(吸取 PR #496 教训):\n- stopTopmostWatchdog 仅经 topmostRuntime.cleanup()(:215-220→:222-229)可达,而 cleanup() 在 main.js 唯一调用点是 :3775,位于 app.on(\"before-quit\")(:3752)——纯退出路径。DND/低功耗/睡眠/游戏前台均不停看门狗。grep src/main.js 全树确认。\n- git log --grep \"fullscreen guard|game mode|exclusive fullscreen|suppress topmost|#538\" = 0 命中;grep src/*.js \"isFullScreen|foregroundFullscreen\" = 0;src 内无用 GetForegroundWindow 抑制置顶(focus.js:551 那处是 PowerShell 脚本内确认终端聚焦,与置顶无关)。topmost-runtime.js 仅两次提交(4ee6e2a 抽取 + 1177e2d 全屏切窗恢复),后者只加 nudge 去重(pendingNudgeRestore),未加任何游戏/全屏感知。\n\n为何下调到 medium(对症状描述的反驳):\n1. 「每~5s 被 1px 推一下再推回」不准确:5s 看门狗只重发 setAlwaysOnTop(廉价 z-order set,:181),不 nudge;1px nudge 仅在 always-on-top-changed 事件(别的窗抢走置顶时,:165)触发。周期性部分与事件性 nudge 被混为一谈,实际行为比症状文案温和。\n2. 「独占全屏掉出」是合理假设但无实证:pop-up-menu 是 HWND_TOPMOST 带,现代游戏绝大多数走 borderless windowed(flip model),叠加层桌宠通常可容忍;真 DirectX exclusive fullscreen 由 GPU flip-chain 独占显示,5s 一次 z-order set 是否真把某游戏踢出独占,取决于硬件/驱动/游戏,repo 内无任何真机 repo 证据,#538 也无关联 commit/repro。\n结论:代码模式真实存在、Windows 专属、未修,是合法的潜在隐患(5s 置顶看门狗+事件 nudge 全无游戏/全屏感知,可能对部分全屏游戏造成抢焦/闪烁),但最坏的「独占全屏掉出」未经验证、对常见 borderless 情形被夸大 → medium。",
+          "fixSketch": "加「前台全屏/游戏感知」抑制,而非删看门狗:\n1. 主进程查前台窗是否覆盖全屏(Windows: GetForegroundWindow + 比较其矩形 vs 该显示器 MonitorInfo.rcMonitor 判 borderless/exclusive;或 Shell QUNS_RUNNING_D3D_FULL_SCREEN / SHQueryUserNotificationState),做成一个 isForegroundFullscreen() 探针。\n2. 在 reassertWindowAndTaskbar 与 guardAlwaysOnTop 的 nudge 分支前置门控:若前台全屏/独占,跳过 setAlwaysOnTop 重发与 1px nudge(桌宠本就在全屏下不该抢顶)。\n3. 看门狗可保留但在全屏前台时降为 no-op,或在检测到全屏前台时 stopTopmostWatchdog()、离开后重启——给 main.js 增一条 stop/start 触发路径(目前仅 before-quit cleanup 调 stop)。\n4. 复用现有 getNearestWorkArea/几何工具判矩形;加 topmost-runtime 单测覆盖「全屏前台时不 reassert、不 nudge」。真机需在独占全屏游戏下 smoke 验证(参照仓库 verify-platform-fixes-on-real-hardware 习惯,勿仅凭 CI/代码评审定论)。"
+        }
+      },
+      {
+        "title": "applyFreshNudge 移动的是真实 OS 窗口(setBounds),全屏独占前台被叠加 topmost 窗重定位易触发模式翻转",
+        "file": "src/topmost-runtime.js:143",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "#271 为『全屏窗口切换后桌宠掉到下面』而加的恢复手段:把桌宠窗 x+1 再 x 推回。在全屏游戏场景里,这个『推一下』不是无害的——它真实地 setBounds 移动了一个置顶窗,叠在独占全屏应用上方时,正是 Windows 把独占全屏拽回窗口化/重组合的已知诱因,表现为游戏瞬时闪烁或掉出全屏。",
+        "whyWindowsSpecific": "applyFreshNudge 仅在 guardAlwaysOnTop(全程 isWin 门控)与 scheduleHwndRecovery(if (!isWin) return)里被调用,是 Windows 专属路径。它通过 applyPetWindowPosition → applyPetWindowBounds → win.setBounds(...) 真正移动 OS 窗口两次。nudge 只受 isDragLocked/isMiniAnimating/isMiniTransitioning 三个门控,完全不看前台是否是全屏/独占游戏。",
+        "evidence": "topmost-runtime.js:143-149 `applyFreshNudge(bounds){ pendingNudgeRestore = {...}; applyPetWindowPosition(bounds.x + 1, bounds.y); applyPetWindowPosition(bounds.x, bounds.y); }`;链路 pet-window-runtime.js:180-184 applyPetWindowPosition → applyPetWindowBounds → :174 `win.setBounds(materialized.bounds)`;触发门控仅 topmost-runtime.js:111 / :157-161 的 drag/mini 三项,无全屏判断。源自 1177e2d『fix: recover pet after fullscreen window switches』(#271),即恢复腿本身与 #538 抢焦点腿同源对冲。",
+        "confidence": "medium",
+        "relatedIssue": "#538(机制源自 #271 恢复)",
+        "dimension": "focus-fullscreen",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真实存在,Windows 专属,未修。证据逐条核过当前 main 真实代码:(1) applyFreshNudge 在 src/topmost-runtime.js:143-149 做 applyPetWindowPosition(x+1) → applyPetWindowPosition(x) 的双推。(2) 该推真正落到 OS setBounds:applyPetWindowPosition(main.js:938)→pet-window-runtime.js:180 applyPetWindowPosition→:169 applyPetWindowBounds→:174 win.setBounds(materialized.bounds),其中 win=getRenderWindow()(:170),即 renderWin 显示层窗口,非虚拟坐标。(3) Windows 专属:applyFreshNudge 仅被 guardAlwaysOnTop(:165/:170)与 restorePendingNudge/scheduleHwndRecovery(:112)调用;guardAlwaysOnTop 在 !isWin 时早返回(:152),scheduleHwndRecovery 在 !isWin 时早返回(:104);always-on-top-changed 事件经 main.js:3431 guardAlwaysOnTop(win) 挂在桌宠窗上。(4) 门控正是发现所述三项——topmost-runtime.js:158-160 仅看 isDragLocked()/isMiniAnimating()/isMiniTransitioning(),整个 nudge+recovery 路径无任何 fullscreen/独占/前台窗判断(grep -i fullscreen 在 topmost-runtime.js 只命中 mac 的 screen-saver 注释与 mac visibleOnFullScreen 选项)。(5) 未修:git log -S applyFreshNudge --all 仅返回起源 commit 1177e2d(#271,经 baaf675 合并),1177e2d..HEAD 对 topmost-runtime.js 为空,无 later commit,无 fullscreen-skip 测试。这正是 #271 恢复腿,与 #538 抢焦点腿同源对冲。严重度维持 medium 不上调:nudge 仅在 always-on-top-changed(即桌宠已被踢下置顶后)触发,是恢复路径而非常态;且现代 Windows/Electron 独占全屏多走 Flip/borderless,topmost 叠加窗重定位多表现为闪烁而非硬性模式翻转,症状量级依游戏/硬件而定。机制(在独占全屏应用上方移动一个 topmost 窗,触发 DWM 重组合)是真实已知诱因,故 medium 成立。",
+          "fixSketch": "在 applyFreshNudge(或更上游的 guardAlwaysOnTop 触发条件)加一道前台全屏门控,独占/全屏前台时跳过物理推窗:Windows 上判前台窗是否覆盖整屏且非桌面/shell(Win32 GetForegroundWindow+GetWindowRect 比对显示器 bounds,或经已有 native helper / setDisplayAffinity 思路探测),命中则只做 setAlwaysOnTop 重断言、不调 applyPetWindowPosition 的双推。退一步的低风险做法:把 x+1→x 的双 setBounds 改为单次\"原地\"重断言(去掉物理位移,仅靠 setAlwaysOnTop(true, pop-up-menu) 重新拿回 z-order),因为 nudge 的目的本是逼 DWM 重排 z-order,而非真挪位置;若实测单纯重断言不足以恢复,再退化为带全屏门控的位移。任一改法都补一条 topmost-runtime.test.js 用例:模拟前台全屏时 applyFreshNudge 不调用 applyPetWindowPosition。务必 Windows 真机(含独占全屏游戏)验证,勿仅凭 CI/代码评审下结论。"
+        }
+      },
+      {
+        "title": "全程无『前台是否全屏/游戏』探测,无法在游戏期间降级置顶/输入接管(#538 缺的就是这条腿)",
+        "file": "src/topmost-runtime.js:54",
+        "severity": "medium",
+        "kind": "known-unfixed",
+        "symptom": "#538 的根因不是某个写错的分支,而是缺一整条『检测到前台是独占全屏游戏 → 暂停 topmost reassert / 暂停 nudge / 让 hitWin 不抢焦点』的逻辑。当前任何全屏游戏场景下桌宠都按普通桌面同样的力度抢置顶+可被点击抢焦点,用户无开关可缓解。",
+        "whyWindowsSpecific": "Windows 上桌宠用 pop-up-menu 顶到全屏之上 + focusable 输入窗,是唯一会与全屏独占应用正面冲突的平台(mac 用 screen-saver + 渲染/输入窗 setFocusable(false);Linux hitWin 不可 focus)。缓解 #538 必须用 Windows 专有的前台窗口探测(GetForegroundWindow + 全屏/独占判定),而代码里完全没有这套设施服务于桌宠置顶。",
+        "evidence": "grep 全树:GetForegroundWindow 仅出现在 focus.js(终端聚焦确认 confirmForeground,与桌宠 z-order 无关);topmost-runtime.js 的 reassertWinTopmost(:54)、startTopmostWatchdog(:185)、guardAlwaysOnTop(:151)三处置顶入口均无任何前台全屏判断;main.js 里 stopTopmostWatchdog 仅在退出 cleanup 调用(从不在游戏/DND/睡眠时停)。无 isFullScreenActive/suppressTopmost/gameDetect 等任何相关标识(grep 返回空)。",
+        "confidence": "medium",
+        "relatedIssue": "#538",
+        "dimension": "focus-fullscreen",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真实存在的「缺一条腿」型缺口(known-unfixed),非写错的分支。逐项实查全部坐实:\n\n1) 三个置顶入口零前台/全屏判定:reassertWinTopmost (topmost-runtime.js:54-60) 无条件 setAlwaysOnTop(true,'pop-up-menu');guardAlwaysOnTop (:151-177) 在 always-on-top-changed 里一律抢回置顶+nudge;startTopmostWatchdog (:185-213) 每 5s(TOPMOST_WATCHDOG_MS=5000)无条件 reassert。无任何 isFullScreenActive/suppressTopmost/gameDetect(grep 全空,git log -S 全空)。\n\n2) GetForegroundWindow 仅在 focus.js:93/551 的 PowerShell 终端聚焦确认(confirmForeground，focus.js:722-733)用,git log -S 显示它是为 Telegram 直发粘贴(4de944c)引入,与桌宠 z-order 完全无关;confirmForeground 在 src/ 内除 focus.js 外无任何调用方。无 SHQueryUserNotificationState / monitorFromWindow / exclusiveFullscreen / isGameMode 等任何前台全屏探测设施。\n\n3) watchdog 永不为游戏/DND/睡眠停:startTopmostWatchdog() 仅在 main.js:3432 启动一次;stopTopmostWatchdog 只经 cleanup()(topmost-runtime.js:223)可达。doNotDisturb 状态存在(main.js:758 等)但从未接到置顶抑制。\n\n4) Windows 特有性成立:pet-window-runtime.js renderWin.setFocusable(false) 恒(:462);hitWin focusable:!isLinux(:545)+ isMac 时 setFocusable(false)(:559)→ 仅 Windows 的命中窗可获焦 + 顶在 'pop-up-menu'(topmost-runtime.js:7)。mac='screen-saver'+双窗 setFocusable(false),Linux hitWin 不可 focus,均不会与独占全屏正面冲突。\n\n5) PR #496 同款陷阱已排除:唯一相关提交 1177e2d 'fix: recover pet after fullscreen window switches'(及合并 PR baaf675 fix/windows-fullscreen-pet-recovery)做的是反向——加 pendingNudgeRestore/applyFreshNudge 让桌宠在全屏窗抢走 z-order 后『更用力地抢回置顶并恢复位置』(topmost-runtime.js:120-149),正是『抢得更狠』而非『检测到全屏游戏就退让』。所以 main 上没有任何提交修掉本缺口。\n\n结论:发现描述的『无前台全屏/游戏探测 → 无法在游戏期间降级置顶/输入接管,用户无开关缓解』在当前 main 真实成立,行号(:54/:151/:185)精确,是 #538 缺的那条腿。属增强/缺失子系统而非既有逻辑缺陷;有粗粒度手动兜底(DND/右键隐藏桌宠),故 medium 合适。",
+          "fixSketch": "在 Windows 加一条前台全屏探测并据此降级置顶/输入。1) 探测:用已可用的 koffi FFI(参照 main.js:148-155 的 user32 绑定)调 SHQueryUserNotificationState(shell32),返回 QUNS_RUNNING_D3D_FULL_SCREEN(=3)或 QUNS_PRESENTATION_MODE/QUNS_BUSY 即视为『独占全屏/演示/游戏』;或退一步 GetForegroundWindow + 比较窗口矩形 vs 所在显示器 bounds 且排除自身/桌面/shell 类名(focus.js 里已有 GetWindowRect/GetClassName/MonitorFromWindow 可复用)。2) 门控:在 reassertWinTopmost、startTopmostWatchdog 的 tick、guardAlwaysOnTop 的 always-on-top-changed 回调里,先查一个 suppressTopmost 标志——为真则跳过 setAlwaysOnTop 与 nudge,且对 hitWin 做 setIgnoreMouseEvents(true)/setFocusable(false) 让出输入,退出全屏后恢复。3) 状态来源:在 watchdog tick 内顺带刷新该探测(避免新增定时器),并加用户开关(设置→行为/位置,默认开『游戏时让位』)。4) 测试:topmost-runtime.test.js 注入 fake 探测 getter,断言 suppress=true 时不调用 setAlwaysOnTop。真机门槛:必须在 Windows 独占全屏游戏(非边框全屏)实测验证 SHQueryUserNotificationState 返回值与让位/恢复,勿凭 CI 合并。"
+        }
+      },
+      {
+        "title": "命中窗口在 Windows 上 focusable:true,配合周期性 topmost 重置会从全屏游戏/应用抢焦点并把它最小化",
+        "file": "src/pet-window-runtime.js:545",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "relatedIssue": "#538",
+        "symptom": "在 Windows 上跑全屏应用(尤其游戏)时,桌宠大约每 ~5 秒让前台全屏窗口丢焦点并最小化回桌面,导致全屏应用基本没法用(只要 Clawd 在跑)。",
+        "whyWindowsSpecific": "hitWin 在 mac 用 setFocusable(false)(line 559)、Linux 用 focusable:false,只有 Windows 走 focusable:!isLinux=true。这是当初为绕开 WS_EX_NOACTIVATE 输入路由 bug 让命中窗可激活(#545 拖动可靠性)而做的『KEY EXPERIMENT』(line 543-545)。一个 focusable 的 topmost 窗口被 SetWindowPos(HWND_TOPMOST) 拉回顶层时,Windows 会短暂激活它从而把全屏独占/前台窗踢下去。mac 靠 NSWindowCollectionBehavior 共处全屏,Windows 只有 pop-up-menu 层级,没有等价处理。",
+        "evidence": "src/pet-window-runtime.js:543-545 `// KEY EXPERIMENT: allow activation to avoid WS_EX_NOACTIVATE input // routing bugs. Linux keeps the old non-focusable behavior.` / `focusable: !isLinux,`;对照 line 559 `if (isMac) hitWin.setFocusable(false);`。git log -L 543,546 显示该行自 311692c(运行时抽取)起就是这样,#538 之后未改。issue #538 OPEN,reporter 已自查根因并附可用补丁(改 focusable:false + 新增 win-fullscreen-detect.js 在 watchdog tick 里检测全屏前台窗时跳过 setAlwaysOnTop),但当前代码两处都未落地。这是 #545(focusable 才能稳拖) ↔ #538(focusable 抢焦点) 的真实张力,不能简单改回 false。",
+        "confidence": "high",
+        "dimension": "zorder-taskbar",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真。我独立核实(全部对照 origin/main,工作区与 main 这两个文件逐字节相同):(1) hitWin 在 Windows 上确为 focusable —— src/pet-window-runtime.js:545 `focusable: !isLinux,`(mac 才在 :559 `if (isMac) hitWin.setFocusable(false)`,Linux 由 `!isLinux` 排除);`git blame -L 543,545` 显示该行自 311692c(2026-05-07 运行时抽取)起未变。行号与发现描述完全吻合。(2) ~5 秒周期性 topmost 重置真实存在且作用在这个 focusable 窗口上 —— src/topmost-runtime.js:9 `TOPMOST_WATCHDOG_MS = 5_000`;startTopmostWatchdog(:187)每 tick 调 `reassertWindowAndTaskbar(getHitWin())`(:189)→ `win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)`(:181),`WIN_TOPMOST_LEVEL = \"pop-up-menu\"`(:7);该 tick 无任何前台/全屏判断。(3) mac/Win 不对称属实 —— mac 用 screen-saver 级 + NSWindowCollectionBehavior/visibleOnFullScreen 与全屏 Space 共处(:8,:62-89),Windows 只有 pop-up-menu、零全屏共处处理。Windows 特有:症状链(focusable 命中窗 + 无条件 5s topmost 重置 + 无全屏 gating)只在 Windows 成立,mac/Linux 因 focusable:false 不触发。未修:`git log -S \"focusable: !isLinux\"` 仅 311692c;src/win-fullscreen-detect.js 不存在;全分支 grep GetForegroundWindow/GetMonitorInfo/fullscreen-detect 仅命中无关的终端聚焦代码(src/focus.js、hooks/shared-process.js),非本提案;唯一全屏相关且动过 watchdog 的已合 PR #271(commit 1177e2d「recover pet after fullscreen window switches」)只加了位置 nudge-restore,未加任何前台 gating(已逐行核 diff);issue #538 仍 OPEN,reporter 的补丁(focusable:false + win-fullscreen-detect.js + watchdog skip)两处代码均未落地。唯一无法纯代码确证的是「setAlwaysOnTop 对 focusable 窗会激活并把全屏前台踢下去」这一运行时行为(属 Windows SetWindowPos(HWND_TOPMOST) 已知交互,reporter 在 Win11 26200 实测过,但非代码可证事实)——不影响机制层结论。这与发现描述的 #545(focusable 才稳拖)↔#538(focusable 抢焦点)真实张力一致,不能简单改回 false。",
+          "fixSketch": "两条腿,缺一不可,且都必须真 Windows 机(尤其全屏游戏 + 独占全屏)验证。腿1(预防,治本):在 topmost watchdog 的 tick(src/topmost-runtime.js startTopmostWatchdog 内,以及 guardAlwaysOnTop/scheduleHwndRecovery 的 reassert 路径)前加一个 Windows 前台全屏探测——新增 win-fullscreen-detect.js,用 koffi 调 GetForegroundWindow + GetMonitorInfoW,判断前台窗是否覆盖整个 monitor 且非桌宠/桌面自身(排除 Shell_TrayWnd/WorkerW/Progman),若是则跳过 setAlwaysOnTop 重置(可对照 mac 端 reapplyMacVisibility 的 deferUntil 机制做一个等价的 defer)。腿2(降低激活面):评估把 hitWin 在 Windows 也尽量做到「不抢激活」——但不能简单 focusable:false(会复发 #545 的 WS_EX_NOACTIVATE 拖动不可靠),可考虑仅在探测到全屏前台期间临时 setFocusable(false)/暂停命中层、退出全屏后恢复,把 #545↔#538 的张力收敛到「仅全屏期间让步」。优先腿1(reporter 已附可用补丁可作起点),腿2按真机拖动回归结果决定深度。务必加单测覆盖「探测到全屏→watchdog tick 不调 setAlwaysOnTop」分支,并保留现有分区顺序/常量导出测试不破。"
+        }
+      },
+      {
+        "title": "topmost 看门狗(5s)+ guardAlwaysOnTop 钩子无前台/全屏判定,无条件把桌宠重置回 pop-up-menu 顶层",
+        "file": "src/topmost-runtime.js:185",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "relatedIssue": "#538",
+        "symptom": "全屏应用运行时桌宠不停地把自己抢回最顶层:看门狗每 5 秒一次,且只要 z-order 一变(always-on-top-changed)guardAlwaysOnTop 就立刻再 setAlwaysOnTop(true)+1px 位移强刷一次,持续干扰全屏前台窗。这是 #538 周期性抢焦点的『机制那一半』。",
+        "whyWindowsSpecific": "整段 startTopmostWatchdog 一上来 `if (!isWin) return`(line 186),reassertWinTopmost 同样 `if (!isWin) return`(line 55),guardAlwaysOnTop `if (!isWin...) return`(line 152)——全是 Windows 专属路径,用的是 Windows 的 setAlwaysOnTop(true,\"pop-up-menu\")=SetWindowPos(HWND_TOPMOST)。主进程里全局 grep 不到任何 GetForegroundWindow/全屏前台窗检测(focus.js 里的 GetForegroundWindow 只用于终端聚焦确认,不喂给 z-order),所以重置完全不看用户是否在全屏应用里。mac 侧用 NSWindowCollectionBehavior 共处,无此问题。",
+        "evidence": "src/topmost-runtime.js:187-189 `topmostWatchdog = setIntervalFn(() => { reassertWindowAndTaskbar(getWin()); reassertWindowAndTaskbar(getHitWin()); ...`,reassertWindowAndTaskbar(line 179-183)=`win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL); keepOutOfTaskbar(win);`,WIN_TOPMOST_LEVEL=\"pop-up-menu\"(line 7)。guardAlwaysOnTop(line 151-176):`win.on(\"always-on-top-changed\", (_e, isOnTop) => { if (isOnTop...) return; winToGuard.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL); ...applyFreshNudge(bounds)...})` —比 5s 看门狗更激进,每次掉出顶层立即反击。issue #538 reporter 明确把『hit window focusable』和『watchdog 不看前台状态』并列为 two issues in combination。两处当前代码均无修复。",
+        "confidence": "high",
+        "dimension": "zorder-taskbar",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真实存在且未修。当前 main(HEAD 7db4fa9,工作树干净)src/topmost-runtime.js 逐行核实:(1) startTopmostWatchdog (185-213) 每 TOPMOST_WATCHDOG_MS=5000ms(line 9)无条件调用 reassertWindowAndTaskbar(getWin())+reassertWindowAndTaskbar(getHitWin())(188-189);reassertWindowAndTaskbar(179-183)= win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)+keepOutOfTaskbar,WIN_TOPMOST_LEVEL='pop-up-menu'(line 7)。(2) guardAlwaysOnTop(151-177) 监听 always-on-top-changed,掉出顶层(!isOnTop)即 setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)(155)+applyFreshNudge 1px 位移(143-148/165)+scheduleHwndRecovery(174)——比 5s 看门狗激进,每次掉层立刻反击。两者均 live 接线:main.js:3431-3432 对 pet window 调 guardAlwaysOnTop(win)+startTopmostWatchdog()。Windows 特有确认:三入口全 Windows 门控——startTopmostWatchdog if(!isWin) return(186)、reassertWinTopmost if(!isWin) return(55)、guardAlwaysOnTop if(!isWin...) return(152);mac 侧走 reapplyMacVisibility(62-89)用 NSWindowCollectionBehavior(mac-window.js:5-19,含 Stationary/FullScreenAuxiliary)做原生共处,无 busy reassert。无前台/全屏判定确认(已按 PR #496 教训实查):git log -S 'GetForegroundWindow' 对 topmost-runtime.js/main.js/pet-window-runtime.js 返回空=从未加入 z-order;主进程仅有的 GetForegroundWindow(focus.js:93,551)在 PowerShell 终端聚焦确认块(549-556)里,不喂 z-order。相关 commit 1177e2d 'fix: recover pet after fullscreen window switches'(经已合并 PR #271)恰恰是引入/强化这套激进恢复(applyFreshNudge/scheduleHwndRecovery)的提交——它让全屏切换后桌宠抢得更狠,而非加入『不与全屏前台争抢』逻辑。一处校正:看门狗用 setAlwaysOnTop(=SetWindowPos HWND_TOPMOST)只重置 z-order band,本身不调 SetForegroundWindow 抢键盘焦点,故『抢焦点』对纯 z-order 腿略有夸张;但无条件重置确实周期性盖到全屏前台窗(用户可见的闪/盖症状真实),符合 #538 reporter 把『hit window focusable』与『watchdog 不看前台』并列为 two issues in combination。维持 high(active reporter 投诉),仅标注 focus vs z-order 区别。",
+          "fixSketch": "给 reassert 加前台门控:在 reassertWindowAndTaskbar 与 guardAlwaysOnTop 的 reassert+nudge 之前,加 Windows 全屏前台探针——koffi FFI GetForegroundWindow+GetWindowRect 对比所在 monitor 全屏边界,或用 SHQueryUserNotificationState 判 QUNS_RUNNING_D3D_FULL_SCREEN/QUNS_PRESENTATION_MODE;当独占全屏应用占据前台时跳过重置与 1px 位移。粗粒度兜底:桌宠被完全遮挡时(window blur/powerMonitor 信号)暂停或降频看门狗。必须按仓库硬件验证规则在真 Windows 机验证(prevention/gating 两腿,且与 #538 另一半 hit window focusable 一起评估,避免只修一半)。"
+        }
+      },
+      {
+        "title": "设置面板尺寸预览期间,5s topmost 看门狗会把桌宠重新插到设置窗之上,遮住正在拖的尺寸滑杆",
+        "file": "src/pet-window-runtime.js:693",
+        "severity": "low",
+        "kind": "fragility",
+        "relatedIssue": "#176",
+        "symptom": "在 Windows 上拖设置面板的『尺寸』滑杆做实时预览时,若拖动持续超过 ~5 秒(或恰好跨过看门狗 tick),桌宠会闪到设置窗上方挡住滑杆/预览区。点击仍能落到滑杆(因为预览期 hitWin 被设了 setIgnoreMouseEvents(true)),所以是纯视觉遮挡,不影响操作。",
+        "whyWindowsSpecific": "beginSettingsSizePreviewProtection 整段在 `if (!isWin) return`(line 695)之后才执行,把设置窗 setAlwaysOnTop(true, topmostLevel)+moveTop() 抬到和桌宠同一 pop-up-menu 顶层带——但 moveTop() 只调一次。Windows 的 setAlwaysOnTop(true,level)=SetWindowPos(HWND_TOPMOST) 把窗口插到 topmost 带顶部,所以『最后一个调用的赢』。预览期看门狗(topmost-runtime.js:188-189)随后 reassert 桌宠+hitWin 到同一层,就把设置窗压到下面。预览不会暂停看门狗(没有 stopTopmostWatchdog 调用)。mac 设置窗用其它机制,无此层级带竞争。",
+        "evidence": "src/pet-window-runtime.js:693-711 beginSettingsSizePreviewProtection:`settingsWindow.setAlwaysOnTop(true, topmostLevel); if (...moveTop) settingsWindow.moveTop();` 且 `hitWin.setIgnoreMouseEvents(true)`(line 709,这正是点击仍可达的缓解)。预览生命周期由 settings-size-preview-session.js 控制,begin 在滑杆抓取(settings-size-slider.js:89)、end 在释放(:139),可持续整段拖动。topmost-runtime.js:185-212 看门狗每 watchdogMs(默认 5000)无条件 reassertWindowAndTaskbar(getWin())/getHitWin(),期间不感知预览态。属设计取舍下的可见性脆弱点,非功能性 bug。",
+        "confidence": "medium",
+        "dimension": "zorder-taskbar",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真问题,Windows 特有,未修复。机制在当前代码逐行成立:(1) beginSettingsSizePreviewProtection 只把设置窗抬到 pop-up-menu 顶层一次——pet-window-runtime.js:701-702 的 setAlwaysOnTop(true, topmostLevel)+moveTop() 都是单发,没有任何后续 reassert。(2) topmost 看门狗无条件常驻:main.js:3432 调 startTopmostWatchdog() 且全仓没有任何 stopTopmostWatchdog 调用(grep 仅得定义与该单处调用),每 5000ms(TOPMOST_WATCHDOG_MS,topmost-runtime.js:9,212)经 reassertWindowAndTaskbar→win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL)(topmost-runtime.js:181,188-189)把 pet+hitWin 重插 pop-up-menu 带顶部,且完全不感知预览态(topmost-runtime.js 内无 settingsSizePreviewSyncFrozen/preview 引用)。(3) 设置窗不在看门狗保护集里(main.js:1154-1173 仅 win/hitWin/pendingPermissions/updateBubble/sessionHud/contextMenuOwner),无人替它复位;且 settings-window.js:195-207 的 temporarilyLiftSettingsWindow 是定时回落(SETTINGS_FRONT_LIFT_MS 后 setAlwaysOnTop(false)),平时设置窗是普通层级,更易被 pop-up-menu 带的 pet 压住。(4) 预览贯穿整段拖动:slider 在 pointerDown/input 开 begin、pointerUp/blur 才 end(settings-size-slider.js:181-205),轻易超 5s。Windows 特有:整段抬升逻辑在 pet-window-runtime.js:695 的 `if (!isWin) return` 之后;看门狗 topmost-runtime.js:186 亦 `if (!isWin)` 门禁;pop-up-menu 同层带碰撞+HWND_TOPMOST『最后调用者在上』为 Win 专属,mac 用 screen-saver+独立机制无此竞争。git log -S(beginSettingsSizePreviewProtection / settingsSizePreviewSyncFrozen / stopTopmostWatchdog)仅见 311692c、4ee6e2a 抽取重构与无关调参,无修复提交,无已合并 PR 引入预览感知暂停。严重度下调依据:hitWin.setIgnoreMouseEvents(true)(pet-window-runtime.js:709)使点击穿透落到滑杆,确为纯视觉遮挡不阻塞操作;需 >5s 拖动且实际重叠受时序/驱动影响(与作者 medium 置信一致)——属设计取舍下脆弱点而非功能 bug,low 合适。报告行号 693 是函数起点,真正载重在 695/701-702/709 与 topmost-runtime.js:185-212,描述准确。",
+          "fixSketch": "让看门狗在尺寸预览期不再抢 z-order,而非依赖一次性 moveTop。最小改法:预览开始时(beginSettingsSizePreviewProtection,pet-window-runtime.js:693)调 stopTopmostWatchdog(),结束时(endSettingsSizePreviewProtection)再 startTopmostWatchdog()——但需把 stopTopmostWatchdog 经 petWindowRuntime 暴露/注入。更稳妥(不停整条看门狗、保留任务栏防护):给 topmostRuntime 注入 isSettingsSizePreviewActive() 谓词,在 startTopmostWatchdog 的 tick 内当预览激活时跳过对 win/hitWin 的 reassertWindowAndTaskbar(仅跳 setAlwaysOnTop 抬升,keepOutOfTaskbar 可保留),从而让 begin 时设置窗的 pop-up-menu 抬升在整段预览内保持『最后写入者』。两种都应配合在 endSettingsSizePreviewProtection 里已有的 reassertWinTopmost()(pet-window-runtime.js:731)恢复正常 z-order。因纯视觉且低频,属可选打磨,非必修。"
+        }
+      },
+      {
+        "title": "keepSizeAcrossDisplays 把 DPI 抖动期的瞬时错误尺寸『洗白』成永久尺寸，桌宠越睡/越切屏越大（#408 修复 PR #501 未合并）",
+        "file": "src/main.js:745-756",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "symptom": "开启『跨显示器保持大小』后，电脑睡眠/唤醒、改 DPI 缩放、在不同缩放的显示器间拖动或 RDP 重连后，桌宠会自己一点点变大，且不会自我纠正；重启后仍然是被放大的尺寸，只有手动拖一次尺寸滑杆才会复位。",
+        "whyWindowsSpecific": "纯 Windows per-monitor-DPI 行为：窗口跨越/移动到不同 scaleFactor 的显示器或经历 sleep/wake DPI flux 时，Windows 发 WM_DPICHANGED，Electron 的 win.getBounds() 返回被重算过的 DIP 尺寸。代码用 setBounds(getBounds()) 这种 live 回读，在该 DPI 往返下不是幂等的，瞬时错误的 DIP 尺寸被写回并持久化。100% 缩放下不复现（PR #501 commit message 自述：scale-factor dependent, does not reproduce at 100%）。mac/Linux 无此 DPI 往返语义。",
+        "evidence": "getEffectiveCurrentPixelSize() 在 keepSize+proportional 时直接回读 live 窗口：`const bounds = getPetWindowBounds(); return { width: bounds.width, height: bounds.height };`(main.js:752-753)。display 事件同样回读 live 并写回:pet-window-runtime.js:751-757 `const size = getKeepSizeAcrossDisplays() ? { width: current.width, height: current.height } : ...; applyPetWindowBounds({ ...clamped, width: size.width, height: size.height })`；drag-end 持久化 live 尺寸:pet-interaction-ipc.js:113-119 `const size = getKeepSizeAcrossDisplays() ? { width: virtualBounds.width, height: virtualBounds.height } : getCurrentPixelSize(); ... flushRuntimeStateToPrefs()` → 写入 savedPixelWidth/Height(main.js:451-452)。修复(in-memory frozen DIP 尺寸 keepSizeFrozenPx + savedPixelWorkArea)在 c80b568/786756b，但 `git merge-base --is-ancestor` 验证两 commit 均 NOT on main，`grep keepSizeFrozenPx src/` 在当前 src 中 ABSENT。提交说明原文：『every display event re-applied the size by reading the LIVE window bounds and writing them straight back: setBounds(getBounds()). On Windows that round-trip is not idempotent across a sleep/wake DPI flux — a transiently-wrong DIP size gets laundered into a permanent one』。",
+        "relatedIssue": "#408",
+        "confidence": "high",
+        "dimension": "dpi-multimon",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真阳性,且当前 main 未修。完整 live-readback→持久化→重启仍膨胀链条逐文件核实:(1) BUG 源 — getEffectiveCurrentPixelSize 在 keepSize+proportional 时直接回读 live 窗口 `const bounds = getPetWindowBounds(); return {width,height}`(src/main.js:752-753);getPetWindowBounds 返回的就是 live `win.getBounds()`(src/pet-window-runtime.js:151);display 事件 handleDisplayMetricsChanged/handleDisplayRemoved 同样 keepSize 时回读 current 并 setBounds 写回(src/pet-window-runtime.js:751-757、773-777),applyPetWindowBounds 内部 `win.setBounds(materialized.bounds)`(:177)。(2) 持久化 — drag-end keepSize 时取 virtualBounds live 尺寸并 flushRuntimeStateToPrefs(src/pet-interaction-ipc.js:113-119),flush 把 live bounds 写入 savedPixelWidth/Height(src/main.js:442、451-452)。(3) 重启仍膨胀 — getLaunchPixelSize 在 `keepSizeAcrossDisplays && size 以 'P:' 开头` 时用持久化的 savedPixel(src/size-utils.js:56-61),故膨胀尺寸跨重启存活,只有手动拖滑杆(走 ratio 重算)才复位。(4) keepSize 关掉自纠正 — 唯一会重算回正确比例尺寸的 proportionalRecalc 被 `&& !getKeepSizeAcrossDisplays()` 显式禁掉(src/pet-window-runtime.js:755),所以开了 keepSize 才不自我纠正。Windows 特有成立:整条 setBounds(getBounds()) 往返只在 per-monitor-DPI 的 WM_DPICHANGED 重算下非幂等,mac/Linux 无此 DIP 往返。未修证据:`git merge-base --is-ancestor c80b568/786756b HEAD` 均 NOT ancestor;两 commit 仅存在于未合并分支 fix/408-size-growth-keepsize(PR #501);`grep keepSizeFrozenPx|savedPixelWorkArea src/` 当前 src 全 ABSENT;main 上唯一的 #408 commit 0547e35 是无关的眼睛追踪修复(PR #499/A-vs-B 双 bug 中的 B)。",
+          "fixSketch": "合并 PR #501(分支 fix/408-size-growth-keepsize,commits c80b568+786756b,合并前需 150% 缩放 Windows 真机验证)。核心思路:keepSize 开启时不再每次回读 live 窗口 bounds,而是把第一次确定的 DIP 尺寸冻结进一个 in-memory truth source(keepSizeFrozenPx),所有 display/drag/effective 路径改读这个冻结值而非 getPetWindowBounds().width/height;启动 clamp 用独立的 savedPixelWorkArea 当 frozen-origin 而非当前(可能已 DPI 漂移的)work area,避免把 DPI 抖动期的瞬时错误 DIP 尺寸洗白成永久值。"
+        }
+      },
+      {
+        "title": "display-metrics-changed 的桌宠几何处理无防抖，而同一处的 textScale 处理却防抖 400ms —— Windows DPI 切换/RDP 重连时桌宠会闪烁式跳动并喂大 #408",
+        "file": "src/pet-window-runtime.js:741-761",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "在 Windows 显示设置里改某显示器的缩放、插拔显示器、RDP/锁屏重连、睡眠唤醒时，由于这些事件成串爆发，桌宠会在比例模式（默认）下被反复重算尺寸/位置，出现可见的抖动、跳位、尺寸闪烁；并把瞬时错误尺寸喂给 keepSize 路径加剧 #408。",
+        "whyWindowsSpecific": "Windows 上 display-metrics-changed 在 DPI 变化/拓扑变化/RDP 重连时成 burst 到达，代码自己在相邻的 textScale 处理上写了注释承认这点(『these events arrive in bursts during reconnects』)并加了 400ms 防抖；但桌宠几何处理 handleDisplayMetricsChanged 直连无防抖。比例模式下 proportionalRecalc 恒为 true，每个 burst 事件都会无条件 applyPetWindowBounds，而 burst 期间 workArea 值是过渡态/不稳定的。mac/Linux 的 DPI burst 行为不同且本机非主要场景。",
+        "evidence": "几何 handler 直连无防抖:main.js:3434 `screen.on(\"display-metrics-changed\", () => petWindowRuntime.handleDisplayMetricsChanged())`。同一文件 textScale handler 显式防抖:main.js:3442-3451 `const reapplyTextScaleAfterTopologyChange = () => { if (textScaleTopologyTimer) clearTimeout(...); textScaleTopologyTimer = setTimeout(() => { ... applyTextScaleNow(); }, 400); }` 且注释 main.js:3440 『Debounced because these events arrive in bursts during reconnects.』。handleDisplayMetricsChanged 内 proportionalRecalc = isProportionalMode() && !getKeepSizeAcrossDisplays()(pet-window-runtime.js:755），默认 keepSize OFF + 比例模式 → 恒 true → 每个 burst 事件 `if (proportionalRecalc || ...) applyPetWindowBounds(...)`(pet-window-runtime.js:756-757) 无条件重算。函数体内无任何 timer/guard。",
+        "relatedIssue": "#408",
+        "confidence": "medium",
+        "dimension": "dpi-multimon",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "REAL but with an overstated #408 linkage; downgraded medium→low. The structural asymmetry is verbatim: the geometry handler is direct-connected with no debounce — `screen.on(\"display-metrics-changed\", () => petWindowRuntime.handleDisplayMetricsChanged())` (src/main.js:3434) — while the textScale handler on the SAME three events (display-metrics-changed/removed/added, src/main.js:3449-3451) is wrapped in a 400ms timer `reapplyTextScaleAfterTopologyChange` (src/main.js:3442-3448) with the explicit comment \"Debounced because these events arrive in bursts during reconnects.\" (src/main.js:3438-3440). In the default config (keepSize OFF), `handleDisplayMetricsChanged` computes `size = getCurrentPixelSize()` (src/pet-window-runtime.js:753), which recomputes proportionally from the LIVE workArea (getCurrentPixelSize→getPixelSizeFor→getNearestWorkArea→getProportionalPixelSize, src/main.js:740/728-737), and sets `proportionalRecalc = isProportionalMode() && !getKeepSizeAcrossDisplays()` = true, so it UNCONDITIONALLY calls `applyPetWindowBounds(...)` on every burst event (src/pet-window-runtime.js:755-757). `applyPetWindowBounds` (src/pet-window-runtime.js:169-178) has NO idempotency check — it calls `win.setBounds(materialized.bounds)` every time. There is no timer/guard anywhere in the handler (confirmed by reading the full function and grepping; tests 26/26 pass). So transient in-session jitter/flicker during a DPI/RDP/wake burst is genuinely reachable. isWindowsSpecific: the burst arrival of display-metrics-changed is Windows-characteristic and the codebase asserts exactly this in the adjacent comment. alreadyFixedOnMain=false: the two merged #408 commits c80b568 (\"freeze keep-size pixel dimensions across DPI flux\") and 786756b explicitly scope to keepSize-ON only — their `keepSizeFrozenPx`/`getEffectiveCurrentPixelSize` guard is gated behind `keepSizeAcrossDisplaysCached &&` (src/main.js:747) and the commit message states \"default config (keepSize OFF) unchanged\"; the geometry handler never got a debounce. HOWEVER the finding's claim that this \"feeds the wrong size into keepSize aggravating #408\" is INACCURATE for the default config: with keepSize OFF the transient size does NOT persist — `getLaunchPixelSize` returns the fresh proportional recompute when keepSize is OFF (src/size-utils.js:56-62, `if (!prefs.keepSizeAcrossDisplays) return fallbackSize`) and getCurrentPixelSize recomputes from workArea ignoring saved px, so it self-corrects on the next stable event and on relaunch. That makes it transient cosmetic jitter (kind=fragility), not a permanent-growth #408 amplifier — hence low, not medium.",
+          "fixSketch": "Mirror the textScale pattern: route handleDisplayMetricsChanged through a short debounce (reuse the existing 400ms topology timer or a dedicated one) so a burst collapses to one recompute on the settled workArea, e.g. `let geomTopologyTimer=null; const onMetrics=()=>{ if(geomTopologyTimer)clearTimeout(geomTopologyTimer); geomTopologyTimer=setTimeout(()=>{geomTopologyTimer=null; petWindowRuntime.handleDisplayMetricsChanged();},400); }; screen.on(\"display-metrics-changed\", onMetrics);` (src/main.js:3434). Optionally add a cheap idempotency guard inside applyPetWindowBounds (skip setBounds when materialized bounds equal current getBounds) at src/pet-window-runtime.js:174 to kill redundant re-applies generally. Keep display-removed/added on their existing immediate handlers if instant reflow on add/remove is desired, or debounce those too for full burst coverage. Default-config only; keepSize-ON path is already frozen so unaffected. Cosmetic-only, so gate on a real Windows DPI/RDP smoke before merge."
+        }
+      },
+      {
+        "title": "启动恢复期反复跑 Get-CimInstance Win32_Process 全量枚举(含 .CommandLine),Windows 上是已知慢路径",
+        "file": "src/state.js:1890-1902",
+        "severity": "low",
+        "kind": "known-unfixed",
+        "symptom": "clawd 启动后若一直没有任何 agent 会话连上(纯空闲),最长 5 分钟内每 10 秒 spawn 一次 powershell 跑 Get-CimInstance Win32_Process 全量进程枚举并访问 .CommandLine。在进程很多/很忙的 Windows 机器上,这是 WMI 公认最重的查询之一,带来周期性 CPU/IO 抖动(对应 #350 PID 解析性能)。",
+        "whyWindowsSpecific": "仅 win32 分支走 Get-CimInstance Win32_Process(state.js:1890 if process.platform==='win32');其他平台走轻量 pgrep。Win32_Process 全量枚举 + CommandLine 属性在 Windows 上需对每个进程读 PEB,是平台特有的慢点。",
+        "evidence": "state.js:1890-1902 win32 分支: $match = Get-CimInstance Win32_Process | Where-Object { $names -contains $_.Name -or ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*') }(无 -Filter,全量枚举)。调用点 state.js:1741-1748: if (startupRecoveryActive && sessions.size === 0) { detectRunningAgentProcesses(...) };cleanStaleSessions 由 setInterval(cleanStaleSessions, 10000)(state.js:1912)每 10s 触发。startupRecoveryActive 在收到任意真实会话事件时立即清零(state.js:1236-1239),且有 5 分钟硬上限(STARTUP_RECOVERY_MAX_MS=300000,state.js:138)。_detectInFlight 只防重叠不防重复(state.js:1876-1878)。缓解:只在零会话且恢复窗口内触发,有界(~30 次),CommandLine 是一次 WMI 批量取非 N 次——故定 low。",
+        "confidence": "high",
+        "relatedIssue": "#350",
+        "dimension": "native-api",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实存在且未修,确为 Windows 特有,严重度 low 维持。代码核实(当前 HEAD=fix/completion-happy-short-replies,比 main 仅多一条 short-reply commit,该路径与 main 完全一致——已用 `git show main:src/state.js` 第1795行确认): src/state.js:1890-1902 仅 win32 分支跑 `powershell.exe -Command \"...Get-CimInstance Win32_Process | Where-Object {...}\"`,**无 -Filter**=全量进程枚举,且对 node.exe 比较访问 `$_.CommandLine`(每进程读 PEB);其他平台走轻量 pgrep(state.js:1904)→ isWindowsSpecific=true。递归调用点 state.js:1741 `if (startupRecoveryActive && sessions.size === 0) detectRunningAgentProcesses(...)`,在 cleanStaleSessions 内;cleanStaleSessions 由 setInterval(...,10000)(state.js:1912)、boot 无条件 startStaleCleanup()(main.js:3407)驱动;5min 硬上限 STARTUP_RECOVERY_MAX_MS=300000(state.js:138)+ 任意真实会话事件即清零(state.js:1236-1239);_detectInFlight(state.js:1876)只防重叠不防重复——发现描述的机制逐条对上。alreadyFixedOnMain=false:`git log -S \"Get-CimInstance Win32_Process\"` 仅命中 e1c2489 `fix(state): replace wmic startup-recovery probe with PowerShell`(hwasowl 2026-05-12,已确认 IS ancestor of HEAD 且在 main),该 commit 是这段代码的**来源**——把 Win11 24H2 上 ENOENT 的旧 wmic 换成 Get-CimInstance 并刻意沿用同样的无过滤 Where-Object,属修正性引入而非性能修复;此后无任何 commit 加 -Filter 减负,故重查询形态正是当前 intended 代码,确\"known-unfixed\"。严重度仍 low:递归轮询的前置门是 startupRecoveryActive=true,而它仅在 main.js:992-999 的 boot 一次性探针(启动后5s)真发现有 agent 进程在跑且无会话/无DND 时才被 armStartupRecovery 点亮——所以\"纯空闲、零 agent\"永不触发;最坏需 boot 时有真 agent 进程在跑却始终不产生会话事件,且 5min 硬顶 + 首个真会话事件即清零 → 至多约30次、每次一发批量 WMI(非N次逐进程 spawn)。窄但真实、Windows特有的周期性重WMI查询,low 恰当,对应 #350。非假阳性、非已修、非不可达。",
+          "fixSketch": "把无过滤的 `Get-CimInstance Win32_Process | Where-Object {...}` 改成服务端 WQL -Filter,使 WMI 在常见情形下不再物化/序列化全部进程及其 CommandLine:对固定 exe 名集合用 `Get-CimInstance Win32_Process -Filter \"Name='claude.exe' OR Name='codex.exe' OR ...\"`,仅对 node.exe+*claude-code* 这一例再单独窄查 `-Filter \"Name='node.exe'\"` 后只在这批上读 CommandLine。或因结果只是 startup-recovery 的布尔,用更轻的 `Get-Process -Name <names>`(不取 CommandLine)覆盖除 node/claude-code 外的全部 agent,node 那例作次级窄查。任一方案都能去掉全表枚举+逐进程 PEB 读。"
+        }
+      },
+      {
+        "title": "SetConsoleOutputCP(65001) 改的是父控制台的共享码页,崩溃/被 kill 时不会恢复",
+        "file": "src/main.js:172-193",
+        "severity": "low",
+        "kind": "fragility",
+        "symptom": "npm start 从 PowerShell/cmd 启动时,clawd 把附着的共享控制台码页改成 UTF-8(65001)。正常退出会还原(will-quit/exit 钩子),但若 clawd 崩溃或被 SIGKILL,父控制台被永久留在 UTF-8,之后该终端里其它程序输出非 ASCII 可能乱码,直到用户 chcp 或重开终端。仅开发态(npm start)受影响;打包的 GUI 子系统无控制台,该调用是 no-op。",
+        "whyWindowsSpecific": "整段被 if (isWin) 门控(main.js:172),SetConsoleOutputCP/GetConsoleOutputCP 是 Windows 控制台 API;修改共享父控制台状态、子进程退出后不自动回滚是 Windows 控制台模型特有行为。",
+        "evidence": "main.js:172-193: if (isWin) { ... const setConsoleOutputCP = kernel32.func('bool __stdcall SetConsoleOutputCP(uint wCodePageID)'); const previousOutputCP = getConsoleOutputCP(); if (setConsoleOutputCP(65001) && previousOutputCP && previousOutputCP !== 65001) { ... _restoreConsoleOutputCP = () => { ...; setConsoleOutputCP(previousOutputCP); }; app.once('will-quit', _restoreConsoleOutputCP); process.once('exit', _restoreConsoleOutputCP); } }。还原仅挂在 will-quit/exit——硬崩溃/SIGKILL 不触发。restored 布尔已正确防重复还原(main.js:182-184)。代码注释明确这是开发态便利、非致命,故定 low。",
+        "confidence": "high",
+        "relatedIssue": "none",
+        "dimension": "native-api",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实存在,非假阳性,严重度 low 准确。代码在 src/main.js:171-193(行号与发现完全一致):if (isWin) 门控(:172)内,SetConsoleOutputCP(65001) 后只把还原挂到 app.once(\"will-quit\")(:186)和 process.once(\"exit\")(:187)。实测验证(Node v24.16.0):process.once(\"exit\") 在 SIGKILL(kill -9)和默认 SIGTERM(kill -15)下均不触发,而正常退出会触发(对照用例确认测试有效)→ 硬崩溃/被 kill 时父控制台被永久留在 UTF-8(65001),原码页(如 CP936)不还原。isWindowsSpecific=真:SetConsoleOutputCP/GetConsoleOutputCP 是 Windows kernel32 控制台 API,整块 isWin 门控;\"共享父控制台在子进程死后仍残留\"是 Windows 控制台附着模型特有,mac/Linux 无此行为。alreadyFixedOnMain=否:git log -S \"SetConsoleOutputCP\" 与 -S \"_restoreConsoleOutputCP\"(src/main.js)只返回单一引入提交 7f40e9b(#332),git log -L 171,193 显示此后无修改;grep 全 src/ 的 SIGTERM/SIGINT/uncaughtException 命中全在无关文件(telegram-approval-sidecar.js、remote-ssh-*),无一还原码页;无开放分支触及。当前 HEAD(7db4fa9)与 main 该块一致、工作树干净。severity low 准确:仅开发态(npm start from cmd/PowerShell)受影响,打包 GUI 无控制台=no-op;症状是终端 mojibake 直到 chcp/重开,非致命;restored 布尔(:180-184)正确防重复还原。这是真实、未修、确为 Windows 特有的 low 级 fragility。",
+          "fixSketch": "补 SIGTERM/SIGINT(可选 SIGHUP)处理器:调用 _restoreConsoleOutputCP() 后再 re-exit,可覆盖优雅终止路径;但 SIGKILL 本质不可捕获,任何 handler 都无法完全堵住该缺口(这正是它只配 low、不值得大动的原因)。更根本的视角:这是\"修改共享父控制台状态\"的固有局限,最稳的缓解是不依赖 cleanup(文档说明开发用户硬 kill 后可能需 chcp 还原),或把输出 spawn 进独立子控制台。鉴于严重度,保持现状也可接受。"
+        }
+      },
+      {
+        "title": "Launching a Claude session blocks the Electron main process for up to 5s on a synchronous `where claude` PATH probe",
+        "file": "src/launch-claude.js:341",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "After the user picks New Session (or drops a folder that triggers a Claude launch), the whole pet can freeze for up to 5 seconds — renderWin stops animating, hitWin stops responding to drags/clicks — before the terminal opens or the failure dialog appears. On machines where the probe stalls (slow/network PATH, AV intercepting process spawn) the freeze hits the full 5s timeout on every launch.",
+        "whyWindowsSpecific": "`launchClaudeSession` is async but calls `findClaudeCmd(plat)` synchronously (line 341), and findClaudeCmd runs `execFileSync('where', ['claude'], {timeout: 5000})` (launch-claude.js:100-105) on the main thread. The POSIX branch uses `which`, which returns after the first hit; Windows `where.exe` enumerates EVERY PATH entry (including UNC/network drives) and is commonly intercepted by AV on process creation, so the 5s ceiling is realistically reachable on Windows specifically. It is reached from a menu click on the Electron main process (main.js:2867 -> runLaunchClaudeSession at main.js:2717), so the event loop is blocked, not a worker.",
+        "evidence": "launch-claude.js:335 `async function launchClaudeSession(...)`, then line 341 `const claudePath = _findClaudeCmd(plat);` (synchronous, not awaited). findClaudeCmd at launch-claude.js:99-105: `const cmd = plat === 'win32' ? 'where' : 'which'; const out = _execFileSync(cmd, ['claude'], { encoding: 'utf8', timeout: 5000, windowsHide: true });` — execFileSync is a blocking call. The same module uses async spawn for tryLaunch (line 69), so this sync probe is the only event-loop stall in the launch path.",
+        "confidence": "high",
+        "relatedIssue": "none",
+        "dimension": "launch-terminal",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "Real, unfixed, but the symptom over-claims its trigger surface so I dropped medium→low.\n\nCONFIRMED REAL: launch-claude.js:341 `const claudePath = _findClaudeCmd(plat);` is called synchronously (un-awaited — findClaudeCmd is a plain sync fn) inside `async function launchClaudeSession` (line 335). findClaudeCmd at launch-claude.js:99-105 runs `_execFileSync(cmd, [\"claude\"], {timeout: 5000, windowsHide: true})` — execFileSync is blocking by Node's API contract; 5000ms is the ceiling (line 103). It executes on the Electron main-process event loop: menu.js:425/431 (click) → ctx.newSessionWithFolder/newSessionInCurrentDir (main.js:2868/2906) → runLaunchClaudeSession (main.js:2717) → launchClaudeSession (main.js:2720) → findClaudeCmd (launch-claude.js:341). No utilityProcess/Worker/worker_threads anywhere in the launch path (grep empty), so the loop really is blocked, not offloaded.\n\nWINDOWS ASYMMETRY HOLDS: launch-claude.js:100 `plat === \"win32\" ? \"where\" : \"which\"`. `where.exe` walks all PATH entries (incl. UNC/net drives) and is AV-intercepted on process creation; `which` returns on first hit. So the 5s worst case is realistically a Windows scenario — though note the stall mechanism itself is cross-platform (macOS/Linux block too, just shorter).\n\nNOT FIXED ON MAIN: `git log -S \"execFileSync\"` and `git log -S \"5000\"` on launch-claude.js show the probe untouched since the feature's birth commit f2b8706; the newer commits (caa4e13, ede38ac) only reworked terminal-candidate/shim resolution, not the sync probe. Not a repeat of the PR #496 mis-call — I checked history, the probe is genuinely still here.\n\nWHY SEVERITY DROPPED: the finding's symptom says dropping a folder hits this probe — FALSE. The drop path (pet-interaction-ipc.js:148-166, #459) calls openTerminalAt(dir), which uses buildShellTerminalCandidates and never touches findClaudeCmd (no claude probe at all — opens a bare shell). Only the explicit 'New Session' menu reaches the probe. Combined with: hot path (claude on PATH) returns fast, the full 5s only on cold/AV/network-PATH worst case, and it's a one-shot freeze on a deliberate user action (not background/recurring) → low, not medium.",
+          "fixSketch": "Move the PATH probe off the main thread. Cheapest: make findClaudeCmd async and replace execFileSync('where'/'which', ...) with the async execFile wrapped in a Promise (the module already uses async spawn in tryLaunch, so the pattern exists), then `await _findClaudeCmd(plat)` at launch-claude.js:341. Keep the 5000ms timeout but as the async-execFile timeout so the event loop stays free during the wait — renderWin keeps animating and hitWin keeps handling drags. Optionally also drop the timeout to ~1500ms and cache the resolved path across launches so repeat New-Session clicks don't re-probe."
+        }
+      },
+      {
+        "title": "wt.exe launch candidate relies on Windows Terminal's post-`--` re-tokenization that no passing test exercises",
+        "file": "src/launch-claude.js:200",
+        "severity": "medium",
+        "kind": "design-tradeoff",
+        "symptom": "On some Windows Terminal versions/configs the first New-Session attempt (wt.exe) may open a tab that fails to start `claude` (mangled path/args) or lands wrong; the user then silently falls through to the cmd.exe fallback tab. The wt path can also misbehave for shim paths with spaces/parens depending on how wt re-quotes them.",
+        "whyWindowsSpecific": "This is purely the Windows branch of buildTerminalCandidates. Args are passed with `windowsVerbatimArguments: true`, so Node joins them unquoted and Windows Terminal then re-tokenizes everything after `--` and re-quotes only space-containing tokens. The `call \"<path>\"` prefix mitigates cmd's leading-quote stripping, but the code itself comments the wt re-tokenization layer 'still needs real-Windows validation', and the only real-Windows test (launch-claude.test.js:301, skipped off-Windows) exercises the cmd.exe SIDE ONLY (drops `--`, swaps /k->/c) and explicitly states it 'does NOT exercise Windows Terminal's own commandline re-tokenization/re-quoting'.",
+        "evidence": "launch-claude.js:200-205 wt candidate: `args: ['--', 'cmd.exe', '/d', '/v:off', '/k', 'call', quoteCmdExecutablePath(claudePath), ...claudeArgs], extraOpts: { shell: false, windowsVerbatimArguments: true }`. Comments at launch-claude.js:191-199 acknowledge 'Windows Terminal re-tokenizes the args after `--`... we can't rely on our own quotes surviving verbatim' and '...This path still needs real-Windows validation.' Test-gap note confirmed at launch-claude.test.js:331-336. Impact is bounded because wt is tried first and cmd.exe (validated) is the next fallback.",
+        "confidence": "medium",
+        "relatedIssue": "none",
+        "dimension": "launch-terminal",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实存在,但属于代码里如实标注的设计权衡,非疏漏型 bug。逐行核对当前 main:(1) wt 候选与发现描述一字不差 — src/launch-claude.js:200-205 即 `{bin:'wt.exe', args:['--','cmd.exe','/d','/v:off','/k','call', quoteCmdExecutablePath(claudePath), ...claudeArgs], extraOpts:{shell:false, windowsVerbatimArguments:true}}`。(2) 注释承认 wt 在 `--` 之后会重新分词、只对含空格 token 重新加引号,且 launch-claude.js:199 明写 \"This path still needs real-Windows validation.\"。(3) 测试缺口属实且自述:test/launch-claude.test.js:333-336 明确该回归 \"does NOT exercise Windows Terminal's own commandline re-tokenization/re-quoting\",并在 :336 用 `wt.args.slice(1)` 砍掉 `--`、把 post-`--` token 直接喂给 cmd.exe,完全绕过 wt 分词器 — 故 wt 这条腿确实零通过性测试覆盖。Windows 特异性:整段在 src/launch-claude.js:175 的 `plat==='win32'` 分支内。是否已修:`git log -S` 证实该 args 数组与 windowsVerbatimArguments 由 caa4e13(=已合并 PR #438,v0.10.0 发布,见 docs/releases/release-v0.10.0.md:33)引入,之后唯一改动 915f638(#459)只加了 openTerminalAt/macOS cd,未动 wt 路径;无任何 open/merged PR 处理此重分词问题 — 已照 PR #496 教训实查,确认未被悄悄修掉。降severity理由:`call \\\"<path>\\\"` 前缀是对两个已知 hazard(wt 重引号 + cmd /K 吃首引号)的健全缓解(命令永不以引号开头),内层 argv 只有 `--resume <已 allow-list 的 id>` 可控(buildClaudeArgs 在 :158 校验),无注入面;且 cmd.exe 这条已验证的回退就排在 wt 之后。发现里\"silently falls through to cmd.exe\"一句机制描述略有偏差:tryLaunch(src/launch-claude.js:57-92,注释明示)在 wt.exe 一 spawn 就 resolve ok:true,不管内层 claude 是否起来,所以 wt 开了坏 tab 时循环会停在 wt(返回 terminal:'wt.exe')、并不会回退到 cmd.exe — 真实失败态是\"死/错 tab 且无回退\",而非静默回退,残余风险因此比发现描述略重,但仍有界(仅特定 wt 配置下的启动外观失败,无安全后果)。综合=如实标注、有界、不可利用的未上真机验证路径,low 比 medium 更贴切。",
+          "fixSketch": "两条腿,任选其一或并用:(1) 关闭测试缺口(最直接)—— 在 test/launch-claude.test.js 的 win32-only 块里加一个真实 `wt.exe` 启动用例:spawn `wt.exe -- cmd.exe /c call \"<带空格与括号的 shim 路径>\" --resume safe_id`,让内层 echo-argv.cmd 把收到的 argv 写到临时文件,再断言文件内容==期望 argv,以此真正穿过 wt 的 post-`--` 重分词/重引号层(现有 :301 用例只验了 cmd.exe 那侧)。(2) 消除对 wt 重分词的依赖(更稳)—— 改用 Windows Terminal 的 `wt.exe new-tab` 子命令并对每个含空格/特殊字符的 token 用 wt 自己的转义规则(`;` 需转义、引号规则与裸 `--` 不同),或退一步直接把 wt 这条腿降级/移除、首选已验证的 cmd.exe 路径(代价:丢掉\"优先开 Windows Terminal tab\"的体验)。另可顺手修正机制认知:若想让坏 tab 能回退,需让 tryLaunch 不止观测 spawn,但 detached+stdio:ignore 下无法观测内层进程,故现实只能靠\"把 argv 喂对\"而非回退兜底 —— 这进一步说明缓解正确性必须靠真机验证而非回退。两者都务必在真实 Windows + Windows Terminal 上验证后再动(参见仓库\"真机验证\"教训)。"
+        }
+      },
+      {
+        "title": "renderer/hitWin 崩溃恢复无 crash-loop 防护:Windows 上 #530 类启动崩会无限崩→reload→崩死循环",
+        "file": "src/main.js:3422",
+        "severity": "high",
+        "kind": "fragility",
+        "relatedIssue": "#530",
+        "symptom": "在会让 renderer 启动即崩的 Windows 环境(虚拟显示软件 Honor/IddDesk 注入 DLL 被 code-integrity 拒、或 0x80000003 启动崩),桌宠永远起不来,而且后台进入紧凑的 崩溃→reload→再崩 死循环:持续吃 CPU、日志被 'Renderer crashed' 刷屏、风扇狂转,且永远不会停下来自救,用户只能强杀进程。hitWin(命中层)同样会陷入该循环,在 Windows 上 hitWin 是 focusable:true,反复 reload 还会反复抢/丢焦点。",
+        "whyWindowsSpecific": "恢复机制本身是为跨平台的 <object> SVG 文档抖动偶发崩溃设计的(那种崩溃 reload 一次就好)。但 #530 的崩因是 Windows 特有且确定性复发的——注入 DLL 的 code-integrity 拒绝 / 该机器 GPU 栈问题在每次 reload 后立刻再次触发,于是 reload 永远救不回来,只会无限循环。mac/Linux 上没有 RendererCodeIntegrity 强签名校验,不会出现这种确定性复发崩溃。",
+        "evidence": "src/main.js:3422-3429 win.webContents.on('render-process-gone', (_event, details) => { safeConsoleError('Renderer crashed:', details.reason); setLowPowerIdlePaused(false); petWindowRuntime.setDragLocked(false); idlePaused=false; mouseOverPet=false; petWindowRuntime.reloadWindowWebContents(win); }) —— 无 reload 计数、无指数退避、无时间窗,直接无条件 reload。hitWin 路径同样:main.js:3337-3340 onRenderProcessGone:(details,ownedHitWin)=>{ safeConsoleError('hitWin renderer crashed:'); petWindowRuntime.reloadWindowWebContents(ownedHitWin); },底层 pet-window-runtime.js:571-577 默认分支也是裸 reloadWindowWebContents(hitWin)。reloadWindowWebContents(pet-window-runtime.js:31-43)只做了 isDestroyed 空安全检查,不防循环。git log 确认引入此机制的 commit 149cf59『guard reload after renderer crash』只是把 win.webContents.reload() 换成空安全的 reloadWindowWebContents,从未加过循环防护。全仓 grep crashCount/crashLoop/reloadCount/backoff 在 pet 窗口路径下为空。",
+        "confidence": "high",
+        "dimension": "renderer-crash",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "REAL, not fixed on main (HEAD 0dec5f8). The crash-recovery handlers reload the renderer with zero rate-limiting. renderWin: src/main.js:3422-3429 `win.webContents.on(\"render-process-gone\", ...)` calls `petWindowRuntime.reloadWindowWebContents(win)` unconditionally (no counter/window/backoff). hitWin: src/main.js:3337-3340 onRenderProcessGone → `reloadWindowWebContents(ownedHitWin)`, and the default branch src/pet-window-runtime.js:571-577 is also a bare reload. `reloadWindowWebContents` (src/pet-window-runtime.js:31-43) only does isDestroyed/null safety, then `contents.reload()`. grep for crashCount|crashLoop|reloadCount|backoff|lastCrash|tooManyCrashes in the pet-window path = empty (backoff exists only in telegram-approval-sidecar.js / remote-ssh-runtime.js, unrelated). So a renderer that crashes on every load → unbounded crash→reload→crash loop (pegged CPU, log spam, no self-recovery). NOT fixed: `git log -S reloadWindowWebContents` yields only 149cf59 \"guard reload after renderer crash\", whose full diff merely swaps win.webContents.reload() → null-safe reloadWindowWebContents — it adds NO loop protection; no app-level render-process-gone/child-process-gone limiter exists. Windows-specific escalation is accurate: the unbounded-reload code is generic, but a DETERMINISTICALLY re-crashing renderer needs a deterministic cause, and #530's causes (RendererCodeIntegrity rejecting injected DLLs / broken Win GPU stack) are Windows-only — mac/Linux have no MS-signed renderer enforcement so the <object>-churn crash this was built for recovers in one reload. hitWin is focusable on Windows (src/pet-window-runtime.js:545 `focusable: !isLinux`), so its reload loop also thrashes focus, as claimed. Severity high (not critical): needs the deterministic-crash precondition, so clean machines are unaffected, but when triggered the pet is permanently stuck with pegged CPU and no escape but a force-kill.",
+          "fixSketch": "Add a sliding-window crash-rate guard shared by both renderWin and hitWin recovery paths. Track reload timestamps per window; if N reloads occur within T seconds (e.g. >=5 within 30s), stop auto-reloading that window, log once (\"renderer crash loop detected; giving up to avoid CPU spin\"), and surface a one-time tray/notification so the user knows the pet is down instead of silently looping. Optionally add exponential backoff between reloads (like remote-ssh-runtime.js BACKOFF_SCHEDULE_MS) before the hard give-up, and reset the counter once a load succeeds (did-finish-load). Implement inside reloadWindowWebContents or a thin wrapper in pet-window-runtime.js so both main.js:3428 and the hitWin default branch (pet-window-runtime.js:576) inherit it."
+        }
+      },
+      {
+        "title": "#530 的修复补丁从未提交进当前代码:Windows renderer 启动崩零缓解,且原计划用的 RendererCodeIntegrity 开关在 Electron 41 已是死开关",
+        "file": "src/main.js:134",
+        "severity": "medium",
+        "kind": "known-unfixed",
+        "relatedIssue": "#530",
+        "symptom": "用户报告的 Windows renderer 启动崩 0x80000003 在当前代码里没有任何缓解措施:既没有禁 sandbox/code-integrity 的命令行开关,也没有 windows-renderer-code-integrity.js 模块。受影响用户(干净 Windows 机复现不了,但装了虚拟显示/注入类软件的机器会中)桌宠完全无法启动。",
+        "whyWindowsSpecific": "RendererCodeIntegrity(强制 renderer 只加载微软签名模块)是 Windows 独有的 Chromium 安全特性;mac/Linux 无此机制。第三方 DLL 注入(虚拟显示软件、输入法、杀软)只在 Windows 上会因该校验导致 renderer 进程拒绝启动。",
+        "evidence": "find/grep 全仓:无 windows-renderer-code-integrity.js 文件(任务描述里『若存在』——不存在);grep -rIl 'CodeIntegrity|third-party-modules|RendererCodeIntegrity' src/ 命中为空;git log --all -S 'RendererCodeIntegrity' / -S 'third-party-modules' 均无任何提交记录(补丁始终未 commit)。main.js 全文只有一处 appendSwitch:line 134 app.commandLine.appendSwitch('autoplay-policy','no-user-gesture-required'),无 --allow-third-party-modules、无 --disable-features=RendererCodeIntegrity、无 --no-sandbox。package.json:176 electron ^41.0.2(已装 41.0.2 = Chromium ~146),按记录 RendererCodeIntegrity feature 在 Chromium 146 已被移除,即便补丁提交了 --disable-features=RendererCodeIntegrity 也是 no-op;stock Electron 对受 sandbox 的 renderer 注入无解。",
+        "confidence": "high",
+        "dimension": "renderer-crash",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "独立核实通过,发现的事实证据全部成立(非假阳性、非已修)。当前 main:(1) src/windows-renderer-code-integrity.js 不存在(ls 报 No such file);(2) grep -rI 'CodeIntegrity|third-party-modules|RendererCodeIntegrity|disable-features|no-sandbox|allow-third' src/ 命中为空;(3) git log --all -S 对 RendererCodeIntegrity / third-party-modules / windows-renderer-code-integrity 三个串在所有分支均无任何提交记录;(4) src/main.js 全文唯一的 app.commandLine.appendSwitch 在 main.js:134 = ('autoplay-policy','no-user-gesture-required'),无 --no-sandbox / --disable-features=RendererCodeIntegrity / --allow-third-party-modules;(5) pet-window-runtime.js:450 的 webPreferences 没有 sandbox:false,renderer 默认走沙箱;(6) package.json:176 electron ^41.0.2,node_modules/electron 实装 41.0.2(=Chromium 146);(7) gh issue 530 仍 OPEN。我特意按 PR #496 教训用 grep+git log -S+全仓 sweep 实查未仅凭记忆。全仓另有 3 处 --no-sandbox 命中(hooks/shared-process.js:393 给 Node 子进程、test/shared-process.test.js:307 对应测试、.github/workflows/wayland-smoke.yml:69 Linux CI AppImage)全部与 Windows renderer 无关,排除。结论:reporter 报的 0x80000003(STATUS_BREAKPOINT,实为 Chromium force-MS-signed 挡掉注入的非微软签名 DLL → 'Observers can only be added once!' CHECK 崩)在 shipped 代码里确无任何缓解。Windows 特有成立:MITIGATION_FORCE_MS_SIGNED_BINS / RendererCodeIntegrity 是 Windows 独有的 Chromium sandbox 机制,mac/Linux 无等价物。重要框架修正:这是『真实未修但属于有意识地待 reporter A/B 后再动』,非疏漏——团队已验证的分析(sandbox_win.cc:496 唯一门控 --allow-third-party-modules、该开关透传 GPU 不透传 renderer)结论是原计划的 --disable-features=RendererCodeIntegrity 在 Chromium 146 是死开关 no-op,且 stock Electron 对受沙箱的 renderer 无干净命令行解(reporter 真正起效的是 --no-sandbox);因此『补丁没提交』部分是正确的克制而非失职。维持 medium:真实启动级崩溃,但受影响人群窄(仅有主动注入非微软签名 DLL 的机器,如 Honor Virtual Display/IddDesk 等虚拟显示软件),且当前无干净修法,故不降为 invalid 也不升 high。",
+          "fixSketch": "不存在『干净一招修好』的方案,但可发一个『严格不劣于现状』的缓解(干净机零风险、至少修 GPU 子进程那条腿):在 main.js whenReady 之前 app.commandLine.appendSwitch('allow-third-party-modules')(禁掉 force-MS-signed,透传到 GPU 进程)。但因 reporter 已间接证 renderer 崩独立于 GPU(--disable-gpu 后 renderer 照崩),该开关大概率修不好受沙箱的 renderer——Electron 41 不把它透传给 render_process_host;唯一已知能让 renderer 活的是 --no-sandbox,而那会整体关闭 renderer 沙箱(安全降级,不应默认开)。因此正确处置仍是:等 reporter A/B(Event Viewer CodeIntegrity 日志拿被挡 DLL 名 + 关虚拟显示软件无 flag 重测)确认根因后再决定;若先发缓解,#530 措辞须写『缓解待确认』而非『已修复』。验机纪律:必须真 Windows 机(有注入源)验证,CI/代码审查不算。"
+        }
+      },
+      {
+        "title": "render-process-gone 不区分 details.reason:对 clean-exit/killed 也 reload,对 Windows 特有的 integrity-failure/launch-failed 当作可恢复崩溃处理",
+        "file": "src/main.js:3423",
+        "severity": "low",
+        "kind": "fragility",
+        "relatedIssue": "#530",
+        "symptom": "任何 renderer 退出原因(包括正常 clean-exit、被 OS killed、以及确定性复发的 integrity-failure / launch-failed)都被一视同仁地立即 reload。前者会做无谓 reload;后者(Windows 上)会和上面的死循环叠加,把本应『放弃并提示用户』的不可恢复失败当成『再试一次就好』。",
+        "whyWindowsSpecific": "details.reason 取值 'integrity-failure'(模块完整性校验失败)与 'launch-failed' 在 Windows 上由 code-integrity/注入冲突触发,属于确定性不可恢复;同样的 reason 在 mac/Linux 极少或不会出现。代码对它们和跨平台可恢复的 'crashed'(<object> 抖动)不做任何区分。",
+        "evidence": "src/main.js:3423 仅把 details.reason 传给 safeConsoleError 打日志,随后无条件 reload;无任何 if(details.reason==='crashed'/'oom') 之类分支。grep -rnIE \"reason ===|'crashed'|integrity-failure|launch-failed|clean-exit\" src/*.js 在 pet 窗口崩溃路径下零命中(focus.js:741 的 reason 是无关的 telegram 字段)。pet-window-runtime.js:571 的 hitWin 默认分支同样不读 details。",
+        "confidence": "medium",
+        "dimension": "renderer-crash",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实存在,但描述的行号/细节有偏差,且严重度的\"死循环\"论据偏推测。实查结论:\n\n1) isReal=true。两条 renderer 崩溃路径都对 details.reason 一视同仁:\n   - 主窗 renderWin:src/main.js:3422-3428 — `safeConsoleError(\"Renderer crashed:\", details.reason)` 后无条件 `petWindowRuntime.reloadWindowWebContents(win)`,无任何 reason 分支。(发现里标 3423 只点到打日志那行,真正 reload 在 3428。)\n   - hitWin:发现称走 pet-window-runtime.js:571 的\"默认分支\"不读 details——此处不准。main.js:3337 实际传了 onRenderProcessGone 回调,所以默认分支(pet-window-runtime.js:576)对真桌宠 hitWin 不会命中;但该回调本身(src/main.js:3337-3340)同样只打 details.reason 再无条件 reloadWindowWebContents,reason-盲的实质成立。\n   - 还有第三条同类无条件 reload:pet-window-runtime.js:474-477 的 `unresponsive` handler。\n   - 全仓 `grep -rnIE \"integrity-failure|launch-failed|clean-exit|killed|oom|'crashed'\"` 在崩溃路径零命中(只命中 zoom/kill 等无关项),证实确无 reason 分支。\n\n2) isWindowsSpecific=true。Electron render-process-gone 的 reason 枚举含 'integrity-failure'(文档明述 = Windows code integrity 校验失败)与 'launch-failed',这两者基本只在 Windows 出现;跨平台可恢复的 'crashed'(<object> 抖动)被同等处理。本仓正是 Electron ^41.0.2(package.json 确认)。\n\n3) alreadyFixedOnMain=false。`git log -S \"render-process-gone\"` 仅 311692c(D2 抽取重构)与 d6dab3e;该 handler 最后实质改动是 149cf59(2026-06-08 \"guard reload after renderer crash\"),但那次只在 reloadWindowWebContents 内加了 isLiveWindow/isDestroyed 兜底(pet-window-runtime.js:31-44),并未引入 reason 分支。当前 main 仍无分支。\n\n4) reloadWindowWebContents(pet-window-runtime.js:31-44)无任何节流/退避/重试计数;全仓仅 remote-ssh-runtime.js / codex-pet-importer.js 有 backoff,与崩溃 reload 无关。focus.js:741 的 reason 确为无关 SSH/telegram 字段(字符串清洗),发现对此判断正确。\n\n为何仍定 low 而非更高:发现的\"和死循环叠加\"主要是推测。按 issue-530 记忆,#530 的 integrity-failure 实际是 0x80000003 直接终止整个进程(进程已死,reload 根本转不起来,不会无限 loop);launch-failed 下紧密 reload 循环虽可能,但未经真机证实。因此这是健壮性/代码质量层面的脆弱点(无谓 reload + 对确定性不可恢复失败缺少\"放弃并提示\"),非崩溃/安全 bug,low 合适。",
+          "fixSketch": "在两处崩溃 handler(src/main.js:3422 的 renderWin、src/main.js:3337 的 hitWin 回调)统一按 details.reason 分流:对 'clean-exit'/'killed' 这类非崩溃直接 return 不 reload;对 'crashed'/'oom' 走可恢复 reload;对 Windows 的 'integrity-failure'/'launch-failed' 走\"放弃 + 提示用户/写诊断\"分支(不要无脑 reload)。同时给 reloadWindowWebContents 加一个短窗口内的崩溃计数/退避(例如 N 次/60s 后停手并提示),把 unresponsive(pet-window-runtime.js:474)一并纳入。注:integrity-failure 在 #530 场景实际会整进程退出,reload 本就无意义,这条分支主要是语义正确与日志清晰,不必指望它\"修好\"#530。"
+        }
+      },
+      {
+        "title": "无 GPU 进程崩溃恢复 / 无 disableHardwareAcceleration 软渲染兜底:Windows 透明置顶窗在 GPU 反复崩时无自救",
+        "file": "src/main.js:134",
+        "severity": "low",
+        "kind": "fragility",
+        "relatedIssue": "#530",
+        "symptom": "#530 报告里 renderer 崩常伴随 GPU 崩。代码没有监听 gpu-process-crashed/child-process-gone,也没有在 GPU 反复崩时退化到软渲染(disableHardwareAcceleration)。在 GPU 驱动有问题的 Windows 机器上,透明 alwaysOnTop 桌宠(强依赖 GPU 合成)可能反复闪烁/不可见,而 app 没有任何降级路径。",
+        "whyWindowsSpecific": "透明窗 + pop-up-menu 置顶层在 Windows 上由 DWM/GPU 合成驱动,driver 兼容性问题(老显卡、虚拟显示、远程桌面)是 Windows 高发区;mac CoreAnimation / Linux 合成路径不同。软渲染兜底正是针对这类 Windows GPU 问题的常见手段,此处完全缺失。",
+        "evidence": "grep -rnIE 'disableHardwareAcceleration|gpu-process-crashed|child-process-gone|in-process-gpu|disable-software-rasterizer|use-angle|setBackgroundColor' src/main.js src/pet-window-runtime.js:除 hitWin/renderWin 的 render-process-gone 外零命中;app 级别无任何 GPU 崩溃监听(grep app.on(...gpu/process-gone 为空)。main.js 仅 2 处 appendSwitch/disable(line 134 autoplay + 注释),无 GPU 相关开关。注:Electron 默认会自动重启 GPU 进程,故严重度低;但缺少软渲染降级意味着确定性 GPU 故障下无终极兜底。",
+        "confidence": "low",
+        "dimension": "renderer-crash",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实但温和的硬化缺口,非 live bug;且与 #530 的关联是误导的。逐项实查:(1) 全 src/ 零 `disableHardwareAcceleration`(switch 与 app 方法都没有);`git log -S 'disableHardwareAcceleration'/'gpu-process-crashed'/'child-process-gone' --all` 三者全空 → 从未存在、也无任何已合并 PR 修过(已用 git -S 实查,未重蹈 #496 凭记忆误判)。(2) 仅 2 处 render-process-gone 处理器:src/main.js:3422(renderWin→reload)、src/pet-window-runtime.js:571(hitWin→reload),都是 renderer 进程级,无 GPU 进程级监听。(3) main.js 唯一真实 appendSwitch 在 :134(autoplay-policy),无任何 GPU 开关(发现描述的行号/grep 结果准确)。(4) 桌宠确为 GPU 合成强依赖:src/pet-window-runtime.js:440-442(renderWin)与 :533-535(hitWin)均 transparent:true+alwaysOnTop:true,Windows 经 setAlwaysOnTop(true, topmostLevel='pop-up-menu') 由 DWM 合成 → driver 兼容问题在 Win 确属高发。isWindowsSpecific 成立(缺兜底的代码是跨平台,但症状偏 Windows 的论证合理)。关键反证:#530 reporter 自己的 troubleshooting 显示 `--disable-gpu` 后 GPU 行消失但 renderer 仍崩 → 该崩溃独立于 GPU(实为 MITIGATION_FORCE_MS_SIGNED_BINS 注入 DLL 的 CHECK,exit 0x80000003=STATUS_BREAKPOINT,非 GPU 故障);故软渲染兜底根本修不了 #530,发现把它挂在 relatedIssue:#530 是错的关联。叠加 Electron 默认自动重启 GPU 进程已覆盖瞬时崩,本项无复现失败、无确定性故障证据 → 维持 low(发现自评 low+confidence low 且自带 caveat,诚实)。不判 invalid:代码缺口客观存在且 Windows-GPU 论证站得住,只是 #530 关联与紧迫性被高估。",
+          "fixSketch": "若要做(纯预防性硬化,非紧急):在 main.js app.whenReady 前监听 app.on('child-process-gone', (e, d) => {...}) 与/或 app.on('gpu-process-gone'),对 type==='GPU' 且短窗口内重复崩(如 60s 内 ≥3 次)计数;越阈值后持久化一个 flag 并 app.relaunch(),下次启动早期读 flag 调 app.disableHardwareAcceleration()(必须在 whenReady 前、任何 BrowserWindow 创建前)退化到软渲染(SwiftShader),同时给透明窗口设个不透明 setBackgroundColor 兜底以防合成失败导致全透不可见。注意软渲染下透明+alwaysOnTop 桌宠的视觉质量会下降,需在真 Windows GPU 故障机验证(见 verify-platform-fixes-on-real-hardware),且不要把它当作 #530 的修复——#530 是注入 DLL/force-MS-signed 问题,与 GPU 无关。"
+        }
+      },
+      {
+        "title": "New Session 启动同步阻塞主进程:findClaudeCmd 用 execFileSync 跑 where claude(最多 5s 冻结桌宠)",
+        "file": "src/launch-claude.js:101",
+        "severity": "medium",
+        "kind": "fragility",
+        "symptom": "用户点「新建 Claude 会话」后,桌宠会瞬间卡住不动(动画停顿、无法拖动),最长可达 5 秒,然后终端才弹出。PATH 很大、挂了网络盘、或 where 解析慢时尤为明显。",
+        "whyWindowsSpecific": "该分支被 plat==='win32' 门控:Windows 走 `where`(进程级查 PATHEXT,比 POSIX 的 `which` 慢得多,且会被映射网络盘/慢磁盘拖累)。execFileSync 是同步调用,直接阻塞 Electron 主进程事件循环——而主进程正是渲染/拖动/topmost 重申的驱动方。launchClaudeSession 虽是 async,但在 await 它之前的第一件事就是同步调用 findClaudeCmd(launch-claude.js:341),Promise 不会先让出。",
+        "evidence": "launch-claude.js:100-105 `const cmd = plat === \"win32\" ? \"where\" : \"which\"; const out = _execFileSync(cmd, [\"claude\"], { encoding: \"utf8\", timeout: 5000, windowsHide: true });` —— 同步、5s 超时上限。调用链:main.js:2720 `res = await launchClaudeSession(...)` → launch-claude.js:341 `const claudePath = _findClaudeCmd(plat)`(同步,无 await 让出)→ findClaudeCmd 内同步 execFileSync。git 确认:此块自 New Session 功能引入(f2b8706)起从未异步化;#331 的修复(996dabc/#349)只动了 hooks/install.js 的 async hook 注册,与本路径无关。",
+        "confidence": "high",
+        "relatedIssue": "#331",
+        "dimension": "startup-persist",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "medium",
+          "verdict": "真。机制经实代码核实全部成立(当前 main 与我所在分支对 src/launch-claude.js 的 diff 为空,代码字节级一致)。(1) 同步阻塞调用存在:launch-claude.js:100-105,`cmd = plat==='win32' ? 'where' : 'which'`,`_execFileSync(cmd, ['claude'], { timeout: 5000, windowsHide: true })`——execFileSync 同步,5s 超时上限。(2) 跑在主进程事件循环:launch-claude.js 在 main.js:86 被 require(主进程,无 UtilityProcess/worker 隔离,git 全历史无 utilityProcess/spawnSync 迁移),主进程正是渲染/拖动/topmost 驱动方。(3) async 包装不先让出:launchClaudeSession(launch-claude.js:335 async)入口第一件事就是 line 341 `_findClaudeCmd(plat)`,其前无 await;findClaudeCmd 内零 await(grep 确认 await 仅出现在 openTerminalAt/launchClaudeSession),故 Promise 不让出,同步 where 立即阻塞。(4) 未修:git log -S 显示该块只被 f2b8706(功能引入)/caa4e13/4fe67cb(加 .cmd shim 解析与引号,非异步化)动过;#331 的 996dabc 只动 hooks/install.js,与本路径无关。Windows 特有性成立:整段 findClaudeCmd 在所有平台都同步跑(POSIX 走 which),但 `where` 是进程级查 PATHEXT、会被映射网络盘/慢磁盘拖累,Windows 最坏阻塞时长显著高于 POSIX which——whyWindowsSpecific 推理正确。一处对发现措辞的修正(不改结论):两个真实入口 newSessionWithFolder/newSessionInCurrentDir(main.js:2906+)的典型路径在用户已点过文件夹选择器+模式对话框之后才触达 findClaudeCmd,正常机器 where 毫秒级返回,完整 5s 冻结只在 PATH 巨大/网络盘挂死/where 解析慢等病态下出现——『最长 5s』是尾部上限非常态。severity medium 合理(jank/脆弱性,非崩溃/数据丢失)。行号 101 精确。",
+          "fixSketch": "把 findClaudeCmd 的 PATH 查询从同步 execFileSync 改为不阻塞主进程事件循环:(a) 最小改动——将 launchClaudeSession 改为先 `await` 一个用 child_process.execFile(异步)包装的 findClaudeCmdAsync(保留同 5s timeout/windowsHide/win32 .cmd 优先逻辑),这样 `where`/`which` 在子进程跑、主进程事件循环继续转(渲染/拖动不冻);保留同步版供测试/退路。(b) 更稳——把整次 claude 路径解析与终端拉起挪进 UtilityProcess 或后台,失败再回主进程弹错误对话框。任一方案都需真 Windows 机验证(PATH 大 / 挂网络盘 场景),确认桌宠在点「新建会话」后不再卡顿。"
+        }
+      },
+      {
+        "title": "终端 detached spawn「只看终端起没起、看不到内层 claude 是否成功」——Windows 三层(wt→cmd→shim)失败面最大",
+        "file": "src/launch-claude.js:65",
+        "severity": "low",
+        "kind": "design-tradeoff",
+        "symptom": "若内层 `claude` 实际启动失败(例如终端里 node not found、shim 解析异常、claude 未安装但 where 命中了陈旧路径),桌宠侧仍认为「启动成功」,不报错也不提示;用户只看到一个空终端或一闪而过的窗口,误以为是 clawd 没反应。这正是 #331 那类「首次启动卡死/没反应」的可观测性盲区。",
+        "whyWindowsSpecific": "tryLaunch 只监听终端进程自身的 spawn 事件(stdio:ignore + detached),无法观测内层命令。Windows 的启动链最长、失败点最多:wt.exe → cmd.exe → claude.cmd(npm shim 二次解析)。注释自陈 launch-claude.js:62-64「only observes whether the *terminal* launched … can't see whether `claude` inside it succeeded」。findClaudeCmd 的 stage-3 兜底还会返回裸字符串 \"claude\"(launch-claude.js:155),把「是否真能跑起来」推迟到终端里,进一步放大 Windows 这条链的静默失败概率。",
+        "evidence": "launch-claude.js:65-92 tryLaunch:`child.once(\"spawn\", onSpawn)` 即判定 ok:true,且 onSpawn 里 `child.on(\"error\", () => {})` 吞掉后续错误;opts 为 `{ detached:true, stdio:\"ignore\" }`(launch-claude.js:344)。launchClaudeSession 只要任一候选 spawn 成功就 return {ok:true}(launch-claude.js:353),runLaunchClaudeSession(main.js:2725)据此不弹任何错误。这是有意的 detached 取舍,但在 Windows 多层链下=#331 症状类的可发现性缺口。",
+        "confidence": "medium",
+        "relatedIssue": "#331",
+        "dimension": "startup-persist",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": false,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "low",
+          "verdict": "真实存在,但并非 Windows 特有(发现把它定性为\"Windows failure 面最大\"是对的,定性为机制独有则不对)。机制核实:tryLaunch (src/launch-claude.js:65-92) 在终端进程的 \"spawn\" 事件即 resolve {ok:true},并在 onSpawn 里挂 child.on(\"error\",()=>{}) (line 79) 吞掉后续错误;opts={detached:true,stdio:\"ignore\"} (line 344);launchClaudeSession 任一候选 spawn 成功即 return {ok:true} (line 353);runLaunchClaudeSession (src/main.js:2717-2740) 仅当 res.ok===false 才弹错误框 (2725-2735)。代码自陈注释 lines 59-64 明说\"only observes whether the *terminal* launched … can't see whether `claude` inside it succeeded\",与发现一致。引用行号基本准确(65/155/344/353 均对)。关键纠正:stdio:\"ignore\"+detached+只听 spawn 的这套观测缺口对所有平台一视同仁——darwin 走 osascript→Terminal.app do script (lines 215-225)、Linux 走 bash -c \"...;exec bash\" (lines 229-238) 有完全相同的盲区;Windows 只是失败点最多(wt→cmd→shim 三层 + stage-3 裸 \"claude\" 兜底 line 155 把可运行性推迟到终端里),发生概率最高,并非唯一。alreadyFixedOnMain=false:git log --all 全量历史(6 个 commit)无任何提交加入 child.on(\"exit\")/inner-process 观测(grep 确认零 exit 观测),最近相关 commit 4fe67cb 只 surface 了终端级 spawn 失败,未触及内层。严重度维持 low:findClaudeCmd stage-1/2 已用 _existsSync 校验解析到的路径(lines 110/125/149),真正命中盲区的场景较窄(claude 跑起来但内部失败如 node-not-found/shim 解析异常,或 stage-3 裸名兜底);终端窗口本身会出现、不崩溃,属可发现性/UX 缺口而非崩溃,kind=design-tradeoff 判定正确。",
+          "fixSketch": "这是有意的 detached 取舍,真要补可发现性(跨平台一并补,别只补 Windows):1) 不再用 stdio:\"ignore\" 完全弃观测——保留 detached 但用 stdio:[\"ignore\",\"ignore\",\"pipe\"] 或临时日志文件,给内层命令包一层探针(如 Windows: cmd /k \"call <claude> <args> || (echo CLAWD_LAUNCH_FAILED & pause)\";mac/Linux 类似在 claude 退出非 0 时回写 marker),桌宠侧短窗口内(如 3-5s)检测 marker 文件/早退即提示\"终端起来了但 Claude 没跑起来,检查 node/PATH/claude 安装\"。2) 更轻量:启动前对 stage-3 兜底(\"claude\" 裸名)在 Windows 上额外做一次 where/PATHEXT 预检,命不中就直接弹\"未找到可启动的 claude\",把最易静默失败的那条腿提前转成显式错误。3) 文档/Doctor 兜底:在 Doctor 增一条 claude 可启动性检查,把 #331 类\"首启没反应\"引导到自查。优先级 low,可作为 #331 follow-up,不必阻断当前发布。"
+        }
+      },
+      {
+        "title": "Windows Clawd writes PowerShell-only `command` into Codex hooks.json shared with WSL via CODEX_HOME, so every Codex hook exits 1 inside WSL",
+        "file": "hooks/codex-install-utils.js:45",
+        "severity": "high",
+        "kind": "known-unfixed",
+        "relatedIssue": "#544",
+        "symptom": "With CODEX_HOME=/mnt/c/Users/<user>/.codex shared between Windows and WSL2, Codex sessions started inside WSL fail every hook: `SessionStart hook (failed) error: hook exited with code 1`. WSL's shell (zsh/bash) runs the written `command` `& \"node\" \"D:/...codex-hook.js\"` and dies with `parse error near '&'`. Affects SessionStart/UserPromptSubmit/PreToolUse/PermissionRequest/PostToolUse/Stop — the desktop pet never reacts to WSL Codex.",
+        "whyWindowsSpecific": "`buildCodexHookCommand` hardcodes `windowsWrapper:\"powershell\"`, and `formatNodeHookCommand` (hooks/json-utils.js:214-227) emits the `& \"node\" \"script\"` PowerShell call-operator form whenever `platform==='win32'`. The platform comes from `options.platform || process.platform`, which on the Windows Clawd host is always win32 — even though the SAME hooks.json file is executed by Codex running under Linux/WSL. Unlike Claude Code (which gets a separate `shell:\"powershell\"` side-channel field, install.js:487-493, that the agent honors), Codex's hook schema has no shell field — the wrapper is baked into the `command` string — and `~/.codex` is explicitly shared cross-OS via CODEX_HOME, so a Windows-only command lands in a POSIX executor. Embedded node path is also a Windows path (resolveWindowsNodeBinSync, server-config.js:721/615) meaningless in WSL.",
+        "evidence": "hooks/codex-install-utils.js:45 `function buildCodexHookCommand(nodeBin, hookScript, platform = process.platform){ return formatNodeHookCommand(nodeBin, hookScript, { platform, windowsWrapper: \"powershell\" }); }`. Caller hooks/codex-install-utils.js:338 `const baseCommand = buildCodexHookCommand(nodeBin, hookScript, options.platform || process.platform);`. Emitter hooks/json-utils.js:223-226 `const wrapper = options.windowsWrapper || \"powershell\"; ... return \\`& ${command}\\`;`. Confirmed OPEN on GitHub (issue #544, title/body match exactly). NO WSL/shared-CODEX_HOME detection exists anywhere in hooks/ (grep for WSL/isWsl/microsoft/proc/version returns nothing relevant). git log on codex-install-utils.js shows no fix commit.",
+        "confidence": "high",
+        "dimension": "hooks-config",
+        "verdict": {
+          "isReal": true,
+          "isWindowsSpecific": true,
+          "alreadyFixedOnMain": false,
+          "adjustedSeverity": "high",
+          "verdict": "真实存在,且发现描述的机制、文件、行号全部核对无误。链路逐行确认:(1) codex-install-utils.js:45-54 `buildCodexHookCommand` 硬编码 `windowsWrapper:\"powershell\"`;(2) caller codex-install-utils.js:338-342 用 `options.platform || process.platform`;(3) emitter json-utils.js:214-227 在 `platform==='win32'` 且 wrapper 非 encoded 时返回 `` `& ${command}` `` (223-226 行);(4) 写入的 hook 对象 codex-install-utils.js:401 = `{ type:\"command\", command, timeout }`,**没有任何 shell 旁路字段** —— 与 Claude 安装器形成关键反差:install.js:487-493 给 Windows hook 额外写了 `shell:\"powershell\"`(并在 542 行同步),agent 靠这个字段知道用 PS 执行;Codex schema 把 wrapper 烤进 command 字符串,无此字段。\n\nWindows 特有性成立:`& \"node\" \"script\"` 形式仅在 `process.platform==='win32'` 时产生(json-utils.js:221 `if (platform !== \"win32\") return command;`)。我实测复现了症状:`& \"node\" \"D:/x/codex-hook.js\"` 在 bash 报 `syntax error near unexpected token '&'`、zsh 报 `parse error near '&'`,与 issue #544 原文逐字一致。嵌入的 node 路径也确为 Windows 路径(server-config.js:615-654 `resolveWindowsNodeBinSync` 走 where.exe/Windows 常见位置),在 WSL 中无意义。\n\n可达性高于发现描述:运行期 `src/server.js:146` 装配 integration-sync,`syncCodexHooks()`(integration-sync.js:195-211)调 `registerCodexHooks({silent:true})` 无 platform 覆盖 → Windows 主机上 win32 一路透传。且不是冷僻配置:仓库自己的 docs/guides/codex-wsl-clarification.md:25 明确建议用户\"share CODEX_HOME when you want WSL Codex sessions to report back\",正是触发该 bug 的配置;该文档甚至承认\"hook commands on Windows must use PowerShell's `&` call operator\",却从未与\"共享 CODEX_HOME 后同一 `&` 命令落到 POSIX shell\"这一矛盾对账。\n\n已修复核查(吸取 PR #496 教训,实查):`git log -S windowsWrapper`、`git log -- codex-install-utils.js`、`git log --all --grep` 均无修复提交;grep WSL/isWsl/microsoft//proc/version 在 hooks/ 下无任何检测逻辑;唯一相关的 7223ef9 是纯文档(+612 行 md,0 行 codex-install-utils.js),不构成修复。issue #544 仍 OPEN。",
+          "fixSketch": "两条腿任选/并用:(1) 让 Codex 像 Claude 那样不把 PS wrapper 烤进 command —— 但 Codex hooks.json schema 无 shell 字段,所以更稳妥的是改写命令为跨 shell 安全形式:Windows 上用 `cmd /d /s /c` 包裹(windowsWrapper:\"cmd\",json-utils.js:224 已支持),或干脆始终发裸 `\"node\" \"script\"`(windowsWrapper:\"none\")并依赖 Codex 自身在 Windows 上以何 shell 执行的实际行为(需真机验证 codex 在 Windows 上怎么跑 command);若 Windows-native Codex 确实必须 `&`,则需在写入前探测目标执行环境。(2) 真正治本:加 WSL/共享-CODEX_HOME 检测 —— 当 `CODEX_HOME` 指向 `/mnt/c/...` 或检测到 `/proc/version` 含 microsoft 时,改用 POSIX 形式或走 remote 模式注册;或在 hooks.json 里为命令包一层既能在 PS 又能在 POSIX 下自适应的 shim。任一方案都必须在真实 Windows+WSL2 共享 CODEX_HOME 机器上验证 SessionStart hook 不再 exit 1(本机无法验)。"
+        }
+      }
+    ],
+    "report": {
+      "summary": "Windows 是这套桌宠当前最脆弱的平台,核心矛盾集中在「透明置顶双窗口模型」与 Windows 合成器/激活/DPI 语义的正面冲突。两条最危险的主题:(1) 一整套 z-order/置顶/输入接管逻辑完全没有「前台是否全屏游戏」感知 —— hitWin 在 Windows 恒 focusable + 每 5s 无条件抢 pop-up-menu 顶层,直接造成 #538 全屏游戏被周期性打断,这是 #545 拖拽修复的固有对立面,无法简单回退;(2) 缺乏对 Windows 特有「确定性复发故障」的防护 —— DWM cloaking 无探测无恢复(#525,PR #496 未合)、renderer 崩溃无 crash-loop 限速(#530 类启动崩会无限崩→reload),以及 keepSize 把 DPI 抖动期错误尺寸洗白成永久值(#408,PR #501 未合)。我实读了 topmost-runtime.js / pet-window-runtime.js / codex-install-utils.js 并用 git merge-base 核验,确认所列高危项均仍在 main 上、未被任何已合并 PR 修掉(本轮无误报需排除,0 条已修)。",
+      "topRisks": [
+        {
+          "rank": 1,
+          "title": "全屏游戏每~5s 被打断:hitWin focusable + 无条件 topmost 看门狗,全程无前台全屏感知(#538,与 #545 对立)",
+          "severity": "high",
+          "file": "src/topmost-runtime.js:185 + src/pet-window-runtime.js:545",
+          "symptom": "Windows 上跑全屏(尤其独占全屏)游戏/应用时,桌宠每约 5 秒把可激活的命中窗强推到 pop-up-menu 顶层,周期性盖住/夺走前台全屏窗,游戏被踢出全屏或最小化,基本无法使用;点击桌宠也会抢走游戏焦点。",
+          "rootCause": "三处合流的同一根因(合并 6 条同根发现:focusable 抢焦点×3 + 看门狗无条件 reassert×2 + applyFreshNudge 物理推窗×1):hitWin 在 Windows 恒 focusable:true(为修 #545 WS_EX_NOACTIVATE 拖拽路由 bug 的『KEY EXPERIMENT』,pet-window-runtime.js:545,mac 在 :559 setFocusable(false)、Linux=false);5s 看门狗 reassertWindowAndTaskbar 无条件 setAlwaysOnTop(true,'pop-up-menu')(topmost-runtime.js:181/185-212);guardAlwaysOnTop 在掉层时还立刻反击+1px nudge(:151-176)。整条链零 GetForegroundWindow/全屏探测,无法在游戏期间降级置顶或让出输入。stopTopmostWatchdog 仅 before-quit cleanup 调用,DND/睡眠/游戏前台都不停。",
+          "fix": "加一条 Windows 前台全屏探针(koffi 调 GetForegroundWindow+比对 monitor rect,或 SHQueryUserNotificationState 判 QUNS_RUNNING_D3D_FULL_SCREEN/PRESENTATION_MODE),做成可降级 getter;在 reassertWindowAndTaskbar、guardAlwaysOnTop 的 reassert+nudge 前置门控,前台为独占全屏时跳过 setAlwaysOnTop 与 nudge,并可临时对 hitWin setIgnoreMouseEvents(true)/setFocusable(false) 让出输入,退出后恢复。不能裸翻 focusable:false(复发 #545 且撞 test/pet-window-runtime.test.js:163 的 contract)。补『全屏前台时不 reassert』单测。这正是 reporter 提议但未落仓的 win-fullscreen-detect.js。",
+          "relatedIssue": "#538(对立 #545)",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 2,
+          "title": "DWM cloaking 无探测无恢复:锁屏/解锁/RDP 重连后桌宠逻辑可见但屏幕不可见,只能重启(#525)",
+          "severity": "high",
+          "file": "src/topmost-runtime.js:179-213",
+          "symptom": "锁屏解锁、RDP 重连、快速用户切换或某些 explorer/DWM 事件后,桌宠从屏幕消失但 app 仍认为已显示(isVisible()===true、petHidden===false),右键菜单仍写『隐藏桌宠』,切换可见性也救不回,只有重启 app 才恢复。",
+          "rootCause": "唯一的周期可见性维护是 Windows topmost 看门狗,其体 reassertWindowAndTaskbar 只做 setAlwaysOnTop(true)+keepOutOfTaskbar(topmost-runtime.js:179-183);SetWindowPos(HWND_TOPMOST) 不清 DWMWA_CLOAKED,且看门狗/scheduleHwndRecovery 全程无 hide()→showInactive() 取消 cloak 路径。全 main 零 cloak 处理(grep cloak/DwmGetWindowAttribute=0)。重启才好=重建窗口绕过 cloak。",
+          "fix": "沿用 PR #496 思路但接进周期看门狗才能真自愈:用已加载的 koffi(main.js:151)封 _isWindowCloaked(win)=DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED=14);务必用 repo 既有 nativeHandleToPointer / handle.readBigUInt64LE(0) 取指针(避开 PR #496 自身把原始 Buffer 当 void* 的指针 bug)。看门狗每轮对 win/hitWin,若 !petHidden 且 isWindowCloaked 为真,执行 hide→showInactive 一次性 un-cloak,再 reassert+syncHitWin+setForceEyeResend;只在 isWin、!petHidden、!isDragLocked/!miniTransitioning 下做。",
+          "relatedIssue": "#525(=未合并 PR #496),#184",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 3,
+          "title": "renderer/hitWin 崩溃恢复无 crash-loop 防护:#530 类启动崩会无限崩→reload→崩死循环,CPU 跑满需强杀",
+          "severity": "high",
+          "file": "src/main.js:3422",
+          "symptom": "在会让 renderer 启动即崩的 Windows 环境(虚拟显示软件 Honor/IddDesk 注入 DLL 被 code-integrity 拒、0x80000003 启动崩),桌宠永远起不来并进入紧凑的崩溃→reload→再崩死循环:持续吃 CPU、日志被刷屏、永不停止,用户只能强杀;hitWin 同样陷入,且 Windows 上 focusable 反复 reload 还反复抢/丢焦点。",
+          "rootCause": "两条崩溃恢复路径都无条件 reload 且不读 details.reason:renderWin(main.js:3422-3428)与 hitWin(main.js:3337-3340)直接 reloadWindowWebContents,无 reload 计数/退避/时间窗。reloadWindowWebContents(pet-window-runtime.js:31-43)只做 isDestroyed 空安全。引入此机制的 149cf59『guard reload after renderer crash』只加了空安全、从未加循环防护。跨平台可恢复崩(crashed)与 Windows 确定性不可恢复崩(integrity-failure/launch-failed)被一视同仁。",
+          "fix": "加滑动窗口崩溃限速,renderWin/hitWin 共用:记录每窗 reload 时间戳,N 次/T 秒(如 >=5/30s)后停止自动 reload,日志一次并托盘/通知提示,可加指数退避,did-finish-load 成功后重置计数。同时按 details.reason 分流:clean-exit/killed 不 reload,integrity-failure/launch-failed 走『放弃并提示』而非重试。封进 reloadWindowWebContents 或薄包装让两路继承。",
+          "relatedIssue": "#530",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 4,
+          "title": "keepSizeAcrossDisplays 把 DPI 抖动期瞬时错误尺寸『洗白』成永久尺寸,桌宠越睡/越切屏越大(#408,PR #501 未合)",
+          "severity": "high",
+          "file": "src/main.js:745-756",
+          "symptom": "开启『跨显示器保持大小』后,睡眠/唤醒、改 DPI 缩放、跨不同缩放显示器拖动或 RDP 重连后,桌宠自己一点点变大且不自纠正,重启仍是放大尺寸,只有手动拖一次尺寸滑杆才复位;100% 缩放下不复现。",
+          "rootCause": "纯 Windows per-monitor-DPI:WM_DPICHANGED 后 win.getBounds() 返回重算过的 DIP 尺寸,代码用 setBounds(getBounds()) live 回读在 DPI 往返下非幂等。getEffectiveCurrentPixelSize 在 keepSize+proportional 时直接回读 live 窗口(main.js:752-753);display 事件/drag-end 同样回读 live 并写回 savedPixelWidth/Height(pet-window-runtime.js:751-757、pet-interaction-ipc.js:113-119);启动恢复用持久化膨胀值(size-utils.js:56-61);且 proportionalRecalc 被 !getKeepSizeAcrossDisplays() 显式禁掉,关掉自纠正。",
+          "fix": "合并 PR #501(分支 fix/408-size-growth-keepsize,c80b568+786756b):keepSize 开启时不再每次回读 live bounds,而把首次确定的 DIP 尺寸冻结进 in-memory truth(keepSizeFrozenPx),display/drag/effective 路径改读冻结值;启动 clamp 用独立 savedPixelWorkArea 当 frozen-origin 而非可能已漂移的当前 work area。grep 确认 keepSizeFrozenPx 当前 src ABSENT。",
+          "relatedIssue": "#408",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 5,
+          "title": "Windows Clawd 把 PowerShell-only 命令写进与 WSL 共享的 Codex hooks.json,WSL 内每个 Codex hook exit 1",
+          "severity": "high",
+          "file": "hooks/codex-install-utils.js:45",
+          "symptom": "CODEX_HOME=/mnt/c/Users/<user>/.codex 跨 Windows/WSL 共享时,WSL 内启动的 Codex 每个 hook 失败:SessionStart hook (failed) exited with code 1,WSL shell 跑 & \"node\" \"D:/...\" 报 parse error near '&';桌宠对 WSL Codex 完全无反应。",
+          "rootCause": "buildCodexHookCommand 硬编码 windowsWrapper:'powershell'(codex-install-utils.js:52),formatNodeHookCommand 在 platform==='win32' 时发 PowerShell call-operator 形式 & \"node\" \"script\"(json-utils.js:223-226);platform 来自 Windows 主机=win32,但同一 hooks.json 被 WSL 下的 Codex 执行。与 Claude Code 不同,Codex hook schema 无 shell 旁路字段(wrapper 烤进 command 串),且 CODEX_HOME 经设计跨 OS 共享。嵌入的 node 路径也是 Windows 路径,在 WSL 无意义。hooks/ 内无任何 WSL/共享检测。",
+          "fix": "两条腿任选/并用:(1) 改写命令为跨 shell 安全形式或始终发裸 \"node\" \"script\"(需真机验证 Windows-native Codex 实际用何 shell 执行 command);(2) 治本:检测 CODEX_HOME 指向 /mnt/c/... 或 /proc/version 含 microsoft 时改用 POSIX 形式/remote 模式注册。必须在真实 Windows+WSL2 共享 CODEX_HOME 机器验证 SessionStart 不再 exit 1。",
+          "relatedIssue": "#544",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 6,
+          "title": "无 resume/unlock-screen/RDP 可见性重申监听器(powerMonitor 完全未用)",
+          "severity": "low",
+          "file": "src/main.js:3431-3436",
+          "symptom": "机器唤醒、解锁、RDP/console 重接后,桌宠可能错位/被隐藏/被 cloak 且无自动恢复,只在下次用户触发的 show/move 或重启时自愈。",
+          "rootCause": "main 无任何 powerMonitor/resume/unlock-screen 监听(grep=0)。可见性/位置恢复只接 display-metrics-changed/added/removed(main.js:3434-3436)与 5s 看门狗,都不在 resume/unlock/RDP-attach 触发。renderWin 的 query-session-end/session-end 仅 flush prefs。PR #499(0547e35,powerMonitor resume/unlock)未合并、且只 re-arm 光标不含可见性重申。注:置顶丢失部分会被 5s 看门狗 ~5s 内自愈,故下调 low。",
+          "fix": "createWindow 内注册去抖幂等的 powerMonitor.on('resume'/'unlock-screen', reassertOnWake);reassertOnWake 中若 !petHidden 对 renderWin/hitWin 调 showInactive()+keepOutOfTaskbar()+setAlwaysOnTop(true,WIN_TOPMOST_LEVEL)+syncHitWin(),可顺带 scheduleHwndRecovery();try/catch 包裹。可复用 PR #499 的 handleSystemWake 骨架但需补可见性/位置重申。",
+          "relatedIssue": "#525,#184",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 7,
+          "title": "second-instance 重启在 petHidden=true 时裸 showInactive 重显桌宠,造成状态机错位",
+          "severity": "medium",
+          "file": "src/main.js:3628-3642",
+          "symptom": "用户右键隐藏桌宠后,再从任务栏/开始菜单/快捷方式/clawd:// 链接/拖文件夹重启 Clawd,桌宠窗重新出现但 app 仍认为隐藏:托盘/右键菜单显示『显示桌宠』、气泡与会话 HUD 仍被压制,需手点显示桌宠才 resync。",
+          "rootCause": "second-instance 处理器无条件 win.showInactive()+hitWin.showInactive()(main.js:3630/3634),绕过 setPetHidden,petHidden 不翻、showFloatingSurfacesForPet 不调、托盘/右键菜单不重建,菜单标签由 ctx.petHidden 派生(menu.js:256/468)故 stale。平行的菜单关闭路径有 !ctx.petHidden 守卫并注释警告,second-instance 缺这一守卫;mac 走 app.on('activate')→macHideController.onActivate() 是 hide-aware,Windows 单实例再入口靠 second-instance。",
+          "fix": "按 petHidden 分流:若 isPetHidden() 为真则改调 setPetHidden(false)(走完整 resync),否则保持现有 showInactive()+keepOutOfTaskbar。等价做法给两段 showInactive 套 if (!isPetHidden()) 守卫并在 hidden 分支显式 setPetHidden(false)。补单测覆盖 petHidden=true 时 second-instance 后 petHidden 翻 false 且 buildContextMenu 被调。",
+          "relatedIssue": "none",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 8,
+          "title": "New Session 启动同步阻塞主进程:findClaudeCmd 用 execFileSync 跑 where claude,最多冻结桌宠 5s",
+          "severity": "medium",
+          "file": "src/launch-claude.js:101",
+          "symptom": "点『新建 Claude 会话』后桌宠瞬间卡住(动画停、拖不动)最长 5s 才弹终端;PATH 巨大/挂网络盘/where 解析慢时尤甚(常态为毫秒级,5s 是病态尾部上限)。",
+          "rootCause": "launchClaudeSession(async)入口第一件事就同步调 findClaudeCmd(launch-claude.js:341),内部 execFileSync('where'/'which',{timeout:5000})(:100-105)阻塞 Electron 主进程事件循环 —— 主进程正是渲染/拖动/topmost 驱动方;Promise 在 await 前不让出。Windows 走 where(进程级查 PATHEXT、被映射网络盘拖累)比 POSIX which 慢得多。无 utilityProcess/worker 隔离。",
+          "fix": "把 PATH 查询异步化:findClaudeCmd 改用 child_process.execFile(异步)包装(模块已有 async spawn 先例),launch-claude.js:341 改 await,保留 5s timeout 但作为 async timeout 让事件循环继续转;可顺带缓存解析结果避免重复 probe。注意 drop-folder 路径其实走 openTerminalAt 不触此 probe,只有显式 New Session 命中。",
+          "relatedIssue": "#331",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 9,
+          "title": "hitWin 渲染进程崩溃时未清 dragLocked,主进程拖拽锁卡死→syncHitWin 永久早退→命中层错位,点击穿透到后面应用",
+          "severity": "medium",
+          "file": "src/main.js:3337",
+          "symptom": "拖动中 hitWin renderer 崩溃(reload 后 DOM isDragging 复位但主进程 dragLocked 仍 true),此后桌宠移动时 hitWin 不跟随、命中矩形漂移出桌宠像素,落在桌宠上的点击穿透到背后应用(#545 崩溃边缘场景)。",
+          "rootCause": "hitWin 崩溃处理只 log+reloadWindowWebContents(main.js:3337-3340),无 setDragLocked(false);对照 render 崩溃 main.js:3425 显式释放——不对称缺口。dragLock 释放仅由 hit-renderer.js 的 pointerup/cancel/blur 经 IPC 触发,renderer 进程死时都不发出;crash 后 reload 的新 hit-renderer 初始化 isDragging=false 使 stopDrag 被挡住,唯一发 dragLock(false) 的路径永不触发。dragLocked 永久 true→syncHitWin 在 pet-window-runtime.js:397 早退。可达性低(hit.html 极简、崩溃需外部触发恰落拖拽窄窗口)。",
+          "fix": "把 hitWin 崩溃处理改成与 render 对称:onRenderProcessGone 里 reload 前/后补 petWindowRuntime.setDragLocked(false)+clearDragSnapshot();更稳妥在 syncHitStateAfterLoad/did-finish-load 防御性清一次锁,使任何 hitWin reload 自愈。补测试断言 hitWin onRenderProcessGone 含 setDragLocked(false)。",
+          "relatedIssue": "#545",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 10,
+          "title": "#530 修复补丁从未提交且原计划开关在 Electron 41 已是死开关,Windows renderer 启动崩零缓解",
+          "severity": "medium",
+          "file": "src/main.js:134",
+          "symptom": "用户报的 Windows renderer 启动崩 0x80000003 在当前代码无任何缓解(无禁 sandbox/code-integrity 开关、无 windows-renderer-code-integrity.js);装了虚拟显示/注入类软件的机器桌宠完全无法启动(干净机复现不了)。",
+          "rootCause": "RendererCodeIntegrity(强制 renderer 只加载微软签名模块)是 Windows 独有特性,第三方 DLL 注入致 renderer 拒绝启动。补丁始终未 commit(git log -S 全空)。即便提交,原计划的 --disable-features=RendererCodeIntegrity 在 Chromium 146(Electron 41)已是 no-op 死开关;唯一让 renderer 活的 --no-sandbox 会整体关闭沙箱(安全降级)。这是『真实未修但属有意识待 reporter A/B 后再动』,非失职。",
+          "fix": "无『干净一招』。可发严格不劣于现状的缓解 app.commandLine.appendSwitch('allow-third-party-modules')(修 GPU 那条腿,干净机零风险),但大概率修不好受沙箱 renderer。正确处置:等 reporter A/B(Event Viewer CodeIntegrity 日志拿被挡 DLL 名+关虚拟显示软件重测)确认根因再决定;若先发,#530 措辞须写『缓解待确认』。",
+          "relatedIssue": "#530",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 11,
+          "title": "display-metrics-changed 几何处理无防抖(同处 textScale 却防抖 400ms),DPI 切换/RDP 重连时桌宠抖动跳位",
+          "severity": "low",
+          "file": "src/pet-window-runtime.js:741-761",
+          "symptom": "改某显示器缩放、插拔显示器、RDP/锁屏重连、睡眠唤醒时(这些事件成串爆发),比例模式下桌宠被反复重算尺寸/位置,出现可见抖动、跳位、尺寸闪烁。",
+          "rootCause": "几何 handler 直连无防抖(main.js:3434),而同文件 textScale handler 对同三个事件显式防抖 400ms 并注释承认 burst(main.js:3442-3451);handleDisplayMetricsChanged 在默认 keepSize OFF + 比例模式下 proportionalRecalc 恒 true,每个 burst 事件无条件 applyPetWindowBounds,burst 期 workArea 是过渡态。注:keepSize OFF 时尺寸不持久化、下个稳定事件自纠正,故是瞬态视觉抖动非永久膨胀,与 #408 关联被高估,下调 low。",
+          "fix": "镜像 textScale 模式:把 handleDisplayMetricsChanged 路由过短防抖(复用 400ms 或专用 timer),burst 收敛为一次稳定 workArea 重算;可选在 applyPetWindowBounds 加幂等守卫(materialized bounds 等于当前 getBounds 时跳过 setBounds)。仅默认配置,keepSize-ON 路径已冻结不受影响。",
+          "relatedIssue": "#408",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 12,
+          "title": "设置尺寸预览期 5s 看门狗把桌宠重插到设置窗之上,遮住正在拖的尺寸滑杆(纯视觉)",
+          "severity": "low",
+          "file": "src/pet-window-runtime.js:693",
+          "symptom": "Windows 上拖设置面板尺寸滑杆实时预览时,若拖动超过 ~5s 或跨过看门狗 tick,桌宠闪到设置窗上方挡住滑杆/预览区;点击仍能落到滑杆(预览期 hitWin 被 setIgnoreMouseEvents(true)),纯视觉遮挡不阻塞操作。",
+          "rootCause": "beginSettingsSizePreviewProtection 只把设置窗 setAlwaysOnTop+moveTop 抬到 pop-up-menu 顶层一次(:701-702);看门狗每 5s 把 pet/hitWin 重插同层带(『最后调用者赢』)且不感知预览态;设置窗不在看门狗保护集,预览期也不暂停看门狗。",
+          "fix": "让看门狗在尺寸预览期不抢 z-order:给 topmostRuntime 注入 isSettingsSizePreviewActive() 谓词,tick 内预览激活时跳过对 win/hitWin 的 reassert(保留 keepOutOfTaskbar);end 时已有的 reassertWinTopmost() 恢复。纯视觉低频,可选打磨。",
+          "relatedIssue": "#176",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 13,
+          "title": "render 窗 always-on-top-changed guard 只重顶 render 自己,短暂把 hitWin 压到 render 之下(z-order 反转)",
+          "severity": "low",
+          "file": "src/topmost-runtime.js:155",
+          "symptom": "前台抢占/全屏切换使 Windows 撤掉桌宠 always-on-top 后,到 ~1s hwnd recovery 或下次 5s 看门狗前,render 窗位于 hitWin 之上,破坏『hitWin 必须在最上』不变量。",
+          "rootCause": "guard 在 render 掉层时只对 render setAlwaysOnTop(true)+syncHitWin()(只更新 hitWin bounds/shape,不抬 z-order),hitWin 回到 render 之上要等 scheduleHwndRecovery 或看门狗。但 render 永久 setIgnoreMouseEvents(true)+setFocusable(false) 从不接鼠标,断言的『点击穿透/拖不动』单凭此因不可达(事件仍穿到 hitWin),仅在叠加 dragLocked 卡死等独立 bug 时才表现,故是健壮性 nit 而非可触发输入缺陷。",
+          "fix": "低价值硬化:在 render guard 的 syncHitWin() 前后调 reassertWinTopmost()(已先 win 后 hitWin)消除短暂反转,同步更新 test/topmost-runtime.test.js:95。明确这不修 #545『无法拖动』(其真因在 DWM 指针捕获,见未合 65453fa)。",
+          "relatedIssue": "#545,#176",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 14,
+          "title": "启动恢复期反复跑 Get-CimInstance Win32_Process 全量枚举(含 .CommandLine),Windows 已知慢路径",
+          "severity": "low",
+          "file": "src/state.js:1890-1902",
+          "symptom": "clawd 启动后若有 agent 进程在跑但始终不产生会话事件,最长 5 分钟内每 10s spawn 一次 powershell 跑 Win32_Process 全量进程枚举并读 .CommandLine,进程多/忙的机器周期性 CPU/IO 抖动(#350)。",
+          "rootCause": "win32 分支用 Get-CimInstance Win32_Process | Where-Object 无 -Filter=全量枚举,对 node.exe 读 CommandLine(每进程读 PEB),其他平台走轻量 pgrep。前置门 startupRecoveryActive 仅在 boot 探针发现有 agent 进程时点亮,有 5min 硬顶+首个真会话事件即清零,故纯空闲不触发、最坏约 30 次批量 WMI。来源 commit e1c2489 是修正性引入(替换 Win11 24H2 上 ENOENT 的 wmic),非性能修复。",
+          "fix": "改用服务端 WQL -Filter 让 WMI 不物化全部进程:对固定 exe 名集合用 -Filter \"Name='claude.exe' OR ...\",node.exe+*claude-code* 单独窄查;或用更轻的 Get-Process -Name(不取 CommandLine)覆盖多数 agent,node 那例次级窄查。",
+          "relatedIssue": "#350",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 15,
+          "title": "wt.exe 启动候选依赖 Windows Terminal post-`--` 重分词,无任何通过性测试覆盖该层",
+          "severity": "low",
+          "file": "src/launch-claude.js:200",
+          "symptom": "某些 Windows Terminal 版本/配置下首次 New-Session(wt.exe)可能开出无法启动 claude 的 tab(路径/参数被 mangle)或落错;含空格/括号的 shim 路径取决于 wt 如何重引号也可能 misbehave;tryLaunch 只观测终端起没起、看不到内层 claude 成功,失败态是死/错 tab 且不回退。",
+          "rootCause": "wt 候选用 windowsVerbatimArguments:true,Node 不加引号、wt 再对 -- 后所有 token 重分词并只对含空格 token 重引号;call \"<path>\" 前缀缓解 cmd 首引号剥离与 wt 重引号两个 hazard。代码注释自承『still needs real-Windows validation』,唯一 win32-only 测试(launch-claude.test.js:301)只验 cmd.exe 那侧、明确不穿过 wt 自身重分词。内层 argv 仅 --resume <已 allow-list id>,无注入面。",
+          "fix": "闭测试缺口:加真实 wt.exe 启动用例,spawn wt -- cmd /c call \"<带空格括号路径>\" --resume safe_id,让内层 echo-argv 把收到 argv 写文件再断言,真正穿过 wt 重分词层;或改用 wt new-tab 子命令按 wt 自身转义规则、或降级首选已验证 cmd.exe 路径(代价丢『优先开 WT tab』体验)。",
+          "relatedIssue": "none",
+          "needsRealMachine": true
+        },
+        {
+          "rank": 16,
+          "title": "SetConsoleOutputCP(65001) 改父控制台共享码页,崩溃/被 kill 时不还原",
+          "severity": "low",
+          "file": "src/main.js:172-193",
+          "symptom": "npm start 从 PowerShell/cmd 启动时 clawd 把父控制台码页改成 UTF-8,正常退出会还原,但崩溃或 SIGKILL 时父控制台永久留在 UTF-8,之后该终端其它程序非 ASCII 输出乱码,直到 chcp 或重开;仅开发态受影响,打包 GUI 无控制台=no-op。",
+          "rootCause": "还原仅挂 app.once('will-quit')/process.once('exit')(main.js:186-187),硬崩溃/SIGKILL 不触发(实测 SIGKILL/SIGTERM 均不触发 exit)。这是『修改共享父控制台状态』的固有局限。",
+          "fix": "补 SIGTERM/SIGINT 处理器:还原后 re-exit 覆盖优雅终止;SIGKILL 本质不可捕获堵不住(故只配 low)。或文档说明硬 kill 后可能需 chcp,或把输出 spawn 进独立子控制台。鉴于严重度保持现状亦可。",
+          "relatedIssue": "none",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 17,
+          "title": "终端 detached spawn 只观测终端起没起、看不到内层 claude 是否成功(可发现性盲区,非 Windows 独有)",
+          "severity": "low",
+          "file": "src/launch-claude.js:65",
+          "symptom": "内层 claude 实际启动失败(node not found/shim 解析异常/claude 未装但 where 命中陈旧路径)时桌宠侧仍判『成功』、不报错,用户只见空终端或一闪而过窗口,误以为 clawd 没反应(#331 类盲区)。",
+          "rootCause": "tryLaunch 在终端进程 spawn 事件即 resolve ok:true 并吞掉后续 error(launch-claude.js:65-92),opts detached+stdio:ignore。Windows 失败点最多(wt→cmd→claude.cmd shim 二次解析)且 stage-3 兜底返回裸 'claude'。机制对 mac(osascript)/Linux(bash -c)完全一样,非 Windows 独有,只是 Windows 概率最高。",
+          "fix": "跨平台一并补:用临时日志/marker 给内层命令包探针(claude 退出非 0 回写 CLAWD_LAUNCH_FAILED),桌宠侧短窗口检测后提示;或对 stage-3 裸名兜底在 Windows 额外做 where/PATHEXT 预检命不中直接弹错;Doctor 增 claude 可启动性检查。low,作 #331 follow-up 不阻断发布。",
+          "relatedIssue": "#331",
+          "needsRealMachine": false
+        },
+        {
+          "rank": 18,
+          "title": "无 GPU 进程崩溃恢复 / 无 disableHardwareAcceleration 软渲染兜底(与 #530 关联被高估)",
+          "severity": "low",
+          "file": "src/main.js:134",
+          "symptom": "GPU 驱动有问题的 Windows 机(老显卡/虚拟显示/远程桌面),透明 alwaysOnTop 桌宠强依赖 GPU 合成,GPU 反复崩时桌宠可能反复闪烁/不可见而无降级路径。",
+          "rootCause": "无 gpu-process-crashed/child-process-gone 监听、无 disableHardwareAcceleration 软渲染兜底(grep 全空)。但 Electron 默认自动重启 GPU 进程已覆盖瞬时崩;且 #530 reporter 自证 --disable-gpu 后 renderer 仍崩=该崩独立于 GPU,软渲染兜底修不了 #530,relatedIssue 关联错误。无复现失败证据,纯预防性硬化。",
+          "fix": "若做:监听 app.on('child-process-gone'),type==='GPU' 且短窗口重复崩则持久化 flag+relaunch,下次启动早期(whenReady 前)disableHardwareAcceleration() 退化 SwiftShader,并给透明窗设不透明 setBackgroundColor 兜底防全透不可见。勿当作 #530 修复。",
+          "relatedIssue": "none(发现误挂 #530)",
+          "needsRealMachine": true
+        }
+      ],
+      "themes": [
+        "透明置顶双窗口模型与 Windows 合成器/激活语义的固有冲突:hitWin focusable + pop-up-menu 顶层 + DWM cloaking,既是 #545 拖拽修复的代价(#538 抢焦点),也是可见性丢失(#525)的温床 —— 同一架构在 mac/Linux 无对应问题",
+        "缺乏『前台全屏/游戏感知』这条腿:全套 z-order/置顶/输入接管(看门狗、reassertWinTopmost、guardAlwaysOnTop、applyFreshNudge)零 GetForegroundWindow/全屏探测,导致桌宠在游戏期间无法降级置顶或让出输入(#538 的根因不是某个写错的分支,而是整条缺失子系统)",
+        "对 Windows 特有『确定性复发故障』缺乏放弃/限速机制:renderer crash 无 crash-loop 限速也不分 reason(#530)、DWM cloak 无探测(#525)、code-integrity 注入无解 —— 恢复逻辑都是为『跨平台偶发、reload 一次就好』设计的,在 Windows 确定性故障下要么死循环要么无路径",
+        "per-monitor-DPI live 回读的非幂等性:setBounds(getBounds()) 在 WM_DPICHANGED 往返下把瞬时错误 DIP 尺寸洗白(#408 持久膨胀)或制造抖动(几何 handler 无防抖),根因是把 live 窗口 bounds 当 truth source 而非冻结值",
+        "原生 HWND/koffi 操作的健壮性:cloaking 探测需正确指针转换(PR #496 自身有把 Buffer 当 void* 的指针 bug),前台全屏探测、软渲染兜底等都依赖尚未建立的可降级 FFI 探针基建",
+        "路径/shell 转义与跨执行环境假设:Windows where 同步阻塞(#331)、wt.exe post-`--` 重分词无测试覆盖、PowerShell-only 命令落进 WSL POSIX shell(#544)、共享 CODEX_HOME 跨 OS —— 把『写命令时的宿主平台』当成『执行命令的平台』",
+        "状态机入口绕过:second-instance 裸 showInactive 绕过 setPetHidden、hitWin 崩溃不清 dragLocked —— 多条旁路没有走承载完整状态同步的单一入口,造成 UI/输入错位"
+      ],
+      "coverageGaps": [
+        "真机验证缺口:本轮全部为代码+git 史审计,所列 10 条 needsRealMachine 的 Windows 行为(独占全屏 vs borderless 抢焦点实际表现、DWM cloak 三场景恢复、150% 缩放 DPI 膨胀、WSL 共享 CODEX_HOME、wt 重分词)均未在真 Windows 机/真全屏游戏验证,符合仓库 verify-on-real-hardware 纪律但仍是结论的硬约束",
+        "taskbar.js / skipTaskbar / keepOutOfTaskbar 自身的 Windows 行为未单独深入(只作为看门狗维护项掠过),AppUserModelID、任务栏图标/跳转列表、托盘在多显示器/RDP 下的表现未审",
+        "updater.js 的 Windows 自更新路径(Squirrel/NSIS、运行中替换、UAC 提权、code-signing 校验)完全未覆盖",
+        "Windows 通知/Action Center 与桌宠气泡的交互、focus assist/勿扰模式下的提醒行为未审",
+        "pet-geometry-main.js 的坐标系在混合 DPI 多显示器 + 负坐标(显示器在主屏左/上方)布局下的 clamp/换算正确性,只在 keepSize/防抖语境间接触及,未系统验证负坐标边界",
+        "hit-renderer.js 的 pointer 捕获 / setShape 命中区在 Windows 高 DPI 下与桌宠像素的对齐精度(setShape 用物理像素还是 DIP)未深入",
+        "launch-claude.js 之外的 Codex/Claude hooks 安装在 Windows 上的路径解析(resolveWindowsNodeBinSync、where.exe 依赖、空格/中文用户名路径)只在 #544 语境部分触及,Claude 侧 hook 命令在 Windows 的健壮性未单独审",
+        "并发/竞态面:多个 reassert 路径(看门狗/guard/scheduleHwndRecovery/display 事件)与 drag/mini/preview 状态之间的写竞争只在单条发现内局部判过,未做跨路径的整体竞态梳理"
+      ]
+    }
+  }
+}
