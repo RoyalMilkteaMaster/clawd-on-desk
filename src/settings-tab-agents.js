@@ -18,6 +18,7 @@
   let agentHintActionPending = false;
   let agentInstallHintResetPending = false;
   let agentCleanupHintResetPending = false;
+  let codexHookHealthRequestSeq = 0;
 
   function t(key) {
     return helpers.t(key);
@@ -811,10 +812,14 @@
   // unavailable or healthy, the badge keeps its base "Installed" state.
   function annotateCodexHookHealth(badge, installed) {
     if (!badge) return;
+    const seq = String(++codexHookHealthRequestSeq);
+    if (badge.dataset) badge.dataset.codexHookHealthSeq = seq;
     badge.classList.remove("hook-warning");
     badge.removeAttribute("title");
     if (!installed || !window.doctor || typeof window.doctor.codexHookHealth !== "function") return;
     window.doctor.codexHookHealth().then((health) => {
+      if (badge.isConnected === false) return;
+      if (badge.dataset && badge.dataset.codexHookHealthSeq !== seq) return;
       if (!health || health.healthy || !health.signature) return;
       if (!readers.readAgentIntegrationInstalled("codex")) return;
       badge.classList.add("hook-warning");

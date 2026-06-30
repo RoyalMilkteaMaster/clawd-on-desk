@@ -280,6 +280,14 @@ function shouldSuppressDuplicateCompletionVisual(existing, state, event) {
   return existing.awaitingInputSinceStop === true || hasCompletionTailWithoutProgress(existing);
 }
 
+function shouldKeepExistingCompletionEventTail(existing, state, event) {
+  return state === "attention"
+    && existing
+    && (existing.state === "idle" || existing.state === "sleeping")
+    && POST_COMPLETION_EVENTS.has(event)
+    && hasCompletionTailWithoutProgress(existing);
+}
+
 function shouldMuteMiniPostCompletionNotification(state, event, session) {
   return !!ctx.miniMode
     && state === "notification"
@@ -1448,7 +1456,10 @@ function updateSession(sessionId, state, event, opts = {}) {
 
   const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
 
-  const recentEvents = pushRecentEvent(existing, preservedState || state, event);
+  const keepExistingCompletionEventTail = shouldKeepExistingCompletionEventTail(existing, state, event);
+  const recentEvents = keepExistingCompletionEventTail && Array.isArray(existing.recentEvents)
+    ? existing.recentEvents.slice()
+    : pushRecentEvent(existing, preservedState || state, event);
   const preserveCompletionAck =
     existing
     && existing.requiresCompletionAck === true

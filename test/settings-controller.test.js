@@ -250,6 +250,20 @@ describe("applyUpdate", () => {
     assert.strictEqual(prefs.load(p).snapshot.tutorialSeen, true);
   });
 
+
+  it("persists Codex hook health notification prefs through applyUpdate", async () => {
+    const p = makeTempPath();
+    const ctrl = createSettingsController({ prefsPath: p });
+    const r1 = await ctrl.applyUpdate("codexHookHealthLastNotified", "feature-disabled");
+    assert.strictEqual(r1.status, "ok");
+    assert.strictEqual(ctrl.get("codexHookHealthLastNotified"), "feature-disabled");
+    const r2 = await ctrl.applyUpdate("codexHookHealthNotifyEnabled", false);
+    assert.strictEqual(r2.status, "ok");
+    assert.strictEqual(ctrl.get("codexHookHealthNotifyEnabled"), false);
+    const loaded = prefs.load(p).snapshot;
+    assert.strictEqual(loaded.codexHookHealthLastNotified, "feature-disabled");
+    assert.strictEqual(loaded.codexHookHealthNotifyEnabled, false);
+  });
   it("enforces cross-field constraints (showTray/showDock)", async () => {
     const ctrl = createSettingsController({
       prefsPath: makeTempPath(),

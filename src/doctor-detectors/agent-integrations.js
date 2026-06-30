@@ -605,10 +605,12 @@ function validateAntigravityHookEvents(descriptor, settings, options) {
 
 function applyCodexSupplementary(detail, descriptor, options, settings) {
   if (!descriptor.supplementary || descriptor.supplementary.key !== "hooks") return detail;
-  if (detail.status !== "ok") return detail;
 
   const supplementary = checkCodexHooksFeature(descriptor.supplementary.configPath, { fs: options.fs });
-  if (supplementary.value === "disabled") {
+  if (
+    supplementary.value === "disabled"
+    && (detail.status === "ok" || REPAIRABLE_AGENT_STATUSES.has(detail.status))
+  ) {
     return {
       ...detail,
       status: "not-connected",
@@ -621,6 +623,7 @@ function applyCodexSupplementary(detail, descriptor, options, settings) {
       detail: "Codex hooks feature is disabled",
     };
   }
+  if (detail.status !== "ok") return detail;
   const codexHookTrust = checkCodexHookTrust(
     descriptor.supplementary.configPath,
     settings,

@@ -1529,6 +1529,7 @@ describe("updateSession()", () => {
     assert.deepStrictEqual(stateChanges, ["attention"]);
     assert.strictEqual(api.sessions.get("codex:remote").requiresCompletionAck, true);
     mock.timers.tick(4000);
+    const firstEvents = api.sessions.get("codex:remote").recentEvents.map((entry) => ({ ...entry }));
     assert.strictEqual(api.getCurrentState(), "idle");
 
     soundsPlayed.length = 0;
@@ -1545,8 +1546,57 @@ describe("updateSession()", () => {
     assert.ok(!stateChanges.includes("attention"), "duplicate task_complete must not re-send attention");
     assert.strictEqual(api.deriveSessionBadge(api.sessions.get("codex:remote")), "done");
     assert.strictEqual(api.sessions.get("codex:remote").requiresCompletionAck, true);
+    assert.deepStrictEqual(api.sessions.get("codex:remote").recentEvents, firstEvents);
   });
 
+
+  it("keeps official Codex Stop as the completion tail when JSONL task_complete arrives later", () => {
+    const soundsPlayed = [];
+    const stateChanges = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      playSound: (name) => soundsPlayed.push(name),
+      sendToRenderer: (channel, state) => {
+        if (channel === "state-change") stateChanges.push(state);
+      },
+    });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex:s2", "working", "PreToolUse", {
+      agentId: "codex",
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+    mock.timers.tick(1000);
+    stateChanges.length = 0;
+
+    api.updateSession("codex:s2", "attention", "Stop", {
+      agentId: "codex",
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+    assert.strictEqual(soundsPlayed.filter((name) => name === "complete").length, 1);
+    const firstEvents = api.sessions.get("codex:s2").recentEvents.map((entry) => ({ ...entry }));
+    assert.strictEqual(firstEvents.at(-1).event, "Stop");
+    mock.timers.tick(4000);
+    assert.strictEqual(api.getCurrentState(), "idle");
+
+    soundsPlayed.length = 0;
+    stateChanges.length = 0;
+    api.updateSession("codex:s2", "attention", "event_msg:task_complete", {
+      agentId: "codex",
+      cwd: "/tmp",
+    });
+
+    assert.strictEqual(soundsPlayed.filter((name) => name === "complete").length, 0);
+    assert.ok(!stateChanges.includes("attention"), "late task_complete must not re-send attention");
+    const session = api.sessions.get("codex:s2");
+    assert.deepStrictEqual(session.recentEvents, firstEvents);
+    assert.strictEqual(session.recentEvents.at(-1).event, "Stop");
+    assert.strictEqual(api.deriveSessionBadge(session), "done");
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
   it("still plays completion after new progress follows a completed turn", () => {
     const soundsPlayed = [];
     const stateChanges = [];

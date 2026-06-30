@@ -726,6 +726,7 @@ function loadAgentsTabForTest({
   agentMetadata,
   collapsedGroups = {},
   settingsAPI = {},
+  doctor = null,
 } = {}) {
   const raf = createQueuedRaf();
   const body = new FakeElement("body");
@@ -763,6 +764,7 @@ function loadAgentsTabForTest({
       command: () => Promise.resolve({ status: "ok" }),
       ...settingsAPI,
     },
+    doctor,
     ClawdSettingsSizeSlider: {
       SIZE_UI_MIN: 1,
       SIZE_UI_MAX: 100,
@@ -801,6 +803,10 @@ function loadAgentsTabForTest({
           agentIntegrationInstalled: "Installed",
           agentIntegrationNotInstalled: "Not installed",
           agentIntegrationInstall: "Install",
+          agentCodexHookNeedsAttention: "Needs attention",
+          codexHookHealthReasonInactive: "Hook inactive",
+          codexHookHealthReasonDisabled: "Hooks disabled",
+          codexHookHealthReasonNeedsReview: "Needs review",
           agentIntegrationUninstall: "Uninstall",
           agentIntegrationWorking: "Working",
           agentIntegrationUninstallConfirm: "Confirm uninstall",
@@ -4782,6 +4788,56 @@ describe("settings renderer browser environment", () => {
     );
   });
 
+  it("ignores stale Codex hook health results after the badge becomes not installed", async () => {
+    let resolveHealth;
+    const healthPromise = new Promise((resolve) => { resolveHealth = resolve; });
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codex: { integrationInstalled: true, enabled: true },
+        },
+      },
+      agentMetadata: [{
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: { permissionApproval: true },
+      }],
+      doctor: { codexHookHealth: () => healthPromise },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    const findIntegrationBadge = () => harness.content.querySelectorAll(".agent-badge")
+      .find((candidate) => candidate.classList.contains("integration"));
+    let badge = findIntegrationBadge();
+    assert.ok(badge);
+    assert.strictEqual(badge.textContent, "Installed");
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          codex: { integrationInstalled: false, enabled: false },
+        },
+      },
+      snapshot: {
+        agents: {
+          codex: { integrationInstalled: false, enabled: false },
+        },
+      },
+    });
+    badge = findIntegrationBadge();
+    assert.ok(badge);
+    assert.strictEqual(badge.textContent, "Not installed");
+
+    resolveHealth({ healthy: false, signature: "not-registered", reasonKey: "codexHookHealthReasonInactive" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    badge = findIntegrationBadge();
+    assert.strictEqual(badge.textContent, "Not installed");
+    assert.strictEqual(badge.classList.contains("hook-warning"), false);
+    assert.strictEqual(badge.title, "");
+  });
   it("does not initialize an expanded agent group at 0px height during rerender", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {

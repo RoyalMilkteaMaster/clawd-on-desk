@@ -16,8 +16,8 @@ describe("classifyCodexHookDetail", () => {
     assert.strictEqual(r.reasonKey, null);
   });
 
-  it("treats Codex-not-installed as nothing to warn about", () => {
-    for (const status of ["not-installed", "manual-only", "manual-managed"]) {
+  it("treats inactive-or-user-disabled Codex states as nothing to warn about", () => {
+    for (const status of ["not-installed", "not-managed", "disabled", "manual-only", "manual-managed"]) {
       assert.strictEqual(classifyCodexHookDetail({ status }).signature, null, status);
     }
   });

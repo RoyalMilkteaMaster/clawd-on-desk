@@ -26,7 +26,13 @@ function classifyCodexHookDetail(detail) {
   const status = detail.status;
 
   // Codex (or its config dir) is absent / host-managed — not a fault we own.
-  if (status === "not-installed" || status === "manual-only" || status === "manual-managed") {
+  if (
+    status === "not-installed"
+    || status === "not-managed"
+    || status === "disabled"
+    || status === "manual-only"
+    || status === "manual-managed"
+  ) {
     return { signature: null, reasonKey: null, status };
   }
   if (status === "ok") {

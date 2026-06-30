@@ -997,6 +997,26 @@ describe("checkAgentIntegrations", () => {
     });
   });
 
+
+  it("reports Codex hooks=false even when hook registration is missing", () => {
+    const descriptor = codexDescriptor();
+    writeJson(descriptor.configPath, { hooks: {} });
+    fs.writeFileSync(descriptor.supplementary.configPath, "[features]\nhooks = false\n", "utf8");
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "not-connected");
+    assert.strictEqual(detail.level, "warning");
+    assert.deepStrictEqual(detail.supplementary, {
+      key: "hooks",
+      value: "disabled",
+      detail: "hooks=false",
+    });
+    assert.deepStrictEqual(detail.fixAction, {
+      type: "agent-integration",
+      agentId: "codex",
+      forceCodexHooksFeature: true,
+    });
+  });
   it("turns Codex ok into warning when hooks need Codex review", () => {
     const descriptor = codexDescriptor();
     writeJson(descriptor.configPath, codexHooksConfig(["PermissionRequest", "Stop"]));

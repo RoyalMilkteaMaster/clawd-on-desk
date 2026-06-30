@@ -235,6 +235,8 @@ const updateRegistry = {
   flashTaskbarOnComplete: requireBoolean("flashTaskbarOnComplete"),
   flashIntervalMs: requireNumberInRange("flashIntervalMs", 200, 2000),
   flashDurationMs: requireNumberInRange("flashDurationMs", 0, 60000),
+  codexHookHealthNotifyEnabled: requireBoolean("codexHookHealthNotifyEnabled"),
+  codexHookHealthLastNotified: requireString("codexHookHealthLastNotified", { allowEmpty: true }),
   lowPowerIdleMode: requireBoolean("lowPowerIdleMode"),
   keepAwakeWhileWorking: requireBoolean("keepAwakeWhileWorking"),
   bubbleFollowPet: requireBoolean("bubbleFollowPet"),
