@@ -52,8 +52,9 @@ Before launching:
   `app.asar.unpacked/agents`, `app.asar.unpacked/extensions`,
   `app.asar.unpacked/themes`, and `sidecars/cc-connect-clawd`.
 - For Reasonix smoke, prepare a machine with Reasonix initialized so
-  `~/.reasonix/` exists. A skipped install because Reasonix is missing does not
-  validate the packaged hook path.
+  `<Reasonix home>/` exists (`%APPDATA%\reasonix` on Windows,
+  `~/.reasonix` on macOS/Linux). A skipped install because Reasonix is missing
+  does not validate the packaged hook path.
 - For CodeWhale smoke, prepare a machine with CodeWhale initialized so its
   config path exists. A skipped install because CodeWhale is missing does not
   validate the packaged hook path.

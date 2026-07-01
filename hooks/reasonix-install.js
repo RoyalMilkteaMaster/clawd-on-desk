@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Merge Clawd Reasonix hooks into ~/.reasonix/settings.json (append-only, idempotent)
+// Merge Clawd Reasonix hooks into <Reasonix home>/settings.json (append-only, idempotent)
 // Reasonix hook format: { "hooks": { "EventName": [{ "match", "command", ... }] } }
 
 const fs = require("fs");
@@ -18,8 +18,43 @@ const {
 } = require("./json-utils");
 
 const MARKER = "reasonix-hook.js";
-const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".reasonix");
-const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "settings.json");
+const SETTINGS_DIRNAME = ".reasonix";
+const SETTINGS_FILENAME = "settings.json";
+
+function expandHomePath(value, homeDir) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const home = homeDir || os.homedir();
+  if (raw === "~") return home;
+  if ((raw.startsWith("~/") || raw.startsWith("~\\")) && home) {
+    return path.join(home, raw.slice(2));
+  }
+  return raw;
+}
+
+function resolveReasonixHome(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+
+  // Test/legacy override mirrors Reasonix's hook.GlobalSettingsPath(homeDir):
+  // the override is a fake OS home, not the Reasonix home itself.
+  if (options.homeDir) return path.join(options.homeDir, SETTINGS_DIRNAME);
+
+  const explicit = expandHomePath(env.REASONIX_HOME, options.userHomeDir || os.homedir());
+  if (explicit) return path.resolve(explicit);
+
+  if (platform === "win32") {
+    const appData = String(env.APPDATA || env.AppData || "").trim();
+    if (appData) return path.join(appData, "reasonix");
+    const home = options.userHomeDir || os.homedir();
+    return path.join(home, "AppData", "Roaming", "reasonix");
+  }
+
+  return path.join(options.userHomeDir || os.homedir(), SETTINGS_DIRNAME);
+}
+
+const DEFAULT_PARENT_DIR = resolveReasonixHome();
+const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, SETTINGS_FILENAME);
 
 const REASONIX_HOOK_EVENTS = [
   "SessionStart",
@@ -114,7 +149,7 @@ function normalizeReasonixHookEntries(entries, desiredCommand) {
 }
 
 /**
- * Register Clawd hooks into ~/.reasonix/settings.json
+ * Register Clawd hooks into <Reasonix home>/settings.json
  * @param {object} [options]
  * @param {boolean} [options.silent]
  * @param {string} [options.settingsPath]
@@ -122,13 +157,12 @@ function normalizeReasonixHookEntries(entries, desiredCommand) {
  * @returns {{ added: number, skipped: number, updated: number }}
  */
 function registerReasonixHooks(options = {}) {
-  const homeDir = options.homeDir || os.homedir();
-  const settingsPath = options.settingsPath || path.join(homeDir, ".reasonix", "settings.json");
+  const settingsPath = options.settingsPath || path.join(resolveReasonixHome(options), SETTINGS_FILENAME);
 
-  // Skip if ~/.reasonix/ doesn't exist (Reasonix not installed)
+  // Skip if Reasonix home doesn't exist (Reasonix not installed/initialized).
   const reasonixDir = path.dirname(settingsPath);
   if (!options.settingsPath && !fs.existsSync(reasonixDir)) {
-    if (!options.silent) console.log("Clawd: ~/.reasonix/ not found — skipping Reasonix hook registration");
+    if (!options.silent) console.log(`Clawd: ${reasonixDir} not found — skipping Reasonix hook registration`);
     return { added: 0, skipped: 0, updated: 0 };
   }
 
@@ -197,8 +231,7 @@ function registerReasonixHooks(options = {}) {
 }
 
 function unregisterReasonixHooks(options = {}) {
-  const homeDir = options.homeDir || os.homedir();
-  const settingsPath = options.settingsPath || path.join(homeDir, ".reasonix", "settings.json");
+  const settingsPath = options.settingsPath || path.join(resolveReasonixHome(options), SETTINGS_FILENAME);
 
   let settings = {};
   try {
@@ -240,7 +273,7 @@ module.exports = {
   REASONIX_HOOK_EVENTS,
   registerReasonixHooks,
   unregisterReasonixHooks,
-  __test: { buildReasonixHookCommand },
+  __test: { buildReasonixHookCommand, resolveReasonixHome },
 };
 
 if (require.main === module) {

@@ -32,6 +32,45 @@ afterEach(() => {
 });
 
 describe("Reasonix hook installer", () => {
+  it("resolves the current Reasonix home on Windows", () => {
+    const appData = "C:\\Users\\Alice\\AppData\\Roaming";
+    const userHomeDir = "C:\\Users\\Alice";
+
+    assert.strictEqual(
+      __test.resolveReasonixHome({ platform: "win32", env: { APPDATA: appData }, userHomeDir }),
+      path.join(appData, "reasonix")
+    );
+    assert.strictEqual(
+      __test.resolveReasonixHome({ platform: "win32", env: {}, userHomeDir }),
+      path.join(userHomeDir, "AppData", "Roaming", "reasonix")
+    );
+    assert.strictEqual(
+      __test.resolveReasonixHome({ platform: "win32", env: { REASONIX_HOME: "~/portable-reasonix" }, userHomeDir }),
+      path.resolve(userHomeDir, "portable-reasonix")
+    );
+  });
+
+  it("installs into the Windows Reasonix home under APPDATA", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-reasonix-appdata-"));
+    tempDirs.push(root);
+    const appData = path.join(root, "Roaming");
+    const reasonixHome = path.join(appData, "reasonix");
+    fs.mkdirSync(reasonixHome, { recursive: true });
+
+    const result = registerReasonixHooks({
+      silent: true,
+      platform: "win32",
+      env: { APPDATA: appData },
+      userHomeDir: path.join(root, "Home"),
+      nodeBin: "C:\\Program Files\\nodejs\\node.exe",
+      powerShellBin: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    });
+
+    assert.strictEqual(result.added, REASONIX_HOOK_EVENTS.length);
+    assert.ok(fs.existsSync(path.join(reasonixHome, "settings.json")));
+    assert.ok(!fs.existsSync(path.join(root, "Home", ".reasonix", "settings.json")));
+  });
+
   it("installs all hook events with reasonix-hook.js marker", () => {
     const homeDir = makeTempHome();
     const result = registerReasonixHooks({
