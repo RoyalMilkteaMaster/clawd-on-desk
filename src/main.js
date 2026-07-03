@@ -3839,6 +3839,21 @@ if (!gotTheLock) {
         screen,
         getWindows: () => [{ name: "render", win }, { name: "hit", win: hitWin }],
         logPath: path.join(app.getPath("userData"), "cloak-diagnostic.log"),
+        petRuntime: petWindowRuntime,
+        getPetState: () => ({
+          petHidden: petWindowRuntime.isPetHidden(),
+          miniTransitioning: _mini.getMiniTransitioning(),
+        }),
+        getShortcutStatus: () => {
+          const shortcuts = (_settingsController.getSnapshot() || {}).shortcuts || {};
+          const accel = shortcuts.togglePet || null;
+          let registered = "?";
+          try { registered = accel ? globalShortcut.isRegistered(accel) : "unassigned"; } catch {}
+          const failure = shortcutRuntime && typeof shortcutRuntime.getFailure === "function"
+            ? shortcutRuntime.getFailure("togglePet")
+            : null;
+          return `shortcut togglePet accel=${accel} registered=${registered} failure=${failure || "none"}`;
+        },
       });
       cloakDiag.start();
       app.once("before-quit", () => { try { cloakDiag.stop(); } catch {} });

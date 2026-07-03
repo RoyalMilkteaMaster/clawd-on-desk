@@ -2,11 +2,23 @@
 
 // ── 临时诊断模块（#525 宠物消失根因）────────────────────────────────────
 // 默认【纯只读】：采集 render/hit 窗口的完整可见性快照——DWMWA_CLOAKED
-// flag + HRESULT、isVisible、isAlwaysOnTop、bounds、与各 display 的交集
-// (onScreen)，外加 display 布局。在 flag 变化、电源事件、显示器变化时各
-// dump 一次完整快照。best-effort：非 Windows / FFI 失败时 no-op，绝不影响
-// 正式逻辑；timer 与所有事件回调都包了 try/catch，异步异常也不拖垮主进程。
-// 日志写 userData/cloak-diagnostic.log。
+// flag + HRESULT、isVisible、原生 IsWindowVisible、isMinimized、
+// isAlwaysOnTop、bounds、与各 display 的交集(onScreen)，外加 display 布局、
+// petHidden/miniTransitioning 内部状态、togglePet 快捷键注册状态。在 flag
+// 变化、isVisible 变化、窗口 show/hide/minimize/restore 事件、WM_SHOWWINDOW
+// 消息、电源事件、显示器变化时各 dump 一次完整快照。best-effort：非 Windows
+// / FFI 失败时 no-op，绝不影响正式逻辑；timer 与所有事件回调都包了
+// try/catch，异步异常也不拖垮主进程。日志写 userData/cloak-diagnostic.log。
+//
+// 第二轮加强（#496 报告者日志显示消失瞬间 cloak flag 不变、visible 变 false，
+// 需要区分"内部 setPetHidden vs 外部进程 ShowWindow(SW_HIDE)"）：
+//   • petRuntime 边界打点：wrap setPetHidden / togglePetVisibility /
+//     bringPetToPrimaryDisplay，记录参数、调用前后 petHidden、返回值和精简
+//     调用栈（区分快捷键 / 托盘菜单 / 右键菜单 / mac bridge 入口）。只包一层
+//     日志，行为不变，stop() 时还原。
+//   • WM_SHOWWINDOW hook：HWND 被【任何进程】显示/隐藏前 Windows 都会发此
+//     消息。shown=0 表示即将隐藏；lParam=0 表示来自显式 ShowWindow 调用
+//     （而非父窗口最小化等连带原因）。
 //
 // 可选 mutation（默认关）：设环境变量 CLAWD_CLOAK_DIAG_UNCLOAK=1 时，才对
 // APP-cloak(flag=1) 试一次 DwmSetWindowAttribute(DWMWA_CLOAK=false) 验证
@@ -15,15 +27,27 @@
 //
 //   ⚠ 用完即删：删本文件 + main.js 里 "临时诊断（#525）" 整块接入代码。
 //
-// 判读（宠物消失瞬间看日志）：
-//   • flag 非 0 → 确实 DWM cloak；看值 APP=1 / SHELL=2 / INHERITED=4。
-//   • flag = 0  → 不是 cloak；看 onScreen（被挪出所有屏幕?）、bounds、
-//                 isVisible、aot、display 快照（拓扑/DPI 变化?）定位真因。
+// 判读（宠物消失瞬间看日志；下表为 2026-07-03 真机实测的签名矩阵）：
+//
+//              | >>> 打点行 | WM_SHOWWINDOW | win-event | petHidden
+//   内部 hide  |  ✓(含栈)  |   不发(!)     |  ✓ hide   | true（一致）
+//   外部 SW_HIDE| 无        |  ✓ shown=0    |  不触发(!) | false（失配！）
+//
+//   • 有 ">>> setPetHidden/togglePetVisibility" 行 → 内部路径，看 caller
+//     栈定位入口（main.js:322 快捷键 handler / menu.js 托盘 / 右键菜单）。
+//   • 没有 ">>>" 行、有 WM_SHOWWINDOW shown=0 lParam=0、且 petHidden 与
+//     visible 失配 → 外部进程 ShowWindow(SW_HIDE)，查报告者机器装了什么。
+//   • 实测注意：Electron 内部 hide 不发 WM_SHOWWINDOW（走 SetWindowPos），
+//     外部 ShowWindow 不触发 Electron hide 事件——两个探针互补，另有 2s
+//     轮询对 isVisible 翻转兜底，三层不会同时漏。
+//   • WM_SHOWWINDOW 在状态生效【前】发出，其快照里 visible 仍是旧值，正常。
+//   • flag 非 0 → DWM cloak；看值 APP=1 / SHELL=2 / INHERITED=4。
 
 const fs = require("fs");
 
 const DWMWA_CLOAK = 13;     // set：让本进程 cloak/uncloak 自己的窗口
 const DWMWA_CLOAKED = 14;   // get：读 cloak 状态(0 / APP=1 / SHELL=2 / INHERITED=4)
+const WM_SHOWWINDOW = 0x0018; // 窗口显示状态即将改变（任何进程触发都会发）
 const POLL_MS = 2000;
 const HEARTBEAT_EVERY = 15; // 每 ~30s 打一次单行心跳，即使 flag 没变
 // 默认纯只读；仅显式 opt-in 才试写 uncloak（见文件头说明）。
@@ -35,6 +59,9 @@ function createCloakDiagnostic(options = {}) {
   const powerMonitor = options.powerMonitor || null;
   const screen = options.screen || null;
   const logPath = options.logPath;
+  const petRuntime = options.petRuntime || null;
+  const getPetState = typeof options.getPetState === "function" ? options.getPetState : null;
+  const getShortcutStatus = typeof options.getShortcutStatus === "function" ? options.getShortcutStatus : null;
   const noop = { start() {}, stop() {} };
   if (!isWin || !logPath) return noop;
 
@@ -60,9 +87,22 @@ function createCloakDiagnostic(options = {}) {
     return noop;
   }
 
+  // 原生层可见性：Electron isVisible 之外的独立佐证（检查 WS_VISIBLE 链）。
+  let isWindowVisibleNative = null;
+  try {
+    const user32 = koffi.load("user32.dll");
+    isWindowVisibleNative = user32.func("int __stdcall IsWindowVisible(void *hwnd)");
+  } catch (err) {
+    log(`user32 init failed (nativeVis unavailable): ${err && err.message}`);
+  }
+
   const lastFlag = new Map();
+  const lastVisible = new Map();
   const powerListeners = [];
   const screenListeners = [];
+  const windowDisposers = [];
+  const runtimePatches = [];
+  const hookedWindows = new WeakSet();
   let timer = null;
   let ticks = 0;
 
@@ -125,7 +165,8 @@ function createCloakDiagnostic(options = {}) {
     }
   }
 
-  // 单窗口完整状态：cloak flag/hr + isVisible + alwaysOnTop + bounds + onScreen
+  // 单窗口完整状态：cloak flag/hr + isVisible + 原生可见性 + isMinimized +
+  // alwaysOnTop + bounds + onScreen
   function winSnapshot(name, win) {
     if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) {
       return `${name}: <destroyed/null>`;
@@ -134,6 +175,11 @@ function createCloakDiagnostic(options = {}) {
     if (!hwnd) return `${name}: no hwnd`;
     const { hr, flag } = readCloaked(hwnd);
     const vis = typeof win.isVisible === "function" ? win.isVisible() : "?";
+    let nativeVis = "?";
+    if (isWindowVisibleNative) {
+      try { nativeVis = !!isWindowVisibleNative(hwnd); } catch {}
+    }
+    const minz = typeof win.isMinimized === "function" ? win.isMinimized() : "?";
     const aot = typeof win.isAlwaysOnTop === "function" ? win.isAlwaysOnTop() : "?";
     let bounds = null;
     let b = "?";
@@ -141,7 +187,7 @@ function createCloakDiagnostic(options = {}) {
       bounds = win.getBounds();
       b = `${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`;
     } catch {}
-    return `${name}: flag=${flag} hr=${hrStr(hr)} visible=${vis} aot=${aot} bounds=[${b}] ${coverage(bounds)}`;
+    return `${name}: flag=${flag} hr=${hrStr(hr)} visible=${vis} nativeVis=${nativeVis} min=${minz} aot=${aot} bounds=[${b}] ${coverage(bounds)}`;
   }
 
   function displaySnapshot() {
@@ -158,19 +204,156 @@ function createCloakDiagnostic(options = {}) {
     }
   }
 
-  // flag 变化 / 电源 / 显示器事件时 dump 两窗口 + display 完整快照
+  // 内部记账本 + 快捷键注册状态——每次完整快照都带上，直接检验
+  // "petHidden 与窗口真实可见性是否一致"。
+  function contextLine() {
+    const parts = [];
+    if (getPetState) {
+      try {
+        const s = getPetState() || {};
+        parts.push(`petHidden=${s.petHidden} miniTransitioning=${s.miniTransitioning}`);
+      } catch (err) {
+        parts.push(`petState:err ${err && err.message}`);
+      }
+    }
+    if (getShortcutStatus) {
+      try { parts.push(String(getShortcutStatus())); }
+      catch (err) { parts.push(`shortcut:err ${err && err.message}`); }
+    }
+    return parts.join(" | ");
+  }
+
+  // flag/visible 变化、窗口事件、电源、显示器事件时 dump 两窗口 + 状态 + display
   function dumpFull(reason) {
     log(`--- snapshot (${reason}) ---`);
     for (const entry of getWindows()) {
       log(`  ${winSnapshot(entry && entry.name, entry && entry.win)}`);
     }
+    const ctx = contextLine();
+    if (ctx) log(`  ${ctx}`);
     const ds = displaySnapshot();
     if (ds) log(`  ${ds}`);
+  }
+
+  // 精简调用栈：跳过本文件帧，取前 4 个外部帧的 文件:行号。
+  function callerFrames() {
+    try {
+      const lines = String(new Error().stack || "").split("\n").slice(1);
+      const frames = [];
+      for (const line of lines) {
+        if (line.includes("win-cloak-diagnostic.js")) continue;
+        const m = line.match(/\(?([^\s()]+):(\d+):\d+\)?\s*$/);
+        if (!m) continue;
+        const segs = m[1].split(/[\\/]/);
+        frames.push(`${segs.slice(-2).join("/")}:${m[2]}`);
+        if (frames.length >= 4) break;
+      }
+      return frames.join(" <- ") || "<no-stack>";
+    } catch {
+      return "<stack-err>";
+    }
+  }
+
+  function shortValue(v) {
+    if (v === undefined) return "undefined";
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+
+  // hookWindowMessage 回调参数在不同 Electron 版本可能是 Buffer 或 number。
+  function decodeParam(v) {
+    try {
+      if (Buffer.isBuffer(v)) return v.length >= 4 ? v.readUInt32LE(0) : v.toString("hex");
+      if (typeof v === "number") return v;
+      return v == null ? "?" : String(v);
+    } catch {
+      return "?";
+    }
+  }
+
+  // 边界打点：wrap petRuntime 的可见性入口。所有外部调用（快捷键/菜单/mac
+  // bridge）都经过导出对象，能被截获；runtime 内部闭包互调不经过——真实的
+  // 窗口翻转由 win-event / WM_SHOWWINDOW 兜底。
+  function instrumentPetRuntime() {
+    if (!petRuntime) {
+      log("petRuntime not provided; boundary logging off");
+      return;
+    }
+    for (const name of ["setPetHidden", "togglePetVisibility", "bringPetToPrimaryDisplay"]) {
+      const orig = petRuntime[name];
+      if (typeof orig !== "function") continue;
+      runtimePatches.push([name, orig]);
+      petRuntime[name] = function diagWrapped(...args) {
+        const caller = callerFrames();
+        let before = "?";
+        try { if (typeof petRuntime.isPetHidden === "function") before = petRuntime.isPetHidden(); } catch {}
+        let result;
+        try {
+          result = orig.apply(this, args);
+          return result;
+        } finally {
+          let after = "?";
+          try { if (typeof petRuntime.isPetHidden === "function") after = petRuntime.isPetHidden(); } catch {}
+          log(`>>> ${name}(${args.map(shortValue).join(",")}) petHidden ${before} -> ${after} result=${shortValue(result)} caller: ${caller}`);
+        }
+      };
+    }
+    log(`petRuntime instrumented: ${runtimePatches.map(([n]) => n).join(", ") || "<none>"}`);
+  }
+
+  function restorePetRuntime() {
+    for (const [name, orig] of runtimePatches) {
+      try { petRuntime[name] = orig; } catch {}
+    }
+    runtimePatches.length = 0;
+  }
+
+  // 窗口事件探针 + WM_SHOWWINDOW。tick 里反复调用：WeakSet 防重复，窗口
+  // 若被重建也能补挂。
+  function ensureWindowProbes() {
+    for (const entry of getWindows()) {
+      const name = entry && entry.name;
+      const win = entry && entry.win;
+      if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) continue;
+      if (hookedWindows.has(win)) continue;
+      hookedWindows.add(win);
+      for (const ev of ["show", "hide", "minimize", "restore"]) {
+        const h = () => {
+          try { dumpFull(`win-event ${name}:${ev}`); }
+          catch (err) { log(`win-event handler error: ${err && err.message}`); }
+        };
+        try {
+          win.on(ev, h);
+          windowDisposers.push(() => { try { win.removeListener(ev, h); } catch {} });
+        } catch (err) {
+          log(`win.on(${ev}) failed (${name}): ${err && err.message}`);
+        }
+      }
+      try {
+        if (typeof win.hookWindowMessage === "function") {
+          win.hookWindowMessage(WM_SHOWWINDOW, (wParam, lParam) => {
+            try {
+              // shown=1 即将显示 / 0 即将隐藏；lParam=0 表示显式 ShowWindow
+              // 调用（任何进程），非 0 是父窗口最小化等连带原因。
+              dumpFull(`WM_SHOWWINDOW ${name} shown=${decodeParam(wParam)} lParam=${decodeParam(lParam)}`);
+            } catch (err) {
+              log(`WM_SHOWWINDOW handler error: ${err && err.message}`);
+            }
+          });
+          windowDisposers.push(() => { try { win.unhookWindowMessage(WM_SHOWWINDOW); } catch {} });
+          log(`WM_SHOWWINDOW hooked (${name})`);
+        } else {
+          log(`hookWindowMessage unavailable (${name})`);
+        }
+      } catch (err) {
+        log(`hookWindowMessage failed (${name}): ${err && err.message}`);
+      }
+    }
   }
 
   function tick() {
     try {
       ticks += 1;
+      ensureWindowProbes();
       const heartbeat = ticks % HEARTBEAT_EVERY === 0;
       for (const entry of getWindows()) {
         const name = entry && entry.name;
@@ -180,7 +363,8 @@ function createCloakDiagnostic(options = {}) {
         if (!hwnd) { if (heartbeat) log(`${name}: no hwnd`); continue; }
         const { flag } = readCloaked(hwnd);
         const prev = lastFlag.get(name);
-        if (flag !== prev) {
+        const flagChanged = flag !== prev;
+        if (flagChanged) {
           lastFlag.set(name, flag);
           dumpFull(`${name} flag ${prev} -> ${flag}`);
           // 默认只读；仅在显式 opt-in 时对 APP(1) 试 uncloak（会改窗口状态）。
@@ -189,9 +373,23 @@ function createCloakDiagnostic(options = {}) {
             const after = readCloaked(hwnd);
             log(`  [MUTATE] ${name}: APP uncloak -> setHr=${hrStr(setHr)}, flag now=${after.flag} (hr=${hrStr(after.hr)})`);
           }
-        } else if (heartbeat) {
+        }
+        // 轮询级兜底：事件探针若有遗漏，visible 翻转也会触发完整快照。
+        const vis = typeof win.isVisible === "function" ? win.isVisible() : null;
+        const prevVis = lastVisible.get(name);
+        if (prevVis !== undefined && vis !== prevVis) {
+          lastVisible.set(name, vis);
+          dumpFull(`${name} visible ${prevVis} -> ${vis} (poll)`);
+        } else {
+          lastVisible.set(name, vis);
+        }
+        if (!flagChanged && heartbeat) {
           log(winSnapshot(name, win));
         }
+      }
+      if (heartbeat) {
+        const ctx = contextLine();
+        if (ctx) log(ctx);
       }
     } catch (err) {
       log(`tick error: ${err && err.message}`);
@@ -209,7 +407,9 @@ function createCloakDiagnostic(options = {}) {
 
   return {
     start() {
-      log(`=== start poll=${POLL_MS}ms ptrSize=${ptrSize} uncloak=${UNCLOAK_OPT_IN ? "on" : "off"} ===`);
+      log(`=== start poll=${POLL_MS}ms ptrSize=${ptrSize} uncloak=${UNCLOAK_OPT_IN ? "on" : "off"} nativeVis=${isWindowVisibleNative ? "on" : "off"} ===`);
+      try { instrumentPetRuntime(); } catch (err) { log(`instrument error: ${err && err.message}`); }
+      try { ensureWindowProbes(); } catch (err) { log(`window probe error: ${err && err.message}`); }
       try { dumpFull("startup"); } catch (err) { log(`startup dump error: ${err && err.message}`); }
       if (powerMonitor && typeof powerMonitor.on === "function") {
         for (const ev of ["suspend", "resume", "lock-screen", "unlock-screen"]) {
@@ -238,6 +438,11 @@ function createCloakDiagnostic(options = {}) {
       }
       powerListeners.length = 0;
       screenListeners.length = 0;
+      while (windowDisposers.length) {
+        const dispose = windowDisposers.pop();
+        try { dispose(); } catch {}
+      }
+      try { restorePetRuntime(); } catch {}
       log("=== stop ===");
     },
   };
