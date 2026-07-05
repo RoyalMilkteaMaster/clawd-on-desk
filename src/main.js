@@ -2685,6 +2685,7 @@ async function initTelegramMigrationController() {
         && getTelegramApprovalPrefs().r3DirectSendEnabled === true);
     },
     onTextMessage: (payload) => telegramDirectSend && telegramDirectSend.handleTextMessage(payload),
+    getLang: () => _settingsController.get("lang") || lang || "en",
     log: telegramApprovalLog,
   });
   telegramNativeRunner = nativeRunner;

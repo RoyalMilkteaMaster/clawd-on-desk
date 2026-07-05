@@ -149,6 +149,13 @@ function clampText(value, maxLen) {
   return text;
 }
 
+// Function-form replacement: dynamic values (question progress numbers) must
+// never be interpolated with the string form of String.replace, which parses
+// $$/$&/$`/$' as special sequences.
+function interpolate(template, token, value) {
+  return template.replace(token, () => value);
+}
+
 // Mirrors feishu-approval-client.js's normalizeElicitationPayload clamping
 // rules so a malformed or oversized AskUserQuestion payload can't blow past
 // Telegram's message/button length limits or produce an unbounded card.
@@ -202,26 +209,30 @@ function buildElicitationHeaderText(payload) {
 // question itself. The whole message is re-sent via editMessageText on every
 // navigation step - there is no separate "card body" that stays fixed the way
 // requestApproval's does, since which question is showing IS the body.
-function buildElicitationQuestionText(payload, questionIndex) {
+function buildElicitationQuestionText(payload, questionIndex, t) {
   const header = buildElicitationHeaderText(payload);
   const total = payload.questions.length;
   const question = payload.questions[questionIndex];
-  const progress = `Question ${questionIndex + 1}/${total}`;
+  const progress = interpolate(
+    interpolate(t("telegramElicitationProgress"), "{current}", String(questionIndex + 1)),
+    "{total}",
+    String(total),
+  );
   const questionLines = [progress];
   if (question.header) questionLines.push(question.header);
   questionLines.push(question.question);
   return `${header}\n\n${questionLines.join("\n")}`;
 }
 
-function buildElicitationOtherPromptText(payload, questionIndex) {
-  const base = buildElicitationQuestionText(payload, questionIndex);
-  return `${base}\n\nReply to this message with your answer.`;
+function buildElicitationOtherPromptText(payload, questionIndex, t) {
+  const base = buildElicitationQuestionText(payload, questionIndex, t);
+  return `${base}\n\n${t("telegramElicitationOtherPrompt")}`;
 }
 
 // selectedSet is the in-progress (unconfirmed) multi-select toggle state for
 // the currently active question - always empty for a single-select question,
 // since tapping an option there resolves immediately instead of toggling.
-function buildElicitationKeyboard(payload, questionIndex, selectedSet) {
+function buildElicitationKeyboard(payload, questionIndex, selectedSet, t) {
   const question = payload.questions[questionIndex];
   const callbackBase = `cq:${payload._id}`;
   const rows = question.options.map((option, optionIndex) => {
@@ -229,13 +240,13 @@ function buildElicitationKeyboard(payload, questionIndex, selectedSet) {
     const label = question.multiSelect ? `${checked ? "☑" : "☐"} ${option.label}` : option.label;
     return [{ text: clampText(label, MAX_BUTTON_TEXT), callback_data: `${callbackBase}:o${questionIndex}_${optionIndex}` }];
   });
-  rows.push([{ text: "Other", callback_data: `${callbackBase}:x${questionIndex}` }]);
+  rows.push([{ text: t("telegramElicitationOtherButton"), callback_data: `${callbackBase}:x${questionIndex}` }]);
   if (question.multiSelect) {
-    rows.push([{ text: "Confirm selection", callback_data: `${callbackBase}:c${questionIndex}` }]);
+    rows.push([{ text: t("telegramElicitationConfirmButton"), callback_data: `${callbackBase}:c${questionIndex}` }]);
   }
   const navRow = [];
-  if (questionIndex > 0) navRow.push({ text: "◀ Back", callback_data: `${callbackBase}:b${questionIndex}` });
-  navRow.push({ text: "Go to terminal", callback_data: `${callbackBase}:t` });
+  if (questionIndex > 0) navRow.push({ text: t("telegramElicitationBackButton"), callback_data: `${callbackBase}:b${questionIndex}` });
+  navRow.push({ text: t("telegramElicitationTerminalButton"), callback_data: `${callbackBase}:t` });
   rows.push(navRow);
   return rows;
 }
@@ -286,7 +297,7 @@ function createTelegramNativeRunner({
   getDispatch,        // () => migrationController.dispatch (lazy for cycle)
   getChatId,          // () => "<chat id>" (number-string)
   getAllowedUserId,   // () => "<user id>"
-  getLang = () => "en", // () => current app language, for approval card / button text
+  getLang = () => "en", // () => current app language, for approval/elicitation card / button text
   onCommand = null,   // async ({ command, args, chatId, fromId }) => text | { text }
   isCommandEnabled = () => true,
   onTextMessage = null, // async ({ text, messageId, replyToMessageId, chatId, fromId }) => text | { text }
@@ -842,12 +853,12 @@ function createTelegramNativeRunner({
 
   function renderElicitationQuestion(entry) {
     const text = entry.awaitingOtherFor != null
-      ? buildElicitationOtherPromptText(entry.payload, entry.awaitingOtherFor)
-      : buildElicitationQuestionText(entry.payload, entry.activeQuestionIndex);
+      ? buildElicitationOtherPromptText(entry.payload, entry.awaitingOtherFor, t)
+      : buildElicitationQuestionText(entry.payload, entry.activeQuestionIndex, t);
     const keyboard = entry.awaitingOtherFor != null
       ? null
-      : buildElicitationKeyboard(entry.payload, entry.activeQuestionIndex, entry.multiSelectSelections);
-    return renderElicitationCard(entry, text, keyboard || [[{ text: "Go to terminal", callback_data: `cq:${entry.payload._id}:t` }]]);
+      : buildElicitationKeyboard(entry.payload, entry.activeQuestionIndex, entry.multiSelectSelections, t);
+    return renderElicitationCard(entry, text, keyboard || [[{ text: t("telegramElicitationTerminalButton"), callback_data: `cq:${entry.payload._id}:t` }]]);
   }
 
   // Single resolution point for an elicitation, used by every exit: a
@@ -864,13 +875,13 @@ function createTelegramNativeRunner({
     }
     entry.resolve(decision);
     const status = decision === "terminal"
-      ? "🖥️ Continuing in terminal"
+      ? t("telegramElicitationTerminalStatus")
       : (decision && typeof decision === "object" && decision.type === "elicitation-submit")
-        ? "✅ Submitted"
+        ? t("telegramElicitationSubmittedStatus")
         : APPROVAL_RESOLVED_ELSEWHERE_STATUS[reason];
     const baseText = entry.awaitingOtherFor != null
-      ? buildElicitationOtherPromptText(entry.payload, entry.awaitingOtherFor)
-      : buildElicitationQuestionText(entry.payload, entry.activeQuestionIndex);
+      ? buildElicitationOtherPromptText(entry.payload, entry.awaitingOtherFor, t)
+      : buildElicitationQuestionText(entry.payload, entry.activeQuestionIndex, t);
     if (!entry.chatId || !entry.messageId) return;
     renderElicitationCard(entry, status ? `${baseText}\n\n${status}` : baseText, null);
   }
@@ -901,20 +912,20 @@ function createTelegramNativeRunner({
     if (!parsed) return false;
     const entry = pendingElicitations.get(parsed.id);
     if (!entry) {
-      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Expired" }); } catch {}
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastExpired") }); } catch {}
       return true;
     }
     const isAllowedUser = !entry.allowedUser || fromId === String(entry.allowedUser);
     const isExpectedChat = !entry.chatId || chatId === String(entry.chatId);
     if (!isAllowedUser || !isExpectedChat) {
-      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Not allowed" }); } catch {}
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastNotAllowed") }); } catch {}
       return true;
     }
 
     const { action } = parsed;
 
     if (action.type === "terminal") {
-      client.answerCallbackQuery({ callback_query_id: cb.id, text: "Continuing in terminal" }).catch(() => {});
+      client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastTerminal") }).catch(() => {});
       finishElicitation(parsed.id, "terminal");
       return true;
     }
@@ -924,7 +935,7 @@ function createTelegramNativeRunner({
     // card already moved on) is a no-op rather than corrupting a later
     // question's state.
     if (action.questionIndex !== entry.activeQuestionIndex) {
-      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Expired" }); } catch {}
+      try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastExpired") }); } catch {}
       return true;
     }
     const question = entry.payload.questions[entry.activeQuestionIndex];
@@ -953,7 +964,7 @@ function createTelegramNativeRunner({
     if (action.type === "option") {
       const option = question.options[action.optionIndex];
       if (!option) {
-        try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Unavailable" }); } catch {}
+        try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastUnavailable") }); } catch {}
         return true;
       }
       if (question.multiSelect) {
@@ -966,7 +977,7 @@ function createTelegramNativeRunner({
         renderElicitationQuestion(entry).catch(() => {});
         return true;
       }
-      client.answerCallbackQuery({ callback_query_id: cb.id, text: "Answered" }).catch(() => {});
+      client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastAnswered") }).catch(() => {});
       entry.answers[question.question] = option.label;
       advanceElicitation(parsed.id, entry);
       return true;
@@ -975,10 +986,10 @@ function createTelegramNativeRunner({
     if (action.type === "confirm") {
       if (!question.multiSelect) return true;
       if (entry.multiSelectSelections.size === 0) {
-        try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: "Pick at least one" }); } catch {}
+        try { await client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastPickAtLeastOne") }); } catch {}
         return true;
       }
-      client.answerCallbackQuery({ callback_query_id: cb.id, text: "Answered" }).catch(() => {});
+      client.answerCallbackQuery({ callback_query_id: cb.id, text: t("telegramElicitationToastAnswered") }).catch(() => {});
       const labels = Array.from(entry.multiSelectSelections)
         .sort((a, b) => a - b)
         .map((optionIndex) => question.options[optionIndex].label);
@@ -1032,8 +1043,8 @@ function createTelegramNativeRunner({
     }
     const id = randomId();
     normalized._id = id;
-    const text = buildElicitationQuestionText(normalized, 0);
-    const keyboard = buildElicitationKeyboard(normalized, 0, null);
+    const text = buildElicitationQuestionText(normalized, 0, t);
+    const keyboard = buildElicitationKeyboard(normalized, 0, null, t);
 
     return new Promise((resolve) => {
       const entry = {
