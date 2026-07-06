@@ -620,6 +620,42 @@ describe("server-route-permission POST", () => {
     assert.strictEqual(res.destroyed, true);
     assert.deepStrictEqual(res.ctx.pendingPermissions, []);
     assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, []);
+    // No card went out, so the pet must not play the PermissionRequest
+    // notification animation — there is nothing for the user to act on.
+    assert.deepStrictEqual(res.ctx.calls.updateSession, []);
+  });
+
+  it("keeps the per-agent gate authoritative over remote-only routing when both toggles are off", async () => {
+    // Recording stub, NOT a throwing one: tryRemoteOnlyApproval swallows
+    // exceptions from maybeStartRemoteApproval (started=false → destroy), so a
+    // throw here would leave every assertion below green even if the gate were
+    // bypassed. Returning true makes a bypass keep the connection open, which
+    // res.destroyed then catches — and the call log catches it directly.
+    const remoteCalls = [];
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "claude-code",
+      session_id: "sid",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+    }), {
+      ctx: {
+        hideBubbles: true,
+        // Stronger opt-out: the user disabled permission handling for this
+        // agent entirely — its requests must never reach a remote channel,
+        // even though the global bubble toggle alone would route there.
+        isAgentPermissionsEnabled: () => false,
+        maybeStartRemoteApproval: (entry) => {
+          remoteCalls.push(entry);
+          return true;
+        },
+      },
+    });
+
+    assert.deepStrictEqual(remoteCalls, []);
+    assert.strictEqual(res.destroyed, true);
+    assert.deepStrictEqual(res.ctx.pendingPermissions, []);
+    assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, []);
+    assert.deepStrictEqual(res.ctx.calls.updateSession, []);
   });
 
   it("returns terminal fallback when an elicitation bubble fails", async () => {
