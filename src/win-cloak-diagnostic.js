@@ -42,6 +42,20 @@
 //     轮询对 isVisible 翻转兜底，三层不会同时漏。
 //   • WM_SHOWWINDOW 在状态生效【前】发出，其快照里 visible 仍是旧值，正常。
 //   • flag 非 0 → DWM cloak；看值 APP=1 / SHELL=2 / INHERITED=4。
+//
+// 第三轮加强（#496 报告者 7-09 日志：petHidden/visible/nativeVis/bounds 全部
+// 正常但肉眼看不见——窗口管理层全绿，嫌疑转向"内容没被合成到屏幕"）：
+//   • 虚拟桌面归属：IVirtualDesktopManager::IsWindowOnCurrentVirtualDesktop
+//     （微软公开给外部进程用的 shell COM 接口，Win10+），每窗口快照带
+//     vdesk=CURRENT/OTHER——直接检验 render 窗口 flag 恒为 SHELL(2) 是否
+//     意味着窗口被挂到了别的虚拟桌面。
+//   • GPU 路径：快照带 gpuAccelDisabled + gpu_compositing（来自
+//     app.getGPUFeatureStatus()）；监听 app child-process-gone（重点 GPU
+//     进程）与各窗口 render-process-gone——合成进程/渲染进程死掉重启是
+//     "窗口在、像素没了"的经典成因。
+//   • 对照开关：CLAWD_DIAG_DISABLE_GPU=1（或 --diag-disable-gpu，见 main.js
+//     ready 前的接入）关硬件加速跑对照——关掉后能看见 → GPU/MPO 合成层；
+//     照样看不见 + vdesk=OTHER → 虚拟桌面；两者都排除再看别的。
 
 const fs = require("fs");
 
@@ -56,12 +70,14 @@ const UNCLOAK_OPT_IN = process.env.CLAWD_CLOAK_DIAG_UNCLOAK === "1";
 function createCloakDiagnostic(options = {}) {
   const isWin = options.isWin != null ? !!options.isWin : process.platform === "win32";
   const getWindows = typeof options.getWindows === "function" ? options.getWindows : () => [];
+  const app = options.app || null;
   const powerMonitor = options.powerMonitor || null;
   const screen = options.screen || null;
   const logPath = options.logPath;
   const petRuntime = options.petRuntime || null;
   const getPetState = typeof options.getPetState === "function" ? options.getPetState : null;
   const getShortcutStatus = typeof options.getShortcutStatus === "function" ? options.getShortcutStatus : null;
+  const getGpuStatus = typeof options.getGpuStatus === "function" ? options.getGpuStatus : null;
   const noop = { start() {}, stop() {} };
   if (!isWin || !logPath) return noop;
 
@@ -96,10 +112,68 @@ function createCloakDiagnostic(options = {}) {
     log(`user32 init failed (nativeVis unavailable): ${err && err.message}`);
   }
 
+  // 虚拟桌面归属（第三轮）：IVirtualDesktopManager 是公开 shell COM 接口，
+  // 专为外部进程查询设计。koffi 没有 COM 封装，走虚表手动调：*iface 是
+  // vtable，槽位 0-2 是 IUnknown，槽位 3 = IsWindowOnCurrentVirtualDesktop。
+  // 初始化/调用失败一律降级为 vdesk=unavail，不影响其余探针。
+  let vdeskCheck = null;
+  try {
+    const ole32 = koffi.load("ole32.dll");
+    const CoInitializeEx = ole32.func("int __stdcall CoInitializeEx(void *pvReserved, uint dwCoInit)");
+    const CoCreateInstance = ole32.func(
+      "int __stdcall CoCreateInstance(void *rclsid, void *pUnkOuter, uint dwClsContext, void *riid, _Out_ void **ppv)"
+    );
+    // GUID 内存布局：Data1(u32 LE) Data2(u16 LE) Data3(u16 LE) Data4(8 bytes)
+    const guidBuf = (g) => {
+      const [d1, d2, d3, d4, d5] = g.split("-");
+      const b = Buffer.alloc(16);
+      b.writeUInt32LE(parseInt(d1, 16), 0);
+      b.writeUInt16LE(parseInt(d2, 16), 4);
+      b.writeUInt16LE(parseInt(d3, 16), 6);
+      Buffer.from(d4 + d5, "hex").copy(b, 8);
+      return b;
+    };
+    // 主线程可能已被 Chromium 初始化过 COM：S_OK/S_FALSE/RPC_E_CHANGED_MODE
+    // 都不算失败，成败以 CoCreateInstance 为准。
+    const coInitHr = CoInitializeEx(null, 0x2 /* COINIT_APARTMENTTHREADED */);
+    const ppv = [null];
+    const ccHr = CoCreateInstance(
+      guidBuf("AA509086-5CA9-4C25-8F95-589D3C07B48A"), // CLSID_VirtualDesktopManager
+      null,
+      0x17 /* CLSCTX_ALL */,
+      guidBuf("A5CD92FF-29BE-454C-8D04-D82879FB3F1B"), // IID_IVirtualDesktopManager
+      ppv
+    );
+    if (ccHr !== 0 || !ppv[0]) {
+      log(`vdesk probe unavailable: CoInitializeEx=${hrStr(coInitHr)} CoCreateInstance=${hrStr(ccHr)}`);
+    } else {
+      const mgr = ppv[0];
+      const vtbl = koffi.decode(mgr, "void *");
+      const fnIsOnCurrent = koffi.decode(vtbl, 3 * ptrSize, "void *");
+      const IsOnCurrentProto = koffi.proto(
+        "int __stdcall DiagIsWindowOnCurrentVirtualDesktop(void *self, void *hwnd, _Out_ int *onCurrent)"
+      );
+      vdeskCheck = (hwnd) => {
+        try {
+          const out = [0];
+          const hr = koffi.call(fnIsOnCurrent, IsOnCurrentProto, mgr, hwnd, out);
+          if (hr !== 0) return `vdesk=err:${hrStr(hr)}`;
+          return out[0] ? "vdesk=CURRENT" : "vdesk=OTHER";
+        } catch (err) {
+          return `vdesk=throw:${err && err.message}`;
+        }
+      };
+      log(`vdesk probe ready (CoInitializeEx=${hrStr(coInitHr)})`);
+    }
+  } catch (err) {
+    log(`vdesk init failed: ${err && err.message}`);
+  }
+
   const lastFlag = new Map();
   const lastVisible = new Map();
   const powerListeners = [];
   const screenListeners = [];
+  const appListeners = [];
   const windowDisposers = [];
   const runtimePatches = [];
   const hookedWindows = new WeakSet();
@@ -187,7 +261,8 @@ function createCloakDiagnostic(options = {}) {
       bounds = win.getBounds();
       b = `${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`;
     } catch {}
-    return `${name}: flag=${flag} hr=${hrStr(hr)} visible=${vis} nativeVis=${nativeVis} min=${minz} aot=${aot} bounds=[${b}] ${coverage(bounds)}`;
+    const vdesk = vdeskCheck ? vdeskCheck(hwnd) : "vdesk=unavail";
+    return `${name}: flag=${flag} hr=${hrStr(hr)} visible=${vis} nativeVis=${nativeVis} min=${minz} aot=${aot} bounds=[${b}] ${coverage(bounds)} ${vdesk}`;
   }
 
   function displaySnapshot() {
@@ -219,6 +294,10 @@ function createCloakDiagnostic(options = {}) {
     if (getShortcutStatus) {
       try { parts.push(String(getShortcutStatus())); }
       catch (err) { parts.push(`shortcut:err ${err && err.message}`); }
+    }
+    if (getGpuStatus) {
+      try { parts.push(String(getGpuStatus())); }
+      catch (err) { parts.push(`gpu:err ${err && err.message}`); }
     }
     return parts.join(" | ");
   }
@@ -328,6 +407,21 @@ function createCloakDiagnostic(options = {}) {
           log(`win.on(${ev}) failed (${name}): ${err && err.message}`);
         }
       }
+      // 渲染进程死亡：窗口仍"可见"但内容可能再也画不出来——第三轮重点。
+      try {
+        if (win.webContents && typeof win.webContents.on === "function") {
+          const wc = win.webContents;
+          const h = (_e, details) => {
+            const d = details || {};
+            try { dumpFull(`render-process-gone ${name} reason=${d.reason} exitCode=${d.exitCode}`); }
+            catch (err) { log(`render-gone handler error: ${err && err.message}`); }
+          };
+          wc.on("render-process-gone", h);
+          windowDisposers.push(() => { try { wc.removeListener("render-process-gone", h); } catch {} });
+        }
+      } catch (err) {
+        log(`render-process-gone hook failed (${name}): ${err && err.message}`);
+      }
       try {
         if (typeof win.hookWindowMessage === "function") {
           win.hookWindowMessage(WM_SHOWWINDOW, (wParam, lParam) => {
@@ -407,7 +501,7 @@ function createCloakDiagnostic(options = {}) {
 
   return {
     start() {
-      log(`=== start poll=${POLL_MS}ms ptrSize=${ptrSize} uncloak=${UNCLOAK_OPT_IN ? "on" : "off"} nativeVis=${isWindowVisibleNative ? "on" : "off"} ===`);
+      log(`=== start poll=${POLL_MS}ms ptrSize=${ptrSize} uncloak=${UNCLOAK_OPT_IN ? "on" : "off"} nativeVis=${isWindowVisibleNative ? "on" : "off"} vdesk=${vdeskCheck ? "on" : "off"} ===`);
       try { instrumentPetRuntime(); } catch (err) { log(`instrument error: ${err && err.message}`); }
       try { ensureWindowProbes(); } catch (err) { log(`window probe error: ${err && err.message}`); }
       try { dumpFull("startup"); } catch (err) { log(`startup dump error: ${err && err.message}`); }
@@ -425,6 +519,20 @@ function createCloakDiagnostic(options = {}) {
           screen.on(ev, h);
         }
       }
+      // GPU/utility 等子进程死亡——GPU 进程重启后合成可能悄悄降级或丢内容。
+      if (app && typeof app.on === "function") {
+        const h = (_e, details) => {
+          const d = details || {};
+          try {
+            log(`*** child-process-gone type=${d.type} reason=${d.reason} exitCode=${d.exitCode} name=${d.name || ""} ***`);
+            if (d.type === "GPU") dumpFull("child-process-gone GPU");
+          } catch (err) {
+            log(`child-gone handler error: ${err && err.message}`);
+          }
+        };
+        appListeners.push(["child-process-gone", h]);
+        app.on("child-process-gone", h);
+      }
       timer = setInterval(tick, POLL_MS);
       tick();
     },
@@ -436,8 +544,12 @@ function createCloakDiagnostic(options = {}) {
       if (screen && typeof screen.removeListener === "function") {
         for (const [ev, h] of screenListeners) screen.removeListener(ev, h);
       }
+      if (app && typeof app.removeListener === "function") {
+        for (const [ev, h] of appListeners) app.removeListener(ev, h);
+      }
       powerListeners.length = 0;
       screenListeners.length = 0;
+      appListeners.length = 0;
       while (windowDisposers.length) {
         const dispose = windowDisposers.pop();
         try { dispose(); } catch {}

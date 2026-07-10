@@ -135,6 +135,14 @@ const { getAllAgents } = require("../agents/registry");
 // MUST be set before any BrowserWindow is created (before app.whenReady)
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
+// ── 临时诊断（#496 第三轮）：合成层对照开关——随诊断模块一起删 ──
+// CLAWD_DIAG_DISABLE_GPU=1 或 --diag-disable-gpu 时关闭硬件加速，用于二分
+// "各层状态全部可见但屏幕上没有像素"是否出在 GPU/MPO 合成路径。
+// MUST 在 app ready 前调用，所以放在这里而不是诊断模块里。
+const diagDisableGpu =
+  process.env.CLAWD_DIAG_DISABLE_GPU === "1" || process.argv.includes("--diag-disable-gpu");
+if (diagDisableGpu) app.disableHardwareAcceleration();
+
 const isMac = process.platform === "darwin";
 const isLinux = process.platform === "linux";
 const isWin = process.platform === "win32";
@@ -3835,8 +3843,16 @@ if (!gotTheLock) {
       const { createCloakDiagnostic } = require("./win-cloak-diagnostic");
       const cloakDiag = createCloakDiagnostic({
         isWin,
+        app,
         powerMonitor,
         screen,
+        // 第三轮：每张快照带 GPU 加速开关 + 合成状态（gpu_compositing 值为
+        // enabled / disabled_software 等；GPU 进程崩溃重启后可能中途变化）。
+        getGpuStatus: () => {
+          let comp = "?";
+          try { comp = (app.getGPUFeatureStatus() || {}).gpu_compositing || "?"; } catch {}
+          return `gpuAccelDisabled=${diagDisableGpu} gpu_compositing=${comp}`;
+        },
         getWindows: () => [{ name: "render", win }, { name: "hit", win: hitWin }],
         logPath: path.join(app.getPath("userData"), "cloak-diagnostic.log"),
         petRuntime: petWindowRuntime,
