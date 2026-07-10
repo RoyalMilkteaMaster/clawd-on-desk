@@ -53,9 +53,39 @@
 //     app.getGPUFeatureStatus()）；监听 app child-process-gone（重点 GPU
 //     进程）与各窗口 render-process-gone——合成进程/渲染进程死掉重启是
 //     "窗口在、像素没了"的经典成因。
-//   • 对照开关：CLAWD_DIAG_DISABLE_GPU=1（或 --diag-disable-gpu，见 main.js
-//     ready 前的接入）关硬件加速跑对照——关掉后能看见 → GPU/MPO 合成层；
-//     照样看不见 + vdesk=OTHER → 虚拟桌面；两者都排除再看别的。
+//   • 对照开关（v2 修正了判读，见下）：CLAWD_DIAG_DISABLE_GPU=1 关硬件加速
+//     （同时显式 --disable-gpu，electron#51363）；CLAWD_DIAG_DISABLE_DCOMP=1
+//     关 DirectComposition + 恢复 DWM redirection bitmap。见 main.js ready
+//     前的接入。
+//
+// 第三轮 v2（codex 复审补盲区：窗口层全绿 ≠ 只剩 GPU/vdesk 两个嫌疑）：
+//   • 页面像素 ground truth：win.webContents.capturePage() 读回 Chromium
+//     合成器输出（在 DWM/MPO 之【前】），统计 alpha>0 像素数 + bbox。
+//     判读：capture 有像素 + 屏幕没有 → DWM/DComp/MPO 输出链路；
+//     capture 没像素 → 页面/renderer 上游；有像素但 bbox 越界 → 布局。
+//   • viewportOffsetY（本项目自身机制！）：drag-position 把负 Y 虚拟坐标钳
+//     回屏幕产生补偿量，renderer 加进 CSS bottom——过大时角色被推出透明窗口
+//     外，窗口全绿但屏幕无角色。快照带 viewportOffsetY + virtualBounds，
+//     domProbe 带媒体元素 boundingClientRect/inView。
+//   • 整窗 opacity：theme-fade 会把窗口淡到 0（theme-fade-sequencer），中断
+//     即残留全透明。快照带 op=getOpacity()；wrap setOpacity 记 caller；
+//     native 行带 WS_EX_LAYERED + GetLayeredWindowAttributes alpha。
+//   • DOM 状态：executeJavaScript 采 #pet-clip clipPath、#pet-container
+//     display、媒体元素 rect/computed style/naturalSize/inView。
+//   • z-order 遮挡：aot=true 只说明进 topmost band 不代表 band 顶；沿
+//     GW_HWNDPREV 枚举盖在 render 上方且相交的可见窗口（class/pid/rect/
+//     cloak，不记标题——日志会被公开上传）。
+//   • native 几何 vs DIP：GetWindowRect（物理像素）+ DWMWA_EXTENDED_FRAME_
+//     BOUNDS + GetDpiForWindow，混合 DPI/拓扑变化时与 Electron DIP bounds
+//     对账。
+//   • HWND 身份校验：hwnd hex + IsWindow + GetAncestor(GA_ROOT)==self +
+//     pid==本进程——防"COM/DWM 答的是另一个 HWND 的问题"。
+//   • remoteSession（SM_REMOTESESSION）+ gpuInfoReady + getGPUInfo 一次性
+//     能力摘要（directComposition/supportsOverlays）。
+//   判读修正：GPU 档"关掉后可见"只证明【渲染路径变化有影响】，不特指 MPO
+//   （Chromium 软件模式仍走 DXGI+DComp）；"关掉后仍不可见"也不能排除合成层
+//   ——要结合 DComp 档与 pageCapture 三方交叉。建议报告者跑 A(正常)→
+//   B(gpu off)→A→C(dcomp off)，排除单次重启带来的状态重置干扰。
 
 const fs = require("fs");
 
@@ -78,6 +108,8 @@ function createCloakDiagnostic(options = {}) {
   const getPetState = typeof options.getPetState === "function" ? options.getPetState : null;
   const getShortcutStatus = typeof options.getShortcutStatus === "function" ? options.getShortcutStatus : null;
   const getGpuStatus = typeof options.getGpuStatus === "function" ? options.getGpuStatus : null;
+  const getGpuInfo = typeof options.getGpuInfo === "function" ? options.getGpuInfo : null;
+  const getViewportState = typeof options.getViewportState === "function" ? options.getViewportState : null;
   const noop = { start() {}, stop() {} };
   if (!isWin || !logPath) return noop;
 
@@ -104,10 +136,30 @@ function createCloakDiagnostic(options = {}) {
   }
 
   // 原生层可见性：Electron isVisible 之外的独立佐证（检查 WS_VISIBLE 链）。
+  // v2 起 u32 挂第三轮 native 探针集；单个符号缺失（老系统/32 位进程没有
+  // GetWindowLongPtrW 等）只降级对应字段，不拖垮整组。
   let isWindowVisibleNative = null;
+  let u32 = null;
   try {
     const user32 = koffi.load("user32.dll");
     isWindowVisibleNative = user32.func("int __stdcall IsWindowVisible(void *hwnd)");
+    u32 = {};
+    const defs = [
+      ["GetWindowRect", "int __stdcall GetWindowRect(void *hwnd, void *rect)"],
+      ["GetWindow", "void * __stdcall GetWindow(void *hwnd, uint uCmd)"],
+      ["GetClassNameW", "int __stdcall GetClassNameW(void *hwnd, void *buf, int cchMax)"],
+      ["GetWindowThreadProcessId", "uint __stdcall GetWindowThreadProcessId(void *hwnd, _Out_ uint *pid)"],
+      ["GetAncestor", "void * __stdcall GetAncestor(void *hwnd, uint gaFlags)"],
+      ["IsWindow", "int __stdcall IsWindow(void *hwnd)"],
+      ["GetDpiForWindow", "uint __stdcall GetDpiForWindow(void *hwnd)"],
+      ["GetLayeredWindowAttributes", "int __stdcall GetLayeredWindowAttributes(void *hwnd, _Out_ uint *crKey, _Out_ uint8 *bAlpha, _Out_ uint *dwFlags)"],
+      ["GetWindowLongPtrW", "int64 __stdcall GetWindowLongPtrW(void *hwnd, int nIndex)"],
+      ["GetWindowRgnBox", "int __stdcall GetWindowRgnBox(void *hwnd, void *rect)"],
+      ["GetSystemMetrics", "int __stdcall GetSystemMetrics(int nIndex)"],
+    ];
+    for (const [n, sig] of defs) {
+      try { u32[n] = user32.func(sig); } catch (err) { log(`user32.${n} unavailable: ${err && err.message}`); }
+    }
   } catch (err) {
     log(`user32 init failed (nativeVis unavailable): ${err && err.message}`);
   }
@@ -117,6 +169,7 @@ function createCloakDiagnostic(options = {}) {
   // vtable，槽位 0-2 是 IUnknown，槽位 3 = IsWindowOnCurrentVirtualDesktop。
   // 初始化/调用失败一律降级为 vdesk=unavail，不影响其余探针。
   let vdeskCheck = null;
+  let vdeskRelease = null;
   try {
     const ole32 = koffi.load("ole32.dll");
     const CoInitializeEx = ole32.func("int __stdcall CoInitializeEx(void *pvReserved, uint dwCoInit)");
@@ -163,6 +216,11 @@ function createCloakDiagnostic(options = {}) {
           return `vdesk=throw:${err && err.message}`;
         }
       };
+      // stop() 时 Release 接口（IUnknown 槽位 2）。故意不 CoUninitialize：
+      // 主线程 COM 生命周期归 Chromium 管，进程退出自然回收。
+      const fnRelease = koffi.decode(vtbl, 2 * ptrSize, "void *");
+      const ReleaseProto = koffi.proto("uint __stdcall DiagIUnknownRelease(void *self)");
+      vdeskRelease = () => { try { koffi.call(fnRelease, ReleaseProto, mgr); } catch {} };
       log(`vdesk probe ready (CoInitializeEx=${hrStr(coInitHr)})`);
     }
   } catch (err) {
@@ -255,6 +313,10 @@ function createCloakDiagnostic(options = {}) {
     }
     const minz = typeof win.isMinimized === "function" ? win.isMinimized() : "?";
     const aot = typeof win.isAlwaysOnTop === "function" ? win.isAlwaysOnTop() : "?";
+    // 整窗透明度：theme-fade 淡出中断会把 opacity 残留在 0——各层"可见"
+    // 但整窗全透明（codex 复审补的盲区）。
+    let op = "?";
+    try { if (typeof win.getOpacity === "function") op = win.getOpacity(); } catch {}
     let bounds = null;
     let b = "?";
     try {
@@ -262,7 +324,139 @@ function createCloakDiagnostic(options = {}) {
       b = `${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`;
     } catch {}
     const vdesk = vdeskCheck ? vdeskCheck(hwnd) : "vdesk=unavail";
-    return `${name}: flag=${flag} hr=${hrStr(hr)} visible=${vis} nativeVis=${nativeVis} min=${minz} aot=${aot} bounds=[${b}] ${coverage(bounds)} ${vdesk}`;
+    return `${name}: flag=${flag} hr=${hrStr(hr)} visible=${vis} nativeVis=${nativeVis} min=${minz} aot=${aot} op=${op} bounds=[${b}] ${coverage(bounds)} ${vdesk}`;
+  }
+
+  function rectStr(buf) {
+    const l = buf.readInt32LE(0);
+    const t = buf.readInt32LE(4);
+    const r = buf.readInt32LE(8);
+    const b = buf.readInt32LE(12);
+    return `${l},${t} ${r - l}x${b - t}`;
+  }
+
+  function classNameOf(hwnd) {
+    if (!u32 || !u32.GetClassNameW) return "?";
+    try {
+      const buf = Buffer.alloc(512);
+      const n = u32.GetClassNameW(hwnd, buf, 256);
+      return n > 0 ? buf.toString("utf16le", 0, n * 2) : "?";
+    } catch {
+      return "?";
+    }
+  }
+
+  // native 细节行：HWND 身份校验（是不是我们以为的那个窗口）+ 扩展样式/
+  // layered alpha + 物理像素几何——与 Electron DIP bounds 对账，混合 DPI/
+  // 拓扑变化时两边不一致本身就是线索。
+  function nativeDetail(name, hwnd) {
+    if (!u32) return `${name} native: unavail`;
+    const parts = [];
+    try { parts.push(`hwnd=0x${koffi.address(hwnd).toString(16)}`); } catch {}
+    try { if (u32.IsWindow) parts.push(`isWindow=${u32.IsWindow(hwnd) ? 1 : 0}`); } catch {}
+    try {
+      if (u32.GetAncestor) {
+        const root = u32.GetAncestor(hwnd, 2 /* GA_ROOT */);
+        parts.push(`root=${root && koffi.address(root) === koffi.address(hwnd) ? "self" : "OTHER!"}`);
+      }
+    } catch {}
+    try {
+      if (u32.GetWindowThreadProcessId) {
+        const pid = [0];
+        u32.GetWindowThreadProcessId(hwnd, pid);
+        parts.push(`pid=${pid[0] === process.pid ? "me" : pid[0]}`);
+      }
+    } catch {}
+    try {
+      if (u32.GetWindowLongPtrW) {
+        const ex = Number(u32.GetWindowLongPtrW(hwnd, -20 /* GWL_EXSTYLE */));
+        const f = [];
+        if (ex & 0x00080000) f.push("LAYERED");
+        if (ex & 0x00200000) f.push("NOREDIRBMP");
+        if (ex & 0x00000008) f.push("TOPMOST");
+        if (ex & 0x00000020) f.push("TRANSPARENT");
+        if (ex & 0x08000000) f.push("NOACTIVATE");
+        parts.push(`exStyle=0x${(ex >>> 0).toString(16)}(${f.join(",")})`);
+        if ((ex & 0x00080000) && u32.GetLayeredWindowAttributes) {
+          const key = [0];
+          const alpha = [0];
+          const flags = [0];
+          const ok = u32.GetLayeredWindowAttributes(hwnd, key, alpha, flags);
+          // alpha 数值只在 LWA_ALPHA(0x2) 生效时才有意义；flags=0（DComp/
+          // UpdateLayeredWindow 型窗口的常态）时 alpha 字段是残值，直接报
+          // 数值会被误读成"全透明"。读不到也不等于透明。
+          if (!ok) parts.push("layered{unreadable}");
+          else if (flags[0] & 0x2) parts.push(`layered{alpha=${alpha[0]} flags=0x${flags[0].toString(16)}}`);
+          else parts.push(`layered{attrs-unset flags=0x${flags[0].toString(16)}}`);
+        }
+      }
+    } catch { parts.push("exStyle=err"); }
+    try {
+      if (u32.GetWindowRect) {
+        const r = Buffer.alloc(16);
+        if (u32.GetWindowRect(hwnd, r)) parts.push(`physRect=[${rectStr(r)}]`);
+      }
+    } catch {}
+    try {
+      const r = Buffer.alloc(16);
+      const hr = dwmGet(hwnd, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, r, 16);
+      parts.push(hr === 0 ? `dwmFrame=[${rectStr(r)}]` : `dwmFrame=err:${hrStr(hr)}`);
+    } catch {}
+    try { if (u32.GetDpiForWindow) parts.push(`dpi=${u32.GetDpiForWindow(hwnd)}`); } catch {}
+    try {
+      if (u32.GetWindowRgnBox) {
+        const r = Buffer.alloc(16);
+        const t = u32.GetWindowRgnBox(hwnd, r);
+        parts.push(t === 0 ? "rgn=none" : `rgn=type${t}[${rectStr(r)}]`);
+      }
+    } catch {}
+    return `${name} native: ${parts.join(" ")}`;
+  }
+
+  // z-order 遮挡探针：aot=true 只说明进 topmost band，不代表 band 内最顶。
+  // 沿 GW_HWNDPREV 向上枚举盖在该窗口之上且与其相交的可见窗口（含本 app 的
+  // hit 窗口——透明面被驱动当成不透明 plane 时同样会挡）。
+  // 隐私：只记 class/pid/rect，不记窗口标题——日志会被报告者公开上传。
+  function zOrderAbove(hwnd, known) {
+    if (!u32 || !u32.GetWindow || !u32.GetWindowRect) return "zAbove: unavail";
+    try {
+      const my = Buffer.alloc(16);
+      if (!u32.GetWindowRect(hwnd, my)) return "zAbove: rect-err";
+      const mL = my.readInt32LE(0);
+      const mT = my.readInt32LE(4);
+      const mR = my.readInt32LE(8);
+      const mB = my.readInt32LE(12);
+      const rows = [];
+      let scanned = 0;
+      let cur = hwnd;
+      for (let i = 0; i < 512 && rows.length < 8; i++) {
+        cur = u32.GetWindow(cur, 3 /* GW_HWNDPREV */);
+        if (!cur) break;
+        scanned += 1;
+        let visible = false;
+        try { visible = !!(isWindowVisibleNative && isWindowVisibleNative(cur)); } catch {}
+        if (!visible) continue;
+        const r = Buffer.alloc(16);
+        if (!u32.GetWindowRect(cur, r)) continue;
+        const L = r.readInt32LE(0);
+        const T = r.readInt32LE(4);
+        const R = r.readInt32LE(8);
+        const B = r.readInt32LE(12);
+        if (Math.max(mL, L) >= Math.min(mR, R) || Math.max(mT, T) >= Math.min(mB, B)) continue;
+        let addr = null;
+        try { addr = koffi.address(cur); } catch {}
+        const label = addr != null && known ? known.get(String(addr)) : null;
+        const pid = [0];
+        try { if (u32.GetWindowThreadProcessId) u32.GetWindowThreadProcessId(cur, pid); } catch {}
+        const cloak = readCloaked(cur);
+        rows.push(`${label ? `[${label}]` : ""}0x${addr != null ? addr.toString(16) : "?"} pid=${pid[0] === process.pid ? "me" : pid[0]} class="${classNameOf(cur)}" rect=[${L},${T} ${R - L}x${B - T}] cloak=${cloak.flag}`);
+      }
+      return rows.length
+        ? `zAbove(${scanned} scanned): ${rows.join(" | ")}`
+        : `zAbove: none intersecting (${scanned} scanned)`;
+    } catch (err) {
+      return `zAbove: err ${err && err.message}`;
+    }
   }
 
   function displaySnapshot() {
@@ -276,6 +470,103 @@ function createCloakDiagnostic(options = {}) {
       return `displays=${ds.join(" ")}`;
     } catch (err) {
       return `displays:err ${err && err.message}`;
+    }
+  }
+
+  // DOM 状态探针：executeJavaScript 在页面里自含运行（只读 DOM，不碰
+  // renderer.js 内部状态）。回答"角色元素还在不在视口里、有没有被 CSS 藏掉"。
+  const DOM_PROBE_JS = `(() => {
+  try {
+    const out = { vis: document.visibilityState, vw: innerWidth, vh: innerHeight, els: [] };
+    const clip = document.getElementById("pet-clip");
+    out.clip = clip ? (getComputedStyle(clip).clipPath || "none") : "missing";
+    const cont = document.getElementById("pet-container");
+    out.cont = cont ? getComputedStyle(cont).display : "missing";
+    const els = document.querySelectorAll("object, img.clawd-img");
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      const src = String(el.getAttribute("data") || el.getAttribute("src") || "").split("/").pop().split("?")[0];
+      out.els.push({
+        tag: el.tagName.toLowerCase(),
+        src: src,
+        rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+        inView: r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight,
+        display: cs.display,
+        visibility: cs.visibility,
+        opacity: cs.opacity,
+        natural: el.naturalWidth ? (el.naturalWidth + "x" + el.naturalHeight) : "n/a"
+      });
+    }
+    return JSON.stringify(out);
+  } catch (e) { return "err:" + (e && e.message); }
+})()`;
+
+  let lastDomReportAt = 0;
+  function domReport(reason, force) {
+    const now = Date.now();
+    if (!force && now - lastDomReportAt < 2500) return;
+    lastDomReportAt = now;
+    for (const entry of getWindows()) {
+      if (!entry || entry.name !== "render") continue;
+      const win = entry.win;
+      if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) continue;
+      try {
+        win.webContents.executeJavaScript(DOM_PROBE_JS)
+          .then((res) => log(`domProbe (${reason}): ${res}`))
+          .catch((err) => log(`domProbe (${reason}) failed: ${err && err.message}`));
+      } catch (err) {
+        log(`domProbe (${reason}) threw: ${err && err.message}`);
+      }
+    }
+  }
+
+  // 页面像素 ground truth：capturePage 读回 Chromium 合成器输出，位于
+  // DWM/MPO 之【前】——跟屏幕截图（会被 MPO 弄黑）不是一个东西。
+  // capture 有像素+屏幕没有 → 输出链路（DWM/DComp/MPO）；没像素 → 页面/
+  // renderer 上游；有像素但 bbox 贴边越界 → 布局（viewportOffsetY 一类）。
+  let lastCaptureAt = 0;
+  function capturePetPixels(reason, force) {
+    const now = Date.now();
+    if (!force && now - lastCaptureAt < 5000) return;
+    lastCaptureAt = now;
+    for (const entry of getWindows()) {
+      if (!entry || entry.name !== "render") continue;
+      const win = entry.win;
+      if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) continue;
+      try {
+        win.webContents.capturePage()
+          .then((img) => {
+            try {
+              const size = img.getSize();
+              const buf = img.getBitmap(); // BGRA，alpha 在 i+3
+              let n = 0;
+              let minX = Infinity;
+              let minY = Infinity;
+              let maxX = -1;
+              let maxY = -1;
+              const w = size.width || 1;
+              for (let i = 3; i < buf.length; i += 4) {
+                if (buf[i] === 0) continue;
+                n += 1;
+                const p = (i - 3) >> 2;
+                const x = p % w;
+                const y = (p / w) | 0;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+              }
+              const bbox = n ? `[${minX},${minY} ${maxX - minX + 1}x${maxY - minY + 1}]` : "none";
+              log(`pageCapture render (${reason}): size=${size.width}x${size.height} alphaPixels=${n} alphaBBox=${bbox}`);
+            } catch (err) {
+              log(`pageCapture decode error: ${err && err.message}`);
+            }
+          })
+          .catch((err) => log(`pageCapture (${reason}) failed: ${err && err.message}`));
+      } catch (err) {
+        log(`pageCapture (${reason}) threw: ${err && err.message}`);
+      }
     }
   }
 
@@ -299,19 +590,52 @@ function createCloakDiagnostic(options = {}) {
       try { parts.push(String(getGpuStatus())); }
       catch (err) { parts.push(`gpu:err ${err && err.message}`); }
     }
+    // viewportOffsetY：drag-position 钳负 Y 产生的补偿量；过大=角色可能被
+    // 推出透明窗口外（virtualBounds 是钳制前的虚拟坐标，与 bounds 对照）。
+    if (getViewportState) {
+      try {
+        const v = getViewportState() || {};
+        const vb = v.virtualBounds || {};
+        parts.push(`viewportOffsetY=${v.viewportOffsetY} virtualBounds=[${vb.x},${vb.y} ${vb.width}x${vb.height}]`);
+      } catch (err) {
+        parts.push(`viewport:err ${err && err.message}`);
+      }
+    }
+    if (u32 && u32.GetSystemMetrics) {
+      try { parts.push(`remoteSession=${u32.GetSystemMetrics(0x1000 /* SM_REMOTESESSION */) ? 1 : 0}`); } catch {}
+    }
     return parts.join(" | ");
   }
 
-  // flag/visible 变化、窗口事件、电源、显示器事件时 dump 两窗口 + 状态 + display
+  // flag/visible 变化、窗口事件、电源、显示器事件时 dump 两窗口 + 状态 +
+  // display + native 细节 + z-order；并触发（节流的）DOM/像素探针。
   function dumpFull(reason) {
     log(`--- snapshot (${reason}) ---`);
-    for (const entry of getWindows()) {
+    const entries = getWindows();
+    const known = new Map();
+    for (const entry of entries) {
       log(`  ${winSnapshot(entry && entry.name, entry && entry.win)}`);
+    }
+    for (const entry of entries) {
+      const name = entry && entry.name;
+      const win = entry && entry.win;
+      if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) continue;
+      const hwnd = hwndOf(win);
+      if (!hwnd) continue;
+      try { known.set(String(koffi.address(hwnd)), name); } catch {}
+      log(`  ${nativeDetail(name, hwnd)}`);
+    }
+    const render = entries.find((e) => e && e.name === "render");
+    if (render && render.win && !(typeof render.win.isDestroyed === "function" && render.win.isDestroyed())) {
+      const hwnd = hwndOf(render.win);
+      if (hwnd) log(`  render ${zOrderAbove(hwnd, known)}`);
     }
     const ctx = contextLine();
     if (ctx) log(`  ${ctx}`);
     const ds = displaySnapshot();
     if (ds) log(`  ${ds}`);
+    domReport(reason);
+    capturePetPixels(reason);
   }
 
   // 精简调用栈：跳过本文件帧，取前 4 个外部帧的 文件:行号。
@@ -397,8 +721,21 @@ function createCloakDiagnostic(options = {}) {
       hookedWindows.add(win);
       for (const ev of ["show", "hide", "minimize", "restore"]) {
         const h = () => {
-          try { dumpFull(`win-event ${name}:${ev}`); }
-          catch (err) { log(`win-event handler error: ${err && err.message}`); }
+          try {
+            dumpFull(`win-event ${name}:${ev}`);
+            // show 时 dumpFull 里的即时采样赶不上淡入完成，1.8s 后强制补一次
+            // ——"show 完成后页面到底有没有像素"是本轮最关键的数据点。
+            if (ev === "show" && name === "render") {
+              setTimeout(() => {
+                try {
+                  capturePetPixels("post-show-settled", true);
+                  domReport("post-show-settled", true);
+                } catch (err) {
+                  log(`post-show probe error: ${err && err.message}`);
+                }
+              }, 1800);
+            }
+          } catch (err) { log(`win-event handler error: ${err && err.message}`); }
         };
         try {
           win.on(ev, h);
@@ -406,6 +743,20 @@ function createCloakDiagnostic(options = {}) {
         } catch (err) {
           log(`win.on(${ev}) failed (${name}): ${err && err.message}`);
         }
+      }
+      // setOpacity 打点：theme-fade 把整窗淡到 0 后序列若中断，opacity 残留
+      // 0——窗口"可见"但全透明。只包一层日志，不改行为；delete 还原原型方法。
+      try {
+        if (typeof win.setOpacity === "function") {
+          const origSetOpacity = win.setOpacity.bind(win);
+          win.setOpacity = (value) => {
+            try { log(`>>> ${name}.setOpacity(${value}) caller: ${callerFrames()}`); } catch {}
+            return origSetOpacity(value);
+          };
+          windowDisposers.push(() => { try { delete win.setOpacity; } catch {} });
+        }
+      } catch (err) {
+        log(`setOpacity wrap failed (${name}): ${err && err.message}`);
       }
       // 渲染进程死亡：窗口仍"可见"但内容可能再也画不出来——第三轮重点。
       try {
@@ -501,10 +852,41 @@ function createCloakDiagnostic(options = {}) {
 
   return {
     start() {
-      log(`=== start poll=${POLL_MS}ms ptrSize=${ptrSize} uncloak=${UNCLOAK_OPT_IN ? "on" : "off"} nativeVis=${isWindowVisibleNative ? "on" : "off"} vdesk=${vdeskCheck ? "on" : "off"} ===`);
+      log(`=== start poll=${POLL_MS}ms ptrSize=${ptrSize} uncloak=${UNCLOAK_OPT_IN ? "on" : "off"} nativeVis=${isWindowVisibleNative ? "on" : "off"} vdesk=${vdeskCheck ? "on" : "off"} native=${u32 ? "on" : "off"} ===`);
+      // 一次性 GPU 能力摘要：directComposition/supportsOverlays 直接回答
+      // "这台机器的呈现链路长什么样"。10s 超时防 GPU 进程坏死时挂起。
+      if (getGpuInfo) {
+        try {
+          Promise.race([
+            Promise.resolve(getGpuInfo()),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 10s")), 10000)),
+          ]).then((info) => {
+            try {
+              const aux = (info && info.auxAttributes) || {};
+              const devices = ((info && info.gpuDevice) || []).map(
+                (d) => `${d.vendorId}:${d.deviceId}${d.active ? "*" : ""}`
+              );
+              log(`gpuInfo: directComposition=${aux.directComposition} supportsOverlays=${aux.supportsOverlays} softwareRendering=${aux.softwareRendering} glRenderer=${JSON.stringify(aux.glRenderer || "?")} devices=[${devices.join(" ")}]`);
+            } catch (err) {
+              log(`gpuInfo parse error: ${err && err.message}`);
+            }
+          }).catch((err) => log(`gpuInfo failed: ${err && err.message}`));
+        } catch (err) {
+          log(`gpuInfo threw: ${err && err.message}`);
+        }
+      }
       try { instrumentPetRuntime(); } catch (err) { log(`instrument error: ${err && err.message}`); }
       try { ensureWindowProbes(); } catch (err) { log(`window probe error: ${err && err.message}`); }
       try { dumpFull("startup"); } catch (err) { log(`startup dump error: ${err && err.message}`); }
+      // 启动 5s 后（首帧/淡入已稳定）强制补一次页面像素+DOM 采样。
+      setTimeout(() => {
+        try {
+          capturePetPixels("startup-settled", true);
+          domReport("startup-settled", true);
+        } catch (err) {
+          log(`startup-settled probe error: ${err && err.message}`);
+        }
+      }, 5000);
       if (powerMonitor && typeof powerMonitor.on === "function") {
         for (const ev of ["suspend", "resume", "lock-screen", "unlock-screen"]) {
           const h = () => onPowerEvent(ev);
@@ -555,6 +937,11 @@ function createCloakDiagnostic(options = {}) {
         try { dispose(); } catch {}
       }
       try { restorePetRuntime(); } catch {}
+      if (vdeskRelease) {
+        vdeskRelease();
+        vdeskRelease = null;
+        vdeskCheck = null;
+      }
       log("=== stop ===");
     },
   };

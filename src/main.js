@@ -135,13 +135,38 @@ const { getAllAgents } = require("../agents/registry");
 // MUST be set before any BrowserWindow is created (before app.whenReady)
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
-// ── 临时诊断（#496 第三轮）：合成层对照开关——随诊断模块一起删 ──
-// CLAWD_DIAG_DISABLE_GPU=1 或 --diag-disable-gpu 时关闭硬件加速，用于二分
-// "各层状态全部可见但屏幕上没有像素"是否出在 GPU/MPO 合成路径。
-// MUST 在 app ready 前调用，所以放在这里而不是诊断模块里。
+// ── 临时诊断（#496 第三轮）：呈现路径对照开关——随诊断模块一起删 ──
+// 两档独立对照，都 MUST 在 app ready 前设置，所以放这里而不是诊断模块里。
+//   CLAWD_DIAG_DISABLE_GPU=1 / --diag-disable-gpu
+//     关硬件加速。Electron 38+ 单靠 disableHardwareAcceleration() 不能让所有
+//     Chromium 路径停用 GPU（electron#51363），所以同时显式 --disable-gpu。
+//   CLAWD_DIAG_DISABLE_DCOMP=1 / --diag-disable-dcomp
+//     关 DirectComposition 呈现 + 恢复传统 DWM redirection bitmap。Chromium
+//     的"软件模式"仍走 DXGI swapchain + DComp visual（仍可能被 MPO 提升），
+//     所以关 GPU 后仍不可见并不能排除合成层——这一档才把 DComp/MPO 从呈现
+//     链路里拿掉。
+// 判读措辞注意：GPU 档只证明"渲染路径变化有影响"，不特指 MPO。
 const diagDisableGpu =
   process.env.CLAWD_DIAG_DISABLE_GPU === "1" || process.argv.includes("--diag-disable-gpu");
-if (diagDisableGpu) app.disableHardwareAcceleration();
+const diagDisableDcomp =
+  process.env.CLAWD_DIAG_DISABLE_DCOMP === "1" || process.argv.includes("--diag-disable-dcomp");
+if (diagDisableGpu) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu");
+}
+if (diagDisableDcomp) {
+  app.commandLine.appendSwitch("disable-direct-composition");
+  // disable-features 是单值开关，覆盖前先并入已有值
+  const prevDisabled = app.commandLine.getSwitchValue("disable-features");
+  app.commandLine.appendSwitch(
+    "disable-features",
+    prevDisabled ? `${prevDisabled},RemoveRedirectionBitmap` : "RemoveRedirectionBitmap"
+  );
+}
+// getGPUFeatureStatus() 在 gpu-info-update 之前不可靠（官方文档明示），探针
+// 每张快照带 gpuInfoReady，避免过度解读早期读数。
+let diagGpuInfoReady = false;
+app.on("gpu-info-update", () => { diagGpuInfoReady = true; });
 
 const isMac = process.platform === "darwin";
 const isLinux = process.platform === "linux";
@@ -3846,13 +3871,23 @@ if (!gotTheLock) {
         app,
         powerMonitor,
         screen,
-        // 第三轮：每张快照带 GPU 加速开关 + 合成状态（gpu_compositing 值为
-        // enabled / disabled_software 等；GPU 进程崩溃重启后可能中途变化）。
+        // 第三轮：每张快照带对照档位 + 合成状态。gpuInfoReady=false 时
+        // gpu_compositing 读数不可信（gpu-info-update 未到）。
         getGpuStatus: () => {
           let comp = "?";
           try { comp = (app.getGPUFeatureStatus() || {}).gpu_compositing || "?"; } catch {}
-          return `gpuAccelDisabled=${diagDisableGpu} gpu_compositing=${comp}`;
+          return `diagMode[gpuOff=${diagDisableGpu} dcompOff=${diagDisableDcomp}] gpuInfoReady=${diagGpuInfoReady} gpu_compositing=${comp}`;
         },
+        // 一次性 GPU 能力摘要（directComposition/supportsOverlays 在
+        // auxAttributes 里，只有 "complete" 档才有），探针 start 时异步落日志。
+        getGpuInfo: () => app.getGPUInfo("complete"),
+        // viewportOffsetY：drag-position 把负 Y 虚拟坐标钳回屏幕产生的补偿量，
+        // renderer 会把它加进 CSS bottom——过大时角色会被推出透明窗口外，
+        // 窗口层全绿但屏幕上没有角色（codex 审查指出的第三种机制）。
+        getViewportState: () => ({
+          viewportOffsetY: petWindowRuntime.getViewportOffsetY(),
+          virtualBounds: petWindowRuntime.getPetWindowBounds(),
+        }),
         getWindows: () => [{ name: "render", win }, { name: "hit", win: hitWin }],
         logPath: path.join(app.getPath("userData"), "cloak-diagnostic.log"),
         petRuntime: petWindowRuntime,
