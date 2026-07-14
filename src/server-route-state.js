@@ -113,6 +113,10 @@ function handleStatePost(req, res, options) {
     shouldDropForDnd,
     codexOfficialTurns,
     pathApi = path,
+    // #627 residual: injectable so unit tests never load the real koffi FFI.
+    // Defaults to the real host OS check / a probe that never samples.
+    isWinHost = process.platform === "win32",
+    captureForegroundWindowsTerminal = () => null,
   } = options;
   let body = "";
   let bodySize = 0;
@@ -273,6 +277,74 @@ function handleStatePost(req, res, options) {
           res.end("mini states require svg override");
           return;
         }
+        // #627 residual: UserPromptSubmit no longer carries a fresh wt_hwnd
+        // from the hook (cache-only prompt path, hooks/clawd-hook.js) — sample
+        // the foreground Windows Terminal window synchronously here instead
+        // (koffi FFI inside the already-running Electron process, never a
+        // subprocess, so it cannot reproduce the console flash #627 was
+        // about). Priority: incoming hook wt_hwnd (older hook versions, or a
+        // pre-#627-residual sample) > this sample > existing session's last
+        // value (state.js:1431 MERGE, handled automatically by passing null
+        // through when we have nothing new).
+        //
+        // Placed AFTER resolveCodexOfficialHookState on purpose: a codex
+        // subagent prompt is classified headless THERE, and that verdict must
+        // join the effective metadata below — otherwise a first-seen subagent
+        // prompt arriving without a hook wt_hwnd could sample the local
+        // foreground WT before anything knows the session is headless
+        // (matters most once PR2/#634 makes the codex hook cache-only too).
+        // Dropped/invalid requests above never reach the probe at all.
+        //
+        // The eligibility check below MUST use "effective" metadata —
+        // incoming body fields merged with the existing session's known
+        // fields — not just the incoming body: a cache-miss prompt
+        // deliberately omits process metadata (host/wslDistro/platform/
+        // headless/sourcePid), and judging eligibility on the bare incoming
+        // body would misjudge an already-known headless/remote session as
+        // interactive and sample a Windows Terminal window that has nothing
+        // to do with it. See docs/plans/plan-issue-627-residual-userprompt-flash.md §4.2.
+        const existingSession = ctx.sessions && typeof ctx.sessions.get === "function"
+          ? ctx.sessions.get(sid)
+          : null;
+        const effHost = host || (existingSession && existingSession.host) || null;
+        const effWslDistro = wslDistro || (existingSession && existingSession.wslDistro) || null;
+        const effPlatform = platform || (existingSession && existingSession.platform) || null;
+        const effHeadless = headless === true
+          || codexHookState.headless === true
+          || (existingSession && existingSession.headless) === true;
+        const effSourcePid = source_pid || (existingSession && existingSession.sourcePid) || null;
+        // effectiveSourcePid gate: the focus entry point is a hard sourcePid
+        // requirement (src/session-focus.js:41, src/main.js:1668) — sampling
+        // for a session nobody can focus yet risks mis-attributing whatever
+        // WT window the user happens to have foreground to a headless/unknown
+        // session. A cache HIT (server already knows sourcePid) still samples
+        // normally; only a miss on a completely unknown session skips.
+        let sampledWtHwnd = null;
+        const wtHwndSamplingEligible = !wtHwnd
+          && event === "UserPromptSubmit"
+          && isWinHost
+          && !effHost
+          && !effWslDistro
+          && effPlatform !== "webui"
+          && !effHeadless
+          && !!effSourcePid;
+        if (wtHwndSamplingEligible) {
+          try { sampledWtHwnd = captureForegroundWindowsTerminal(); } catch { sampledWtHwnd = null; }
+        }
+        // Failure/ineligibility red line: never anything but null here — no
+        // hook-side PowerShell fallback is ever triggered by this route.
+        const effectiveWtHwnd = wtHwnd || sampledWtHwnd || null;
+        const wtHwndSource = wtHwnd
+          ? "hook"
+          : (sampledWtHwnd
+            ? "server"
+            : ((existingSession && existingSession.wtHwnd) ? "previous" : "none"));
+        // Provenance is only meaningful where sampling can happen; logging it
+        // on every PreToolUse/PostToolUse would flood session-debug.log
+        // (sessionLog is unconditionally enabled once the app is ready).
+        if (event === "UserPromptSubmit" && typeof ctx.debugLog === "function") {
+          ctx.debugLog(`wt-hwnd sid=${sid} event=${event} source=${wtHwndSource}`);
+        }
         if (event === "PostToolUse" || event === "PostToolUseFailure" || event === "Stop") {
           const perm = findPendingPermissionForStateEvent(ctx.pendingPermissions, {
             sessionId: sid,
@@ -328,7 +400,7 @@ function handleStatePost(req, res, options) {
         } else {
           ctx.updateSession(sid, state, event, {
             sourcePid: source_pid,
-            wtHwnd,
+            wtHwnd: effectiveWtHwnd,
             cwd,
             editor,
             pidChain,
