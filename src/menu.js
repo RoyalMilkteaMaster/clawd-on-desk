@@ -46,6 +46,57 @@ module.exports = function initMenu(ctx) {
   // ── Translation helper (bound to ctx.lang via the shared i18n module) ──
   const t = createTranslator(() => ctx.lang);
 
+  // ── #699 diagnostic hooks —— ctx.diag699 缺席时全部零开销 no-op ──
+  // 视频考古证明"点了哪个菜单项"无法靠光标轨迹还原（翻过车），而"菜单
+  // click/关闭事务"本身是 showInactive 失效的头号嫌疑——所以菜单项点击、
+  // 菜单开闭都要成为日志 ground truth。
+  const trayMenuDiag = { open: false, lastCloseAt: 0, lastClick: null };
+
+  function diagNote(line) {
+    if (ctx.diag699 && typeof ctx.diag699.note === "function") {
+      try { ctx.diag699.note(line); } catch {}
+    }
+  }
+
+  // wrap 每个菜单项的 click（递归进 submenu），记 label+时刻。
+  function instrumentMenuTemplate(items, menuName) {
+    if (!ctx.diag699 || !Array.isArray(items)) return items;
+    for (const item of items) {
+      if (!item) continue;
+      if (Array.isArray(item.submenu)) instrumentMenuTemplate(item.submenu, menuName);
+      if (typeof item.click !== "function") continue;
+      const orig = item.click;
+      const label = String(item.label || item.type || "?");
+      item.click = (...args) => {
+        trayMenuDiag.lastClick = { label, menu: menuName, at: Date.now() };
+        diagNote(`${menuName} click "${label}"`);
+        return orig(...args);
+      };
+    }
+    return items;
+  }
+
+  function getMenuDiagState() {
+    const ago = (ts) => (ts ? `${((Date.now() - ts) / 1000).toFixed(1)}s-ago` : "never");
+    const lc = trayMenuDiag.lastClick;
+    return `menu[tray=${trayMenuDiag.open ? "OPEN" : `closed(${ago(trayMenuDiag.lastCloseAt)})`} ctxMenu=${ctx.menuOpen ? "OPEN" : "closed"} lastClick=${lc ? `${JSON.stringify(lc.label)}(${lc.menu})@${ago(lc.at)}` : "none"}]`;
+  }
+
+  // 三个受控诊断按钮 + 日志入口（实现都在 main.js 的 diag699.buttons 里）：
+  //   记录当前状态   —— 纯快照，不修复（observe-first，先保住坏态证据）
+  //   立即重新展示   —— 菜单 click 回调内直接 showInactive（预期失败的对照组）
+  //   3 秒后重新展示 —— 菜单关闭后才执行（检验"菜单事务吞掉 show"假说）
+  function buildDiag699Group() {
+    if (!ctx.diag699 || !ctx.diag699.buttons) return [];
+    const b = ctx.diag699.buttons;
+    return [
+      { label: "诊断：记录当前状态", click: () => b.recordState() },
+      { label: "诊断：立即重新展示（菜单内）", click: () => b.reshowNow() },
+      { label: "诊断：3 秒后重新展示（菜单外）", click: () => b.reshowDelayed() },
+      { label: "诊断：打开日志文件夹", click: () => b.openLogFolder() },
+    ];
+  }
+
   function isMiniSupported() {
     const caps = typeof ctx.getActiveThemeCapabilities === "function"
       ? ctx.getActiveThemeCapabilities()
@@ -261,8 +312,17 @@ module.exports = function initMenu(ctx) {
       { label: t("quit"), click: () => requestAppQuit() },
     ];
 
-    const items = joinGroups([stateGroup, noiseGroup, workGroup, systemGroup, appGroup, quitGroup]);
-    ctx.tray.setContextMenu(Menu.buildFromTemplate(items));
+    const items = joinGroups([stateGroup, noiseGroup, workGroup, systemGroup, appGroup, buildDiag699Group(), quitGroup]);
+    const menu = Menu.buildFromTemplate(instrumentMenuTemplate(items, "tray-menu"));
+    if (ctx.diag699) {
+      // best-effort：tray 弹出的 views 菜单是否派发这两个事件因平台/版本而
+      // 异，冒烟时以日志实际出现与否为准；缺了也有 lastClick 打点兜底。
+      try {
+        menu.on("menu-will-show", () => { trayMenuDiag.open = true; diagNote("tray-menu will-show"); });
+        menu.on("menu-will-close", () => { trayMenuDiag.open = false; trayMenuDiag.lastCloseAt = Date.now(); diagNote("tray-menu will-close"); });
+      } catch {}
+    }
+    ctx.tray.setContextMenu(menu);
   }
 
   function rebuildAllMenus() {
@@ -477,7 +537,7 @@ module.exports = function initMenu(ctx) {
     ];
 
     const template = joinGroups([stateGroup, workGroup, displayGroup, appGroup, quitGroup]);
-    ctx.contextMenu = Menu.buildFromTemplate(template);
+    ctx.contextMenu = Menu.buildFromTemplate(instrumentMenuTemplate(template, "ctx-menu"));
   }
 
   function showPetContextMenu() {
@@ -524,5 +584,6 @@ module.exports = function initMenu(ctx) {
     showPetContextMenu,
     resizeWindow,
     requestAppQuit,
+    getMenuDiagState,
   };
 };

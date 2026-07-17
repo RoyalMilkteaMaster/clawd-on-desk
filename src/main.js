@@ -138,6 +138,39 @@ const { getAllAgents } = require("../agents/registry");
 // MUST be set before any BrowserWindow is created (before app.whenReady)
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
+// ── 临时诊断（#699 第四轮）：呈现路径对照开关——随诊断模块一起删 ──
+// 两档独立对照，都 MUST 在 app ready 前设置，所以放这里而不是诊断模块里。
+//   CLAWD_DIAG_DISABLE_GPU=1 / --diag-disable-gpu
+//     关硬件加速。Electron 38+ 单靠 disableHardwareAcceleration() 不能让所有
+//     Chromium 路径停用 GPU（electron#51363），所以同时显式 --disable-gpu。
+//   CLAWD_DIAG_DISABLE_DCOMP=1 / --diag-disable-dcomp
+//     关 DirectComposition 呈现 + 恢复传统 DWM redirection bitmap。Chromium
+//     的"软件模式"仍走 DXGI swapchain + DComp visual（仍可能被 MPO 提升），
+//     所以关 GPU 后仍不可见并不能排除合成层——这一档才把 DComp/MPO 从呈现
+//     链路里拿掉。
+// 判读措辞注意：GPU 档只证明"渲染路径变化有影响"，不特指 MPO。
+const diagDisableGpu =
+  process.env.CLAWD_DIAG_DISABLE_GPU === "1" || process.argv.includes("--diag-disable-gpu");
+const diagDisableDcomp =
+  process.env.CLAWD_DIAG_DISABLE_DCOMP === "1" || process.argv.includes("--diag-disable-dcomp");
+if (diagDisableGpu) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu");
+}
+if (diagDisableDcomp) {
+  app.commandLine.appendSwitch("disable-direct-composition");
+  // disable-features 是单值开关，覆盖前先并入已有值
+  const prevDisabled = app.commandLine.getSwitchValue("disable-features");
+  app.commandLine.appendSwitch(
+    "disable-features",
+    prevDisabled ? `${prevDisabled},RemoveRedirectionBitmap` : "RemoveRedirectionBitmap"
+  );
+}
+// getGPUFeatureStatus() 在 gpu-info-update 之前不可靠（官方文档明示），探针
+// 每张快照带 gpuInfoReady，避免过度解读早期读数。
+let diagGpuInfoReady = false;
+app.on("gpu-info-update", () => { diagGpuInfoReady = true; });
+
 const isMac = process.platform === "darwin";
 const isLinux = process.platform === "linux";
 const isWin = process.platform === "win32";
@@ -178,6 +211,10 @@ const _cloakInspector = createCloakInspector({
   isWin,
   log: (line) => console.warn(`Clawd: ${line}`),
 });
+
+// ── 临时诊断（#699 第四轮）：探针实例。whenReady 里创建；second-instance
+// 事件必然发生在主实例 ready 之后，届时已赋值。用完随整套诊断代码删除。──
+let cloakDiag = null;
 
 // ── Windows: foreground Windows Terminal probe (server-side wt_hwnd sample,
 // #627 residual) ──
@@ -3866,6 +3903,9 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on("second-instance", (_event, commandLine) => {
+    // 临时诊断（#699）：second-instance 的裸 showInactive 是录像里 2/2 救回
+    // 病态透明的路径——前后快照留底，与菜单内 reshow 的 0/2 成对照。
+    if (cloakDiag) cloakDiag.snapshotNow("before-second-instance");
     if (petWindowRuntime.isPetHidden()) {
       prepManualPetVisibility();
       petWindowRuntime.setPetHidden(false);
@@ -3883,6 +3923,7 @@ if (!gotTheLock) {
       // the cloak recovery path too.
       petWindowRuntime.recoverIfCloaked();
     }
+    if (cloakDiag) setTimeout(() => { try { cloakDiag.snapshotNow("after-second-instance"); } catch {} }, 1200);
     if (shouldOpenSettingsWindowFromArgv(commandLine)) {
       settingsWindowRuntime.openWhenReady();
     }
@@ -4014,6 +4055,83 @@ if (!gotTheLock) {
       powerMonitor.on("resume", () => petWindowRuntime.recoverIfCloaked());
       powerMonitor.on("unlock-screen", () => petWindowRuntime.recoverIfCloaked());
     }
+    // ── 临时诊断（#699 第四轮）——用完删除整块 + src/win-cloak-diagnostic.js ──
+    try {
+      const { createCloakDiagnostic } = require("./win-cloak-diagnostic");
+      cloakDiag = createCloakDiagnostic({
+        isWin,
+        app,
+        powerMonitor,
+        screen,
+        // 每张快照带对照档位 + 合成状态。gpuInfoReady=false 时
+        // gpu_compositing 读数不可信（gpu-info-update 未到）。
+        getGpuStatus: () => {
+          let comp = "?";
+          try { comp = (app.getGPUFeatureStatus() || {}).gpu_compositing || "?"; } catch {}
+          return `diagMode[gpuOff=${diagDisableGpu} dcompOff=${diagDisableDcomp}] gpuInfoReady=${diagGpuInfoReady} gpu_compositing=${comp}`;
+        },
+        getGpuInfo: () => app.getGPUInfo("complete"),
+        getViewportState: () => ({
+          viewportOffsetY: petWindowRuntime.getViewportOffsetY(),
+          virtualBounds: petWindowRuntime.getPetWindowBounds(),
+        }),
+        getWindows: () => [{ name: "render", win }, { name: "hit", win: hitWin }],
+        logPath: path.join(app.getPath("userData"), "cloak-diagnostic.log"),
+        petRuntime: petWindowRuntime,
+        getPetState: () => ({
+          petHidden: petWindowRuntime.isPetHidden(),
+          miniTransitioning: _mini.getMiniTransitioning(),
+        }),
+        getShortcutStatus: () => {
+          const shortcuts = (_settingsController.getSnapshot() || {}).shortcuts || {};
+          const accel = shortcuts.togglePet || null;
+          let registered = "?";
+          try { registered = accel ? globalShortcut.isRegistered(accel) : "unassigned"; } catch {}
+          const failure = shortcutRuntime && typeof shortcutRuntime.getFailure === "function"
+            ? shortcutRuntime.getFailure("togglePet")
+            : null;
+          return `shortcut togglePet accel=${accel} registered=${registered} failure=${failure || "none"}`;
+        },
+        // 第四轮：菜单开闭 + 最近点击的菜单项——"show 是否发生在菜单事务里"。
+        getMenuState: () => _menu.getMenuDiagState(),
+      });
+      cloakDiag.start();
+      app.once("before-quit", () => { try { cloakDiag.stop(); } catch {} });
+
+      // 第四轮：托盘诊断按钮。reshow-immediate 在菜单 click 回调内直接执行
+      //（录像里 0/2 的对照组），reshow-delayed 等菜单关闭 3s 后执行（实验组）
+      // ——两者成对回答"菜单 click/关闭事务是否吞掉 showInactive"。
+      const diagReshow = (tag) => {
+        try {
+          cloakDiag.snapshotNow(`before-${tag}`);
+          cloakDiag.note(`${tag}: showInactive both windows`);
+          if (win && !win.isDestroyed()) { win.showInactive(); keepOutOfTaskbar(win); }
+          if (hitWin && !hitWin.isDestroyed()) { hitWin.showInactive(); keepOutOfTaskbar(hitWin); }
+        } catch (err) {
+          cloakDiag.note(`${tag}: threw ${err && err.message}`);
+        }
+        setTimeout(() => { try { cloakDiag.snapshotNow(`after-${tag}`); } catch {} }, 1200);
+      };
+      _menuCtx.diag699 = {
+        note: (line) => cloakDiag.note(line),
+        snapshotNow: (reason) => cloakDiag.snapshotNow(reason),
+        buttons: {
+          recordState: () => { cloakDiag.snapshotNow("manual-record"); },
+          reshowNow: () => diagReshow("reshow-immediate"),
+          reshowDelayed: () => {
+            cloakDiag.note("reshow-delayed: scheduled +3000ms (after menu closes)");
+            setTimeout(() => diagReshow("reshow-delayed"), 3000);
+          },
+          openLogFolder: () => {
+            try { shell.showItemInFolder(path.join(app.getPath("userData"), "cloak-diagnostic.log")); } catch {}
+          },
+        },
+      };
+      rebuildAllMenus(); // 诊断组立刻出现在托盘菜单
+    } catch (err) {
+      console.warn("Clawd: cloak diagnostic init failed:", err && err.message);
+    }
+    // ── 临时诊断结束 ──
     // macOS: bridge the OS app-hidden state (⌘H / Dock right-click → 隐藏) to the
     // pet. Pet windows are setCanHide:NO, so the OS marks the app hidden but the
     // windows refuse to vanish, and an inactive-app Dock Hide fires no
