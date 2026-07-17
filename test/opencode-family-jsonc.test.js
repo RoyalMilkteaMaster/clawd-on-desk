@@ -155,33 +155,64 @@ describe("mimocode JSONC installer — unregister", () => {
     assert.deepStrictEqual(parseJsonc(text).plugin, ["@vendor/other"]);
   });
 
-  it("KNOWN LIMIT: trivia immediately FOLLOWING a removed element may be dropped", () => {
-    // jsonc-parser's element removal spans forward to the next element, so a
-    // trailing same-line comment or a full-line comment sitting between a
-    // removed element and its successor is collateral (empirically probed).
-    // Pinned here so the behavior is documented, not accidental — comments
-    // above elements that are not preceded by a removed element are the
-    // guaranteed-preserved shape (previous test).
+  it("preserves trivia FOLLOWING a removed element — span surgery, not modify() (R8 P2)", () => {
+    // jsonc-parser's own removal would swallow both comments below; the
+    // module's span surgery removes only the element token + one comma.
     const { configPath } = tmpConfig([
       "{",
       '  "plugin": [',
       `    "${PLUGIN_DIR}",`,
-      "    // note below the removed entry (may be dropped)",
-      '    "@vendor/other", // boundary comment (may be dropped)',
+      "    // note below the removed entry",
+      '    "@vendor/other", // boundary comment',
       "  ],",
       "}",
     ].join("\n"));
     const res = unregisterMimocodePlugin({ silent: true, configPath, pluginDir: PLUGIN_DIR });
     assert.strictEqual(res.removed, 1);
-    assert.deepStrictEqual(parseJsonc(fs.readFileSync(configPath, "utf8")).plugin, ["@vendor/other"]);
+    const text = fs.readFileSync(configPath, "utf8");
+    assert.ok(text.includes("// note below the removed entry"), "full-line comment after removed element must survive");
+    assert.ok(text.includes("// boundary comment"), "same-line trailing comment must survive");
+    assert.deepStrictEqual(parseJsonc(text).plugin, ["@vendor/other"]);
   });
 
-  it("is exact-match only: a different absolute path with the same basename survives", () => {
+  it("preserves file mode across register and unregister (0600 secrets stay 0600, R8 P1)", (t) => {
+    if (process.platform === "win32") return t.skip("posix file modes");
+    const { configPath } = tmpConfig(`{\n  // token inside\n  "plugin": ["${PLUGIN_DIR}", "@vendor/keep"],\n}`);
+    fs.chmodSync(configPath, 0o600);
+
+    unregisterMimocodePlugin({ silent: true, configPath, pluginDir: PLUGIN_DIR });
+    assert.strictEqual(fs.statSync(configPath).mode & 0o777, 0o600, "unregister must not widen permissions");
+
+    registerMimocodePlugin({ silent: true, configPath, pluginDir: PLUGIN_DIR });
+    assert.strictEqual(fs.statSync(configPath).mode & 0o777, 0o600, "register must not widen permissions");
+  });
+
+  it("sweeps a MASKED stale path in a lower-priority file (R8 P1 scenario)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-mimocode-stale-"));
+    const jsoncPath = path.join(dir, "mimocode.jsonc");
+    const jsonPath = path.join(dir, "mimocode.json");
+    fs.writeFileSync(jsoncPath, `{\n  "plugin": ["${PLUGIN_DIR}"],\n}`);
+    fs.writeFileSync(jsonPath, '{\n  "plugin": ["/old/install/hooks/mimocode-plugin"]\n}');
+    const res = unregisterMimocodePlugin({ silent: true, configPath: jsoncPath, pluginDir: PLUGIN_DIR });
+    assert.strictEqual(res.removed, 2, "current entry + masked stale path");
+    assert.deepStrictEqual(parseJsonc(fs.readFileSync(jsonPath, "utf8")).plugin, []);
+  });
+
+  it("removes stale absolute paths by basename — ownership matches register (R8 P1)", () => {
+    // Register treats an absolute path ending in mimocode-plugin as a stale
+    // Clawd install; unregister must apply the SAME rule or the stale entry
+    // survives the sweep and can resurrect from a lower-priority file.
     const { configPath } = tmpConfig(`{\n  "plugin": ["/elsewhere/hooks/mimocode-plugin"],\n}`);
     const res = unregisterMimocodePlugin({ silent: true, configPath, pluginDir: PLUGIN_DIR });
+    assert.strictEqual(res.removed, 1);
+    assert.deepStrictEqual(parseJsonc(fs.readFileSync(configPath, "utf8")).plugin, []);
+  });
+
+  it("never removes npm package specifiers, even scoped ones ending in mimocode-plugin", () => {
+    const { configPath } = tmpConfig(`{\n  "plugin": ["@vendor/mimocode-plugin", "mimocode-plugin"],\n}`);
+    const res = unregisterMimocodePlugin({ silent: true, configPath, pluginDir: PLUGIN_DIR });
     assert.strictEqual(res.removed, 0);
-    assert.strictEqual(res.skipped, true);
-    assert.deepStrictEqual(parseJsonc(fs.readFileSync(configPath, "utf8")).plugin, ["/elsewhere/hooks/mimocode-plugin"]);
+    assert.deepStrictEqual(parseJsonc(fs.readFileSync(configPath, "utf8")).plugin, ["@vendor/mimocode-plugin", "mimocode-plugin"]);
   });
 
   it("tolerates ENOENT and a missing plugin array", () => {

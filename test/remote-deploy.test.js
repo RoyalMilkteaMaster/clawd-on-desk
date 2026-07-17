@@ -41,12 +41,14 @@ describe("scripts/remote-deploy.sh FILES manifest", () => {
   });
 
   // plan §4.1 guard: remote SSH hosts have NO node_modules, so no file in
-  // either manifest may pull a real npm dependency. jsonc-parser (the family
-  // JSONC editor's engine) is the live hazard — it must stay isolated in
-  // hooks/opencode-family-jsonc.js, which itself must never ship remotely.
-  // The relative-require closure test above cannot see bare package requires,
-  // hence this explicit denylist.
-  it("keeps jsonc-parser and the family JSONC editor out of BOTH remote manifests", () => {
+  // either manifest may pull a real npm dependency — bare or subpath
+  // (`jsonc-parser/lib/...` crashes there just as hard as `jsonc-parser`).
+  // The relative-require closure test above cannot see bare requires, so
+  // this allowlists Node builtins and rejects everything else (R8 P2).
+  it("remote manifests require ONLY Node builtins; the family JSONC editor never ships", () => {
+    const { builtinModules } = require("node:module");
+    const builtinRoots = new Set(builtinModules.map((name) => name.split("/")[0]));
+
     const sshSource = fs.readFileSync(path.join(__dirname, "..", "src", "remote-ssh-deploy.js"), "utf8");
     const sshBlock = sshSource.match(/const HOOK_FILES = \[\s*\n([\s\S]*?)\n\];/);
     assert.ok(sshBlock, "HOOK_FILES block not found in remote-ssh-deploy.js");
@@ -62,13 +64,17 @@ describe("scripts/remote-deploy.sh FILES manifest", () => {
       );
       const content = fs.readFileSync(path.join(HOOKS_DIR, name), "utf8");
       assert.ok(
-        !/require\(["']jsonc-parser["']\)/.test(content),
-        `hooks/${name} must not require jsonc-parser — remote hosts have no node_modules`
-      );
-      assert.ok(
         !content.includes("opencode-family-jsonc"),
         `hooks/${name} must not reference the family JSONC editor`
       );
+      for (const match of content.matchAll(/require\(["']([^."'][^"']*)["']\)/g)) {
+        const spec = match[1];
+        const root = (spec.startsWith("node:") ? spec.slice(5) : spec).split("/")[0];
+        assert.ok(
+          builtinRoots.has(root),
+          `hooks/${name} requires "${spec}" — remote hosts have no node_modules, only Node builtins are deployable`
+        );
+      }
     }
   });
 

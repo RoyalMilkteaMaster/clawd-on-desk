@@ -29,6 +29,7 @@
 // callers cannot tell the two apart. `configPath` in the return names the
 // file actually edited.
 
+const fs = require("fs");
 const path = require("path");
 const { parse, parseTree, findNodeAtLocation, modify, applyEdits } = require("jsonc-parser");
 const {
@@ -48,6 +49,31 @@ function normalizePluginEntry(value) {
 
 function entryIsExactManagedPlugin(entry, pluginDir) {
   return typeof entry === "string" && normalizePluginEntry(entry) === normalizePluginEntry(pluginDir);
+}
+
+// Ownership rule shared by register AND unregister: Clawd owns the exact
+// managed path plus any ABSOLUTE entry whose directory basename matches the
+// plugin dir (a stale install at another location). Register updates such
+// entries in place; unregister must remove them too — an asymmetric sweep
+// would leave a masked stale path in a lower-priority file to resurrect
+// once the higher-priority file goes away (#607 review R8). npm package
+// specifiers (never absolute) stay untouched.
+function isManagedEntry(entry, pluginDir, pluginDirName) {
+  if (typeof entry !== "string") return false;
+  if (entryIsExactManagedPlugin(entry, pluginDir)) return true;
+  const normalized = entry.replace(/\\/g, "/");
+  const isAbsolute = path.posix.isAbsolute(normalized) || path.win32.isAbsolute(normalized);
+  return isAbsolute && path.posix.basename(normalized) === pluginDirName;
+}
+
+// Preserve the target's permission bits across the rename-into-place write:
+// a 0600 config holding provider tokens must not come back 0644 (R8 P1).
+function fileMode(filePath) {
+  try {
+    return fs.statSync(filePath).mode & 0o777;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseJsoncStrict(text, configPath) {
@@ -110,43 +136,71 @@ function declaresPlugin(state) {
 // live in the plugin array — are never touched because they aren't absolute).
 function findManagedIndex(pluginArray, pluginDir, pluginDirName) {
   for (let i = 0; i < pluginArray.length; i++) {
-    const entry = pluginArray[i];
-    if (typeof entry !== "string") continue;
-    if (entry === pluginDir) return i;
-    const normalized = entry.replace(/\\/g, "/");
-    const isAbsolute = path.posix.isAbsolute(normalized) || path.win32.isAbsolute(normalized);
-    if (isAbsolute && path.posix.basename(normalized) === pluginDirName) return i;
+    if (pluginArray[i] === pluginDir) return i;
+    if (isManagedEntry(pluginArray[i], pluginDir, pluginDirName)) return i;
   }
   return -1;
 }
 
-// jsonc-parser 3.3.1 emits a CORRUPT edit (dangling quote) when removing an
-// element from a SINGLE-LINE array (probed; latest stable at time of
-// writing). Per-element removal is only safe when the array spans multiple
-// lines; single-line arrays are rewritten wholesale instead.
-function pluginArrayIsMultiline(text) {
+// Element removal is done with CUSTOM span surgery instead of jsonc-parser's
+// modify(): upstream 3.3.1 emits a corrupt edit (dangling quote) when
+// removing from a single-line array, and on multi-line arrays its removal
+// span swallows trivia — i.e. USER COMMENTS — adjacent to the removed
+// element (both probed). We compute each element's exact span from the
+// parse tree and remove only the element token plus ONE adjacent comma, so
+// comments before, after, and on neighboring lines always survive. A line
+// left fully blank by the removal is consumed for tidiness.
+function removeEntriesFromText(text, matches) {
   const root = parseTree(text, [], PARSE_OPTIONS);
-  const node = root ? findNodeAtLocation(root, ["plugin"]) : null;
-  if (!node) return true;
-  return text.slice(node.offset, node.offset + node.length).includes("\n");
-}
+  const arr = root ? findNodeAtLocation(root, ["plugin"]) : null;
+  if (!arr || !Array.isArray(arr.children)) return text;
 
-function removeEntriesFromText(text, tree, matches) {
-  if (pluginArrayIsMultiline(text)) {
-    // Per-element removal, highest index down (keeps indices valid and
-    // preserves comments between the surviving elements).
-    let out = text;
-    for (let k = matches.length - 1; k >= 0; k--) {
-      out = applyEdits(out, modify(out, ["plugin", matches[k]], undefined, FORMATTING));
+  const spans = matches.map((index) => {
+    const node = arr.children[index];
+    let start = node.offset;
+    let end = node.offset + node.length;
+
+    // Prefer eating the FOLLOWING comma (same line, horizontal whitespace
+    // only); for a last element, eat the PRECEDING comma instead.
+    let cursor = end;
+    while (cursor < text.length && (text[cursor] === " " || text[cursor] === "\t")) cursor++;
+    if (text[cursor] === ",") {
+      end = cursor + 1;
+    } else {
+      let back = start - 1;
+      while (back >= 0 && /[ \t\r\n]/.test(text[back])) back--;
+      if (text[back] === ",") start = back;
     }
-    return out;
+
+    // Consume the whole line when nothing but whitespace remains on it.
+    let lineStart = start;
+    while (lineStart > 0 && text[lineStart - 1] !== "\n") lineStart--;
+    let lineEnd = end;
+    while (lineEnd < text.length && text[lineEnd] !== "\n") lineEnd++;
+    if (/^[ \t]*$/.test(text.slice(lineStart, start)) && /^[ \t]*$/.test(text.slice(end, lineEnd))) {
+      start = lineStart;
+      end = Math.min(lineEnd + 1, text.length);
+    }
+    return { start, end };
+  });
+
+  // Adjacent removed elements can claim the SAME comma (one eats forward,
+  // the next eats backward) — merge overlapping spans into their union
+  // before applying, or the later slice would use stale offsets.
+  spans.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span.start <= last.end) last.end = Math.max(last.end, span.end);
+    else merged.push({ ...span });
   }
-  // Single-line array: replace the whole value (upstream removal bug).
-  // Known limit: inline /* */ comments inside the one-line array are lost;
-  // line comments cannot legally exist there.
-  const matchSet = new Set(matches);
-  const remaining = tree.plugin.filter((_, i) => !matchSet.has(i));
-  return applyEdits(text, modify(text, ["plugin"], remaining, FORMATTING));
+
+  // Apply back-to-front so earlier spans stay valid.
+  let out = text;
+  for (let k = merged.length - 1; k >= 0; k--) {
+    out = out.slice(0, merged[k].start) + out.slice(merged[k].end);
+  }
+  return out;
 }
 
 function registerJsonc({ cfg, agentId, configPath, pluginDir, options = {} }) {
@@ -168,28 +222,29 @@ function registerJsonc({ cfg, agentId, configPath, pluginDir, options = {} }) {
     added = true;
   } else {
     editedPath = target.path;
+    const mode = fileMode(target.path);
     let text = target.text;
     if (!isObjectRoot(target.tree)) {
       // Non-object root ("null", a bare number…). The JSON branch tolerates
       // this by starting over from {}; there are no meaningful comments to
       // preserve in a config with no object root, so we do the same.
-      writeTextAtomic(target.path, freshConfigText(cfg, pluginDir));
+      writeTextAtomic(target.path, freshConfigText(cfg, pluginDir), { mode });
       added = true;
     } else if (!Array.isArray(target.tree.plugin)) {
       // Missing or non-array "plugin" — (re)write just that property.
       text = applyEdits(text, modify(text, ["plugin"], [pluginDir], FORMATTING));
-      writeTextAtomic(target.path, text);
+      writeTextAtomic(target.path, text, { mode });
       added = true;
     } else {
       const matchIndex = findManagedIndex(target.tree.plugin, pluginDir, cfg.pluginDirName);
       if (matchIndex === -1) {
         text = applyEdits(text, modify(text, ["plugin", -1], pluginDir, { ...FORMATTING, isArrayInsertion: true }));
-        writeTextAtomic(target.path, text);
+        writeTextAtomic(target.path, text, { mode });
         added = true;
       } else if (target.tree.plugin[matchIndex] !== pluginDir) {
         // Stale path (e.g. old install location) — update the element in place
         text = applyEdits(text, modify(text, ["plugin", matchIndex], pluginDir, FORMATTING));
-        writeTextAtomic(target.path, text);
+        writeTextAtomic(target.path, text, { mode });
         added = true;
       } else {
         skipped = true;
@@ -220,12 +275,12 @@ function unregisterJsonc({ cfg, agentId, configPath, pluginDir, options = {} }) 
 
     const matches = [];
     for (let i = 0; i < state.tree.plugin.length; i++) {
-      if (entryIsExactManagedPlugin(state.tree.plugin[i], pluginDir)) matches.push(i);
+      if (isManagedEntry(state.tree.plugin[i], pluginDir, cfg.pluginDirName)) matches.push(i);
     }
     if (!matches.length) continue;
 
-    const text = removeEntriesFromText(state.text, state.tree, matches);
-    const backupPath = writeTextAtomicWithBackup(state.path, text, options);
+    const text = removeEntriesFromText(state.text, matches);
+    const backupPath = writeTextAtomicWithBackup(state.path, text, { ...options, mode: fileMode(state.path) });
     if (backupPath) backupPaths.push(backupPath);
     removed += matches.length;
   }
@@ -243,5 +298,5 @@ function unregisterJsonc({ cfg, agentId, configPath, pluginDir, options = {} }) 
 module.exports = {
   registerJsonc,
   unregisterJsonc,
-  __test: { parseJsoncStrict, findManagedIndex, entryIsExactManagedPlugin, freshConfigText, candidatePaths },
+  __test: { parseJsoncStrict, findManagedIndex, entryIsExactManagedPlugin, isManagedEntry, freshConfigText, candidatePaths, removeEntriesFromText },
 };

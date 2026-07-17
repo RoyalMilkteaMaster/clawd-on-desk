@@ -1633,6 +1633,19 @@ describe("checkAgentIntegrations", () => {
           `${agentId}: descriptor configCandidates must mirror the registry (order matters — highest priority first)`
         );
       }
+      // marker feeds the plugin-entry basename match; detection routes into
+      // the family validator — a drift in either silently breaks the doctor
+      // for a healthy install (R8 P2).
+      assert.strictEqual(
+        descriptor.marker,
+        cfg.pluginDirName,
+        `${agentId}: descriptor marker must equal the registry pluginDirName`
+      );
+      assert.strictEqual(
+        descriptor.detection,
+        "opencode-plugin",
+        `${agentId}: family members must route through the opencode-plugin validator`
+      );
     }
   });
 

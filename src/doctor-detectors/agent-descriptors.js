@@ -210,7 +210,10 @@ const AGENT_DESCRIPTORS = Object.freeze([
     configCandidates: Object.freeze(
       getFamilyConfig("mimocode").configCandidates.map((name) => path.join(mimocode.DEFAULT_PARENT_DIR, name))
     ),
-    marker: "mimocode-plugin",
+    // marker derives from the registry: it feeds the plugin-entry basename
+    // match, so a drifted literal would report a healthy install as
+    // not-connected (R8 P2).
+    marker: getFamilyConfig("mimocode").pluginDirName,
     detection: "opencode-plugin",
   }),
   Object.freeze({
