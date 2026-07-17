@@ -1559,6 +1559,8 @@ function describeOpencodeEntryIssue(reason) {
       return "the plugin index.mjs could not be read";
     case "extra-module-exports":
       return "the module exports more than the default function, so opencode rejects it and loads nothing (#413)";
+    case "family-core-missing":
+      return "a shared opencode-family file the entry imports is missing (packaging problem)";
     default:
       return reason;
   }
@@ -1578,12 +1580,16 @@ function checkOpencodeSettings(descriptor, settings, options) {
 
   const validation = validateOpencodeEntry(entry, { fs: options.fs });
   if (!validation.ok) {
+    // family-core-missing carries WHICH shared file is gone — surface it, or
+    // the user sees "packaging problem" with no way to tell core.mjs from
+    // session-ids.mjs (the modal renders detail verbatim, no i18n layer).
+    const missingSuffix = validation.missing ? ` — missing ${validation.missing}` : "";
     return makeDetail(descriptor, "broken-path", {
       level: "warning",
       parentDirExists: true,
       configFileExists: true,
       configPath: descriptor.configPath,
-      detail: `opencode plugin entry is invalid: ${describeOpencodeEntryIssue(validation.reason)}`,
+      detail: `opencode plugin entry is invalid: ${describeOpencodeEntryIssue(validation.reason)}${missingSuffix}`,
       opencodeEntryIssue: validation.reason,
       opencodeEntry: entry,
     });

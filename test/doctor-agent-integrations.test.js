@@ -1461,6 +1461,40 @@ describe("checkAgentIntegrations", () => {
     assert.deepStrictEqual(detail.fixAction, { type: "agent-integration", agentId: "opencode" });
   });
 
+  it("surfaces WHICH shared family file is missing in the broken-path detail", () => {
+    const root = makeTempDir();
+    const parentDir = path.join(root, ".config", "opencode");
+    const hooksDir = path.join(root, "hooks");
+    const pluginPath = path.join(hooksDir, "opencode-plugin");
+    const familyDir = path.join(hooksDir, "opencode-family-plugin");
+    // Entry + core present, session-ids MISSING — the packaging false-green
+    // scenario the two-level closure check exists for (plan §3.4).
+    fs.mkdirSync(pluginPath, { recursive: true });
+    fs.writeFileSync(path.join(pluginPath, "index.mjs"), "export default async () => ({});\n", "utf8");
+    fs.mkdirSync(familyDir, { recursive: true });
+    fs.writeFileSync(path.join(familyDir, "core.mjs"), "export function createOpencodeFamilyPlugin() {}\n", "utf8");
+
+    const descriptor = baseDescriptor({
+      agentId: "opencode",
+      marker: "opencode-plugin",
+      parentDir,
+      configPath: path.join(parentDir, "opencode.json"),
+      detection: "opencode-plugin",
+    });
+    writeJson(descriptor.configPath, { plugin: [pluginPath] });
+
+    const detail = runOne(descriptor);
+    assert.strictEqual(detail.status, "broken-path");
+    assert.strictEqual(detail.opencodeEntryIssue, "family-core-missing");
+    // The modal renders detail verbatim (no i18n layer) — the user must see
+    // a readable phrase AND the concrete missing path, not the raw key.
+    assert.match(detail.detail, /shared opencode-family file/);
+    assert.ok(
+      detail.detail.includes(path.join(familyDir, "session-ids.mjs")),
+      `detail should name the missing file: ${detail.detail}`
+    );
+  });
+
   function openClawDescriptor() {
     const root = makeTempDir();
     const parentDir = path.join(root, ".openclaw");

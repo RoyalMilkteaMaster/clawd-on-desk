@@ -541,6 +541,16 @@ export function createOpencodeFamilyPlugin(config) {
     get _sessionParentById() { return _sessionParentById; },
     get _rootSessionId() { return _rootSessionId; },
     set _rootSessionId(v) { _rootSessionId = v; },
+    // Instance-isolation probes (family-core tests). Live views into the
+    // closure — a hardcoded log path or accidentally-shared state bag must
+    // fail the isolation suite, not pass silently.
+    get _debugLogPath() { return DEBUG_LOG_PATH; },
+    get _lastStatePerSession() { return _lastStatePerSession; },
+    get _cachedPort() { return _cachedPort; },
+    set _cachedPort(v) { _cachedPort = v; },
+    get _bridgeUrl() { return _bridgeUrl; },
+    get _bridgeTokenHex() { return _bridgeTokenHex; },
+    get _pidChain() { return _pidChain; },
   };
 
   // Handle v2 permission.asked event — see Phase 2 Spike in
@@ -612,7 +622,7 @@ export function createOpencodeFamilyPlugin(config) {
       return new Response("plugin not ready", { status: 503 });
     }
 
-    debugLog(`BRIDGE → host permission reply requestId=${requestId} reply=${reply}`);
+    debugLog(`BRIDGE → ${AGENT_ID} permission reply requestId=${requestId} reply=${reply}`);
     try {
       // HeyApi v1 client.post() signature confirmed by reading
       // @opencode-ai/sdk/dist/gen/sdk.gen.js — it takes { url, body, headers }

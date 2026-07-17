@@ -216,3 +216,104 @@ describe("resolvePluginDir", () => {
     assert.ok(!result.includes("asar"), `asar keyword leaked: ${result}`);
   });
 });
+
+// ── PR-A §9 gates: full wrapper surface, unregister semantics, CLI entry ──
+
+const { execFileSync } = require("child_process");
+const installerModule = require("../hooks/opencode-install");
+const { unregisterOpencodePlugin } = installerModule;
+
+describe("opencode installer wrapper surface (plan §5 contract)", () => {
+  it("exports the complete legacy surface", () => {
+    assert.strictEqual(typeof installerModule.registerOpencodePlugin, "function");
+    assert.strictEqual(typeof installerModule.unregisterOpencodePlugin, "function");
+    assert.strictEqual(typeof installerModule.resolvePluginDir, "function");
+    assert.strictEqual(typeof installerModule.DEFAULT_PARENT_DIR, "string");
+    assert.strictEqual(typeof installerModule.DEFAULT_CONFIG_PATH, "string");
+    assert.strictEqual(typeof installerModule.__test.entryIsExactManagedPlugin, "function");
+    assert.strictEqual(typeof installerModule.__test.normalizePluginEntry, "function");
+  });
+
+  it("register reports the opencode-not-found reason integration-sync branches on", () => {
+    // No configPath override → the real ~/.config/opencode existence gate runs;
+    // integration-sync.js:314 depends on this exact reason string when the
+    // host is absent. We can't control the real home dir here, so assert the
+    // contract from the other side: a result with skipped:true and no config
+    // dir must carry exactly this reason. (Full behavior is covered by the
+    // configPath-driven cases above; this pins the reason literal.)
+    const src = require("fs").readFileSync(require.resolve("../hooks/opencode-family-install.js"), "utf8");
+    assert.match(src, /reason: `\$\{agentId\}-not-found`/);
+  });
+});
+
+describe("opencode installer unregister", () => {
+  it("removes ALL exact managed entries (duplicates from historical installs)", () => {
+    const pluginDir = "/fake/clawd/hooks/opencode-plugin";
+    const configPath = makeTempConfigDir({
+      plugin: [pluginDir, "opencode-wakatime", pluginDir],
+    });
+
+    const result = unregisterOpencodePlugin({ silent: true, configPath, pluginDir });
+
+    assert.strictEqual(result.removed, 2);
+    assert.strictEqual(result.changed, true);
+    assert.strictEqual(result.skipped, false);
+    assert.deepStrictEqual(readConfig(configPath).plugin, ["opencode-wakatime"]);
+  });
+
+  it("is a no-op (skipped) when nothing matches, and tolerates ENOENT", () => {
+    const pluginDir = "/fake/clawd/hooks/opencode-plugin";
+    const configPath = makeTempConfigDir({ plugin: ["opencode-wakatime"] });
+
+    const noMatch = unregisterOpencodePlugin({ silent: true, configPath, pluginDir });
+    assert.deepStrictEqual(
+      { removed: noMatch.removed, changed: noMatch.changed, skipped: noMatch.skipped },
+      { removed: 0, changed: false, skipped: true }
+    );
+
+    const missing = unregisterOpencodePlugin({
+      silent: true,
+      configPath: path.join(path.dirname(configPath), "nope", "opencode.json"),
+      pluginDir,
+    });
+    assert.strictEqual(missing.skipped, true);
+  });
+});
+
+describe("opencode installer CLI entry (node hooks/opencode-install.js)", () => {
+  const SCRIPT = path.join(__dirname, "..", "hooks", "opencode-install.js");
+
+  function runCli(args, homeDir) {
+    return execFileSync(process.execPath, [SCRIPT, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
+    });
+  }
+
+  it("registers on default invocation and unregisters with --uninstall", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-opencode-cli-"));
+    tempDirs.push(home);
+    const configDir = path.join(home, ".config", "opencode");
+    fs.mkdirSync(configDir, { recursive: true });
+    const configPath = path.join(configDir, "opencode.json");
+
+    const out = runCli([], home);
+    assert.match(out, /Registered: /);
+    const registered = readConfig(configPath).plugin;
+    assert.strictEqual(registered.length, 1);
+    assert.ok(registered[0].endsWith("hooks/opencode-plugin"), registered[0]);
+
+    const out2 = runCli(["--uninstall"], home);
+    assert.match(out2, /entries removed: 1/);
+    assert.deepStrictEqual(readConfig(configPath).plugin, []);
+  });
+
+  it("skips politely when opencode is not installed (exit 0, no config created)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-opencode-cli-"));
+    tempDirs.push(home);
+
+    const out = runCli([], home);
+    assert.match(out, /not found — skipping opencode plugin registration/);
+    assert.strictEqual(fs.existsSync(path.join(home, ".config", "opencode", "opencode.json")), false);
+  });
+});

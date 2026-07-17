@@ -106,11 +106,44 @@ describe("opencode-family bubble payload", () => {
 describe("bubble-renderer family contract (static)", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "src", "bubble-renderer.js"), "utf8");
 
-  it("consumes only the neutral vocabulary and the single family-always behavior", () => {
-    assert.ok(source.includes("data.familyAgentId"), "renderer must branch on familyAgentId");
-    assert.ok(source.includes("data.familyAlways"), "renderer must read familyAlways");
-    assert.ok(source.includes("data.familyPatterns"), "renderer must read familyPatterns");
-    assert.ok(source.includes('decide("family-always")'), "Always button must emit family-always");
+  // Per this repo's convention (see bubble-kimi-cue.test.js) the renderer is
+  // asserted against its source rather than instantiated — but at STATEMENT
+  // granularity inside the family branch, so breaking any rendering step
+  // (detail chain, pill, Always wiring) fails a specific assertion instead of
+  // surviving a loose includes() check.
+  function familyBranch() {
+    const start = source.indexOf("if (data.familyAgentId) {");
+    assert.notStrictEqual(start, -1, "family branch not found");
+    const end = source.indexOf("revealCard();", start);
+    assert.notStrictEqual(end, -1, "family branch end not found");
+    return source.slice(start, end);
+  }
+
+  it("renders the tool pill from the PascalCased tool name", () => {
+    const branch = familyBranch();
+    assert.match(branch, /const displayName = rawName\.charAt\(0\)\.toUpperCase\(\) \+ rawName\.slice\(1\);/);
+    assert.match(branch, /toolPill\.setAttribute\("data-tool", displayName\);/);
+  });
+
+  it("keeps the full detail-selection chain: filepath → command → url → familyPatterns → raw JSON", () => {
+    const branch = familyBranch();
+    assert.match(branch, /detail = \[\.\.\.new Set\(input\.filepath\.split\(","\)/);
+    assert.match(branch, /detail = input\.command;/);
+    assert.match(branch, /detail = input\.url;/);
+    assert.match(branch, /Array\.isArray\(data\.familyPatterns\) && data\.familyPatterns\.length/);
+    assert.match(branch, /detail = \[\.\.\.new Set\(data\.familyPatterns\)\]\.join\(", "\);/);
+    assert.match(branch, /commandBlock\.textContent = truncate\(detail, 200\);/);
+  });
+
+  it("wires the Always button: candidates gate, {agent} tooltip vars, family-always decide", () => {
+    const branch = familyBranch();
+    assert.match(branch, /Array\.isArray\(data\.familyAlways\) && data\.familyAlways\.length > 0/);
+    assert.match(branch, /const agentName = data\.familyDisplayName \|\| data\.familyAgentId;/);
+    assert.match(branch, /bubbleText\(data\.lang, "alwaysAllowBlanketTitle", \{ agent: agentName \}\)/);
+    assert.match(branch, /window\.bubbleAPI\.decide\("family-always"\)/);
+  });
+
+  it("carries no legacy per-agent references anywhere in the renderer", () => {
     for (const legacy of ["data.isOpencode", "opencodeAlways", "opencodePatterns", '"opencode-always"']) {
       assert.strictEqual(source.includes(legacy), false, `legacy reference survived: ${legacy}`);
     }

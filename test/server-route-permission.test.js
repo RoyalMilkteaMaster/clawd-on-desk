@@ -351,6 +351,57 @@ describe("server-route-permission POST", () => {
     assert.deepStrictEqual(res.ctx.calls.replyOpencodeFamilyPermission, []);
   });
 
+  it("silently drops opencode permissions during DND — no bubble, no bridge reply", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "opencode",
+      session_id: "opencode:dnd",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      request_id: "req-dnd",
+      bridge_url: "http://127.0.0.1:1234",
+      bridge_token: "token",
+    }), {
+      ctx: { doNotDisturb: true },
+    });
+
+    // Fire-and-forget: 200 ACK satisfies the plugin; skipping the bridge
+    // reply lets the TUI fall back to its own prompt.
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body, "ok");
+    assert.deepStrictEqual(res.recorder.map((entry) => entry.outcome).filter(Boolean), ["dnd"]);
+    assert.deepStrictEqual(res.ctx.pendingPermissions, []);
+    assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, []);
+    assert.deepStrictEqual(res.ctx.calls.replyOpencodeFamilyPermission, []);
+  });
+
+  it("rescues a failed opencode bubble with an immediate bridge reject", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "opencode",
+      session_id: "opencode:boom",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      request_id: "req-boom",
+      bridge_url: "http://127.0.0.1:1234",
+      bridge_token: "token",
+    }), {
+      ctx: {
+        showPermissionBubble: () => { throw new Error("BrowserWindow boom"); },
+      },
+    });
+
+    assert.strictEqual(res.statusCode, 200);
+    // Ghost entry popped, TUI unblocked via reject — without this the plugin
+    // waits on the bridge until its own multi-minute timeout.
+    assert.deepStrictEqual(res.ctx.pendingPermissions, []);
+    assert.strictEqual(res.ctx.calls.replyOpencodeFamilyPermission.length, 1);
+    const reply = res.ctx.calls.replyOpencodeFamilyPermission[0];
+    assert.strictEqual(reply.agentId, "opencode");
+    assert.strictEqual(reply.reply, "reject");
+    assert.strictEqual(reply.requestId, "req-boom");
+    assert.strictEqual(reply.bridgeUrl, "http://127.0.0.1:1234");
+    assert.strictEqual(reply.bridgeToken, "token");
+  });
+
   it("destroys the Claude/CodeBuddy connection during DND", async () => {
     const res = await callPermissionPost(JSON.stringify({
       tool_name: "Bash",

@@ -90,6 +90,38 @@ describe("opencode-family plugin factory", () => {
     assert.strictEqual(mcIdle.event, "Stop"); // not SessionEnd — no cross-instance child state
     oc.__test._sessionParentById.clear();
   });
+
+  it("isolates the FULL per-instance state bag (log path, dedup, port cache, bridge)", async () => {
+    const { createOpencodeFamilyPlugin } = await loadCore();
+    const oc = createOpencodeFamilyPlugin(OPENCODE_PARAMS);
+    const mc = createOpencodeFamilyPlugin(MIMOCODE_PARAMS);
+
+    // logFileName actually binds per instance — a hardcoded DEBUG_LOG_PATH
+    // (the reviewer's surviving mutation) must fail here.
+    assert.ok(oc.__test._debugLogPath.endsWith("opencode-plugin.log"), oc.__test._debugLogPath);
+    assert.ok(mc.__test._debugLogPath.endsWith("mimocode-plugin.log"), mc.__test._debugLogPath);
+    assert.notStrictEqual(oc.__test._debugLogPath, mc.__test._debugLogPath);
+
+    // Per-session dedup map: distinct objects, no cross-instance visibility.
+    assert.notStrictEqual(oc.__test._lastStatePerSession, mc.__test._lastStatePerSession);
+    oc.__test._lastStatePerSession.set("opencode:ses_x", "working");
+    assert.strictEqual(mc.__test._lastStatePerSession.size, 0);
+    oc.__test._lastStatePerSession.clear();
+
+    // Port cache: live getter/setter into the closure, isolated per instance.
+    assert.strictEqual(oc.__test._cachedPort, null);
+    oc.__test._cachedPort = 23334;
+    assert.strictEqual(oc.__test._cachedPort, 23334); // getter reads live state
+    assert.strictEqual(mc.__test._cachedPort, null);   // not shared
+    oc.__test._cachedPort = null;
+
+    // Bridge state starts empty in both (startBridge only runs at plugin init
+    // under Bun); pid chains are distinct arrays.
+    assert.strictEqual(oc.__test._bridgeUrl, "");
+    assert.strictEqual(mc.__test._bridgeUrl, "");
+    assert.strictEqual(oc.__test._bridgeTokenHex, "");
+    assert.notStrictEqual(oc.__test._pidChain, mc.__test._pidChain);
+  });
 });
 
 describe("opencode-family session-id helpers (prefix matrix)", () => {
