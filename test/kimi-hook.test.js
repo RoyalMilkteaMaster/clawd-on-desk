@@ -1008,3 +1008,123 @@ describe("Kimi gate-ledger markers", () => {
     assert.strictEqual(isGatedPostEvent("PostToolUse", {}), false);
   });
 });
+
+describe("Kimi hook argv permission-mode flag", () => {
+  const { parseHookArgv, setArgvPermissionMode } = require("../hooks/kimi-hook");
+
+  const cleanEnv = (fn) => {
+    const oldMode = process.env.CLAWD_KIMI_PERMISSION_MODE;
+    const oldSuspect = process.env.CLAWD_KIMI_PERMISSION_SUSPECT;
+    const oldImmediate = process.env.CLAWD_KIMI_PERMISSION_IMMEDIATE;
+    try {
+      delete process.env.CLAWD_KIMI_PERMISSION_MODE;
+      delete process.env.CLAWD_KIMI_PERMISSION_SUSPECT;
+      delete process.env.CLAWD_KIMI_PERMISSION_IMMEDIATE;
+      fn();
+    } finally {
+      setArgvPermissionMode(null);
+      if (oldMode == null) delete process.env.CLAWD_KIMI_PERMISSION_MODE;
+      else process.env.CLAWD_KIMI_PERMISSION_MODE = oldMode;
+      if (oldSuspect == null) delete process.env.CLAWD_KIMI_PERMISSION_SUSPECT;
+      else process.env.CLAWD_KIMI_PERMISSION_SUSPECT = oldSuspect;
+      if (oldImmediate == null) delete process.env.CLAWD_KIMI_PERMISSION_IMMEDIATE;
+      else process.env.CLAWD_KIMI_PERMISSION_IMMEDIATE = oldImmediate;
+    }
+  };
+
+  it("parses the mode flag in any position without eating the event name", () => {
+    assert.deepStrictEqual(
+      parseHookArgv(["--permission-mode=suspect", "PreToolUse"]),
+      { event: "PreToolUse", mode: "suspect", ignoredFlags: [] }
+    );
+    assert.deepStrictEqual(
+      parseHookArgv(["PreToolUse", "--permission-mode=explicit"]),
+      { event: "PreToolUse", mode: "explicit", ignoredFlags: [] }
+    );
+    // kimi-cli passes no event argv at all — the installer flag must not
+    // become the event name (that would silently kill every hook run).
+    assert.deepStrictEqual(
+      parseHookArgv(["--permission-mode=suspect"]),
+      { event: "", mode: "suspect", ignoredFlags: [] }
+    );
+  });
+
+  it("ignores unknown flags and invalid mode values instead of misparsing them as events", () => {
+    const unknown = parseHookArgv(["--future-flag", "Stop"]);
+    assert.strictEqual(unknown.event, "Stop");
+    assert.deepStrictEqual(unknown.ignoredFlags, ["--future-flag"]);
+    const badMode = parseHookArgv(["--permission-mode=chaotic", "Stop"]);
+    assert.strictEqual(badMode.mode, null);
+    assert.deepStrictEqual(badMode.ignoredFlags, ["--permission-mode=chaotic"]);
+    assert.deepStrictEqual(parseHookArgv([]), { event: "", mode: null, ignoredFlags: [] });
+    assert.deepStrictEqual(parseHookArgv(undefined), { event: "", mode: null, ignoredFlags: [] });
+  });
+
+  it("space-separated mode values and unknown-flag values never claim the event slot", () => {
+    // `--permission-mode suspect`: the value is consumed by the flag — it must
+    // not become the event (which would override the stdin hook_event_name
+    // and silently kill the hook on the unknown name).
+    assert.deepStrictEqual(
+      parseHookArgv(["--permission-mode", "suspect"]),
+      { event: "", mode: "suspect", ignoredFlags: [] }
+    );
+    assert.deepStrictEqual(
+      parseHookArgv(["--permission-mode", "chaotic"]),
+      { event: "", mode: null, ignoredFlags: ["--permission-mode chaotic"] }
+    );
+    assert.deepStrictEqual(
+      parseHookArgv(["--permission-mode"]),
+      { event: "", mode: null, ignoredFlags: ["--permission-mode"] }
+    );
+    // Unknown flag with a non-event value: both tokens are ignored; the event
+    // stays empty so the stdin payload's hook_event_name wins.
+    assert.deepStrictEqual(
+      parseHookArgv(["--future-flag", "future-value"]),
+      { event: "", mode: null, ignoredFlags: ["--future-flag", "future-value"] }
+    );
+    // A bare positional that is not a known event name is ignored too.
+    assert.deepStrictEqual(
+      parseHookArgv(["banana"]),
+      { event: "", mode: null, ignoredFlags: ["banana"] }
+    );
+    // Space form still coexists with a real positional event.
+    assert.deepStrictEqual(
+      parseHookArgv(["--permission-mode", "explicit", "PreToolUse"]),
+      { event: "PreToolUse", mode: "explicit", ignoredFlags: [] }
+    );
+  });
+
+  it("argv suspect mode drives classifyPreTool when no env override exists", () => {
+    cleanEnv(() => {
+      setArgvPermissionMode("suspect");
+      assert.strictEqual(classifyPreTool("PreToolUse", { tool_name: "shell" }), "suspect");
+      setArgvPermissionMode("explicit");
+      assert.strictEqual(classifyPreTool("PreToolUse", { tool_name: "shell" }), "none");
+      setArgvPermissionMode(null);
+      assert.strictEqual(classifyPreTool("PreToolUse", { tool_name: "shell" }), "none");
+    });
+  });
+
+  it("env escape hatches beat the persisted argv mode in both directions", () => {
+    cleanEnv(() => {
+      setArgvPermissionMode("suspect");
+      process.env.CLAWD_KIMI_PERMISSION_MODE = "explicit";
+      assert.strictEqual(classifyPreTool("PreToolUse", { tool_name: "shell" }), "none");
+      delete process.env.CLAWD_KIMI_PERMISSION_MODE;
+
+      setArgvPermissionMode("explicit");
+      process.env.CLAWD_KIMI_PERMISSION_SUSPECT = "1";
+      assert.strictEqual(classifyPreTool("PreToolUse", { tool_name: "shell" }), "suspect");
+    });
+  });
+
+  it("explicit payload signals still win over any mode (argv or otherwise)", () => {
+    cleanEnv(() => {
+      setArgvPermissionMode("explicit");
+      assert.strictEqual(
+        classifyPreTool("PreToolUse", { tool_name: "shell", permission_required: true }),
+        "immediate"
+      );
+    });
+  });
+});

@@ -77,12 +77,71 @@ function resolvePermissionTools() {
 
 const PERMISSION_TOOLS = resolvePermissionTools();
 
-function readPermissionMode() {
-  const raw = typeof process.env.CLAWD_KIMI_PERMISSION_MODE === "string"
-    ? process.env.CLAWD_KIMI_PERMISSION_MODE.trim().toLowerCase()
-    : "";
+function normalizePermissionModeValue(value) {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (raw === MODE_EXPLICIT || raw === MODE_SUSPECT) return raw;
   return null;
+}
+
+function readPermissionMode() {
+  return normalizePermissionModeValue(process.env.CLAWD_KIMI_PERMISSION_MODE);
+}
+
+// Persistent mode switch written into the hook command line by the installer
+// (`--permission-mode=suspect`). argv instead of an env prefix because both
+// Kimi generations execute hooks through a real shell on Windows
+// (create_subprocess_shell / %COMSPEC%), where the POSIX `VAR=x cmd` form
+// silently does not execute. Runtime env vars stay the higher-priority escape
+// hatch — see classifyPreTool.
+let argvPermissionMode = null;
+
+function setArgvPermissionMode(value) {
+  argvPermissionMode = normalizePermissionModeValue(value);
+  return argvPermissionMode;
+}
+
+// Splits argv tail into { event, mode }. `--permission-mode=<x>` (and the
+// space-separated `--permission-mode <x>` form, whose value is consumed so it
+// can never be misread as an event) set the persistent mode; other `--` flags
+// are ignored. A positional token may claim the event slot ONLY when it is a
+// known event name: kimi-cli itself passes no event argv (the real event
+// arrives as hook_event_name on stdin), and an arbitrary token promoted to
+// eventFromArgv would override that stdin event and make main() exit(0) on
+// the unknown name — a silently dead hook. Residual corner: the value of an
+// UNKNOWN flag that happens to spell a valid event name is still taken as the
+// event; unknowable without a registry of which flags take values.
+function parseHookArgv(argvTail) {
+  const parsed = { event: "", mode: null, ignoredFlags: [] };
+  const args = Array.isArray(argvTail) ? argvTail : [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (typeof arg !== "string" || !arg) continue;
+    if (arg.startsWith("--")) {
+      const eqMatch = arg.match(/^--permission-mode=(.*)$/);
+      if (eqMatch) {
+        const normalized = normalizePermissionModeValue(eqMatch[1]);
+        if (normalized) parsed.mode = normalized;
+        else parsed.ignoredFlags.push(arg);
+        continue;
+      }
+      if (arg === "--permission-mode") {
+        const value = typeof args[i + 1] === "string" ? args[i + 1] : "";
+        i += 1;
+        const normalized = normalizePermissionModeValue(value);
+        if (normalized) parsed.mode = normalized;
+        else parsed.ignoredFlags.push(value ? `${arg} ${value}` : arg);
+        continue;
+      }
+      parsed.ignoredFlags.push(arg);
+      continue;
+    }
+    if (!parsed.event && EVENT_TO_STATE[arg]) {
+      parsed.event = arg;
+    } else {
+      parsed.ignoredFlags.push(arg);
+    }
+  }
+  return parsed;
 }
 
 function isTruthySignal(value) {
@@ -300,14 +359,21 @@ function classifyPreTool(event, payload) {
   // Legacy behavior: any permission-gated PreToolUse flips notification
   // instantly. Useful for folks who want the visual cue no matter what.
   if (process.env.CLAWD_KIMI_PERMISSION_IMMEDIATE === "1") return "immediate";
-  // Persistent mode switch (written into ~/.kimi/config.toml hook command).
-  const mode = readPermissionMode();
-  if (mode === MODE_SUSPECT) return "suspect";
-  if (mode === MODE_EXPLICIT) return "none";
-  // Optional suspect mode: manual opt-in.
+  // Runtime env escape hatch: always beats the persisted argv mode.
+  const envMode = readPermissionMode();
+  if (envMode === MODE_SUSPECT) return "suspect";
+  if (envMode === MODE_EXPLICIT) return "none";
+  // Optional suspect mode: manual opt-in (env level, still beats argv).
   if (process.env.CLAWD_KIMI_PERMISSION_SUSPECT === "1") return "suspect";
-  // Default: explicit-only mode to avoid false positives for long-running
-  // auto-approved tools (sleep/npm/network I/O).
+  // Persistent mode switch baked into the hook command line by the installer
+  // (legacy flavor defaults to `--permission-mode=suspect` since the
+  // batched-approvals work — current kimi-cli never emits explicit permission
+  // fields, so explicit-only was a cue that never fired).
+  if (argvPermissionMode === MODE_SUSPECT) return "suspect";
+  if (argvPermissionMode === MODE_EXPLICIT) return "none";
+  // Default without any switch: explicit-only mode to avoid false positives
+  // for long-running auto-approved tools (sleep/npm/network I/O). Kimi Code
+  // installs carry no mode flag and land here by design.
   return "none";
 }
 
@@ -443,7 +509,12 @@ function buildStateBody(event, payload, resolve) {
 }
 
 function main() {
-  const eventFromArgv = process.argv[2];
+  const parsedArgv = parseHookArgv(process.argv.slice(2));
+  if (parsedArgv.mode) setArgvPermissionMode(parsedArgv.mode);
+  if (parsedArgv.ignoredFlags.length) {
+    appendHookDebug({ at: new Date().toISOString(), ignored_flags: parsedArgv.ignoredFlags });
+  }
+  const eventFromArgv = parsedArgv.event;
 
   const config = getPlatformConfig();
   const agentNames = {
@@ -504,6 +575,8 @@ module.exports = {
   readToolName,
   hasKeywordPermissionSignal,
   readPermissionMode,
+  parseHookArgv,
+  setArgvPermissionMode,
   MODE_EXPLICIT,
   MODE_SUSPECT,
   readHookDebugMaxBytes,
