@@ -26,7 +26,7 @@ describe("session focus helpers", () => {
           id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
           agentId: "codex",
           state: "working",
-          codexOriginator: "Codex Desktop",
+          codexOriginator: "codex_work_desktop",
         },
       ],
     };
@@ -41,10 +41,15 @@ describe("session focus helpers", () => {
     const entry = {
       id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
       agentId: "codex",
-      codexOriginator: "Codex Desktop",
+      codexOriginator: "codex_work_desktop",
     };
 
     assert.strictEqual(getCodexThreadId(entry), "019e115a-4df2-7ed0-b90e-8e6345aca777");
+    assert.strictEqual(getCodexThreadId({
+      id: entry.id,
+      agentId: "codex",
+      originator: "Codex Desktop",
+    }), "019e115a-4df2-7ed0-b90e-8e6345aca777");
     assert.strictEqual(getCodexThreadUrl(entry), "codex://threads/019e115a-4df2-7ed0-b90e-8e6345aca777");
     assert.deepStrictEqual(getSessionFocusTarget(entry), {
       canFocus: true,
@@ -72,14 +77,14 @@ describe("session focus helpers", () => {
     const entry = {
       id: "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
       agentId: "codex",
-      codexOriginator: "Codex Desktop",
+      codexOriginator: "codex_work_desktop",
       sourcePid: 123,
       state: "working",
     };
     const noTerminalEntry = {
       id: "codex:019e115b-4df2-7ed0-b90e-8e6345aca777",
       agentId: "codex",
-      codexOriginator: "Codex Desktop",
+      codexOriginator: "codex_work_desktop",
       state: "working",
     };
 

@@ -23,12 +23,40 @@ const {
   clampAssistantOutputText,
   extractAssistantTextFromRecord,
 } = require("./codex-assistant-output");
+const { parseCodexUserInputRecord } = require("./codex-user-input");
 
 // ── Inline config from agents/codex.js (zero-dependency requirement) ──
 
 const SESSION_DIR = path.join(os.homedir(), ".codex", "sessions");
 const POLL_INTERVAL_MS = 1500;
 const STALE_MS = 300000;
+// Startup recovery sweep bounds (see recoverStalePendingUserInputEntry).
+// Bounded head+tail reads, never a full readFileSync of an arbitrarily large
+// rollout file. session_meta (cwd / subagent role) is always Codex's first
+// record, but a real one can run past 30KB (long cwd, many tools, etc.) —
+// this must be the full line or nothing, never a size guess: a truncated
+// read makes JSON.parse fail, which silently defaults a subagent to "root"
+// and shows it a card it should never get. An unresolved request_user_input
+// is always near the end, since Codex stops writing once it's blocked on an
+// answer.
+const RECOVERY_HEAD_LINE_MAX_BYTES = 256 * 1024;
+const RECOVERY_TAIL_SCAN_BYTES = 1024 * 1024;
+// A file this old is abandoned, not "still waiting" — without this cap, a
+// session killed with an unanswered question resurrects the same ghost card
+// on every future restart, forever, since nothing else clears a card with no
+// live process behind it. Bounds the damage; does not fully solve it. Checked
+// against BOTH the file's mtime (cheap pre-filter) and the request's own
+// embedded timestamp once found (authoritative — Codex Desktop can refresh a
+// dormant file's mtime on focus without the pending question itself getting
+// any newer).
+const RECOVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Total budget for one startup sweep, across ALL stale candidate files —
+// each file's own read is already bounded, but an unbounded NUMBER of
+// candidates still adds up to unbounded blocking. Prioritized by
+// most-recently-modified first, since a genuinely still-open question is far
+// more likely to be sitting in a recently-touched file than an ancient one.
+const RECOVERY_SWEEP_MAX_FILES = 20;
+const RECOVERY_SWEEP_MAX_TOTAL_BYTES = 20 * 1024 * 1024;
 
 // JSONL record type[:subtype] → pet state. This standalone remote monitor keeps
 // a zero-dep subset of agents/codex.js because it posts final states directly
@@ -61,6 +89,11 @@ const hostPrefix = readHostPrefix();
 
 // Map<filePath, { offset, sessionId, cwd, lastEventTime, lastState, partial }>
 const tracked = new Map();
+// One-shot: the first poll() is allowed to open files outside the 2-minute
+// active window to check for a still-unresolved request_user_input. Every
+// later poll reverts to the cheap mtime-only gate below — this is a startup
+// recovery sweep, not an ongoing scan of Codex's full history.
+let didInitialRecoveryScan = false;
 
 // ── Core polling logic (mirrors agents/codex-log-monitor.js) ──
 
@@ -100,6 +133,19 @@ function buildPostStateBody(sessionId, state, event, cwd, isSubagent, host, extr
     body.assistant_last_output = extra.assistantLastOutput;
     if (extra.assistantLastOutputTruncated === true) body.assistant_last_output_truncated = true;
   }
+  if (extra && extra.codexUserInput) {
+    const request = extra.codexUserInput;
+    body.codex_user_input = {
+      phase: request.phase,
+      call_id: request.callId,
+    };
+    if (request.phase === "request") {
+      body.codex_user_input.questions = request.questions;
+      if (request.autoResolutionMs) {
+        body.codex_user_input.auto_resolution_ms = request.autoResolutionMs;
+      }
+    }
+  }
   return JSON.stringify(body);
 }
 
@@ -132,6 +178,51 @@ function processLine(line, entry, options = {}) {
     entry.isSubagent = classifySessionMeta(payload) === "subagent";
   }
 
+  const userInputRecord = parseCodexUserInputRecord(obj);
+  if (userInputRecord) {
+    if (!(entry.pendingUserInputs instanceof Map)) entry.pendingUserInputs = new Map();
+    const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+    if (userInputRecord.phase === "request") {
+      // #707 follow-up review round 4: the recovery sweep's own age cap only
+      // protects files it actually opens (mtime outside the active window).
+      // A file whose mtime got refreshed back into the active window
+      // attaches here instead, with no age check at all. Only during the
+      // initial catch-up read: reject a request whose OWN timestamp is
+      // already past RECOVERY_MAX_AGE_MS. A live request encountered after
+      // that never fails this check — it's freshly-timestamped by definition.
+      if (entry.initializing) {
+        const ts = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
+        if (Number.isFinite(ts) && Date.now() - ts > RECOVERY_MAX_AGE_MS) return;
+      }
+      entry.pendingUserInputs.set(userInputRecord.callId, userInputRecord);
+      // A blocking question is itself a real, live event — refresh the same
+      // staleness bookkeeping the generic event path below updates.
+      // Otherwise a session idle long enough to be near STALE_MS gets its
+      // notification posted here and is immediately flipped back to
+      // "sleeping" by the very next cleanStaleFiles() poll (#707 follow-up).
+      entry.lastEventTime = Date.now();
+      entry.lastState = "notification";
+      entry.stale = false;
+      if (!entry.isSubagent && !entry.initializing) {
+        postStateFn(entry.sessionId, "notification", "CodexUserInputRequest", entry.cwd, false, {
+          codexUserInput: userInputRecord,
+        });
+      }
+      return;
+    }
+    if (!entry.pendingUserInputs.has(userInputRecord.callId)) return;
+    entry.pendingUserInputs.delete(userInputRecord.callId);
+    entry.lastEventTime = Date.now();
+    entry.lastState = "idle";
+    entry.stale = false;
+    if (!entry.isSubagent && !entry.initializing) {
+      postStateFn(entry.sessionId, "idle", "CodexUserInputResolved", entry.cwd, false, {
+        codexUserInput: userInputRecord,
+      });
+    }
+    return;
+  }
+
   const assistantText = extractAssistantTextFromRecord(obj);
   if (assistantText) {
     const assistantOutput = clampAssistantOutputText(assistantText);
@@ -160,6 +251,26 @@ function processLine(line, entry, options = {}) {
   entry.stale = false;
 
   const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+
+  // task_complete/turn_aborted means the turn that asked is over — any
+  // question still open for it is moot, Codex will not consume an answer
+  // after this. Mirrors agents/codex-log-monitor.js's local-monitor fix.
+  if (
+    (key === "event_msg:task_complete" || key === "event_msg:turn_aborted")
+    && entry.pendingUserInputs instanceof Map
+    && entry.pendingUserInputs.size > 0
+  ) {
+    const abandonedCallIds = [...entry.pendingUserInputs.keys()];
+    entry.pendingUserInputs.clear();
+    if (!entry.isSubagent && !entry.initializing) {
+      for (const callId of abandonedCallIds) {
+        postStateFn(entry.sessionId, "idle", "CodexUserInputResolved", entry.cwd, false, {
+          codexUserInput: { phase: "resolved", callId },
+        });
+      }
+    }
+  }
+
   const extra = key === "event_msg:task_complete" && entry.assistantLastOutput
     ? {
       assistantLastOutput: entry.assistantLastOutput,
@@ -167,6 +278,207 @@ function processLine(line, entry, options = {}) {
     }
     : null;
   postStateFn(entry.sessionId, finalState, key, entry.cwd, entry.isSubagent, extra);
+}
+
+// Cheap, standalone pass over an otherwise-ignored file's own
+// request_user_input records — does not touch `tracked` and does not run
+// the normal event pipeline. Used only by poll()'s one-time startup sweep to
+// decide whether a file outside the active window is worth attaching to.
+// Returns a ready-to-track entry (already caught up to EOF, so normal
+// polling only reads NEW bytes from here on) or null if nothing is pending.
+// If found, also emits the recovered CodexUserInputRequest(s) directly —
+// pollFile is deliberately NOT called on the same file, because it has no
+// backfill/silent-replay concept and would replay this file's entire
+// ordinary history as if it were live.
+// Returns { text, bytesRead }. bytesRead is the TRUE byte count read from
+// disk — callers doing offset math must use it, not Buffer.byteLength(text):
+// if `start` lands mid-character in a multi-byte UTF-8 sequence (any
+// non-ASCII content — CJK cwd/output is common), decoding replaces the
+// truncated leading bytes with U+FFFD, whose own UTF-8 length does not equal
+// the raw bytes it replaced. Re-deriving the byte count from the decoded
+// string can overshoot the file's true size, and an offset past real EOF
+// either silently skips the next genuine write forever or gets misread
+// elsewhere as a truncated/rotated file and triggers a full replay from 0 —
+// the exact unbounded read this sweep exists to avoid.
+function readByteRange(filePath, start, length) {
+  if (length <= 0) return { text: "", bytesRead: 0 };
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buf, 0, length, start);
+    return { text: buf.toString("utf8", 0, bytesRead), bytesRead };
+  } catch {
+    return { text: "", bytesRead: 0 };
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+// Grows the read window from byte 0 until it captures a complete
+// (newline-terminated) first line, up to maxBytes. Never returns a line that
+// might have been truncated by an arbitrary window cutoff — a fixed small
+// read guessing "session_meta always fits in N KB" is exactly how a
+// subagent's role silently defaults to "root" (JSON.parse throws on the
+// truncated fragment, the caller sees no session_meta at all, and the safe
+// default becomes indistinguishable from "there was none"). Returns null if
+// no newline is found within budget — the caller must fail closed, not
+// guess a role.
+function readCompleteFirstLine(filePath, statSize, maxBytes) {
+  // Reads only the NEW portion at each step (not a fresh 0..chunkSize read
+  // every retry) so the physical bytes read never exceed maxBytes even in
+  // the worst case — the recovery sweep's total-byte budget assumes this
+  // function never reads more than maxBytes per file (#707 follow-up review
+  // round 4).
+  let readSoFar = 0;
+  let text = "";
+  let target = Math.min(statSize, 8 * 1024, maxBytes);
+  for (;;) {
+    const additional = target - readSoFar;
+    if (additional > 0) {
+      const { text: chunkText } = readByteRange(filePath, readSoFar, additional);
+      text += chunkText;
+      readSoFar = target;
+    }
+    const newlineIdx = text.indexOf("\n");
+    if (newlineIdx !== -1) return text.slice(0, newlineIdx);
+    if (readSoFar >= statSize || readSoFar >= maxBytes) return null;
+    target = Math.min(readSoFar * 4, maxBytes, statSize);
+  }
+}
+
+// Bounded, standalone pass over an otherwise-ignored old file — does not
+// run processLine's normal event pipeline and never reads more than a fixed
+// head+tail window, regardless of file size. Used only by runRecoverySweep.
+// Returns a ready-to-track entry (offset already caught up, so normal
+// polling only reads NEW bytes from here on), also emitting the recovered
+// CodexUserInputRequest(s) directly — or null if nothing is genuinely still
+// pending or the file's role can't be confirmed safely.
+//
+// A request is "still pending" only up to the next task_complete/
+// turn_aborted within the scanned window — those end the turn that asked,
+// so any earlier open request is moot even without a matching
+// function_call_output (Codex killed mid-turn, terminal closed, etc. leave
+// exactly this shape). Mirrors agents/codex-log-monitor.js's local fix.
+function recoverStalePendingUserInputEntry(filePath, fileName, options = {}) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return null;
+  }
+  if (stat.size === 0 || Date.now() - stat.mtimeMs > RECOVERY_MAX_AGE_MS) return null;
+  const sessionId = extractSessionId(fileName);
+  if (!sessionId) return null;
+
+  // Head: session_meta (cwd + subagent role) is always Codex's first record.
+  // Fail closed (skip this file entirely) if we can't read a complete first
+  // line or it isn't session_meta — showing a card is the wrong default when
+  // we genuinely don't know whether this is a subagent.
+  const firstLine = readCompleteFirstLine(filePath, stat.size, RECOVERY_HEAD_LINE_MAX_BYTES);
+  if (!firstLine) return null;
+  let sessionMeta;
+  try {
+    sessionMeta = JSON.parse(firstLine);
+  } catch {
+    return null;
+  }
+  if (sessionMeta.type !== "session_meta" || !sessionMeta.payload || typeof sessionMeta.payload !== "object") {
+    return null;
+  }
+  const cwd = sessionMeta.payload.cwd || "";
+  // classifySessionMeta legitimately returns "unknown" for a normal root
+  // session — most session_meta records carry no explicit "I am root"
+  // marker; being root IS the absence of subagent markers. That's not a
+  // truncation artifact once firstLine is a genuinely complete line (the
+  // fail-closed protection above), so only "subagent" flips isSubagent —
+  // matches the live path's default-to-root-unless-explicitly-subagent
+  // behavior.
+  const isSubagent = classifySessionMeta(sessionMeta.payload) === "subagent";
+
+  const tailLen = Math.min(stat.size, RECOVERY_TAIL_SCAN_BYTES);
+  const tailStart = stat.size - tailLen;
+  const { text: tailText, bytesRead: tailBytesRead } = readByteRange(filePath, tailStart, tailLen);
+  const rawLines = tailText.split("\n");
+  // The window can start mid-line when tailStart > 0 — drop that first
+  // fragment rather than risk a false JSON.parse failure silently masking a
+  // genuine question.
+  if (tailStart > 0) rawLines.shift();
+  // The window always ends at true EOF, so a non-empty last element is a
+  // genuinely incomplete final line — preserve it the same way pollFile's
+  // own `entry.partial` does, instead of consuming those bytes unparsed.
+  const trailingPartial = rawLines.pop() || "";
+
+  const pending = new Map();
+  const pendingTimestampMs = new Map();
+  for (const line of rawLines) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const payload = obj && typeof obj === "object" ? obj.payload : null;
+    const subtype = payload && typeof payload === "object" ? payload.type || "" : "";
+    const key = subtype ? obj.type + ":" + subtype : obj.type;
+    if (key === "event_msg:task_complete" || key === "event_msg:turn_aborted") {
+      pending.clear();
+      pendingTimestampMs.clear();
+      continue;
+    }
+    const record = parseCodexUserInputRecord(obj);
+    if (!record) continue;
+    if (record.phase === "request") {
+      pending.set(record.callId, record);
+      const ts = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
+      pendingTimestampMs.set(record.callId, Number.isFinite(ts) ? ts : null);
+    } else {
+      pending.delete(record.callId);
+      pendingTimestampMs.delete(record.callId);
+    }
+  }
+  if (pending.size === 0) return null;
+
+  // mtime alone isn't a reliable age signal — Codex Desktop can refresh a
+  // dormant file's mtime (e.g. on focus) without the pending question itself
+  // getting any newer. Cross-check against the oldest request's own
+  // timestamp where we have one; a stale question must not survive just
+  // because something else touched the file.
+  const knownTimestamps = [...pendingTimestampMs.values()].filter((ts) => ts !== null);
+  if (knownTimestamps.length > 0 && Date.now() - Math.min(...knownTimestamps) > RECOVERY_MAX_AGE_MS) {
+    return null;
+  }
+
+  // Advance PAST the partial's bytes using the TRUE bytes read (mirrors
+  // pollFile's own `entry.offset = stat.size` convention) — `partial` is
+  // what reconstructs the line once the rest of it lands on a normal poll.
+  const entry = {
+    offset: tailStart + tailBytesRead,
+    sessionId: "codex:" + sessionId,
+    cwd,
+    isSubagent,
+    lastEventTime: Date.now(),
+    lastState: "notification",
+    assistantLastOutput: null,
+    assistantLastOutputTruncated: false,
+    pendingUserInputs: pending,
+    initializing: false,
+    partial: trailingPartial,
+    stale: false,
+  };
+
+  if (!isSubagent) {
+    const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+    for (const request of pending.values()) {
+      postStateFn(entry.sessionId, "notification", "CodexUserInputRequest", entry.cwd, false, {
+        codexUserInput: request,
+      });
+    }
+  }
+  return entry;
 }
 
 function pollFile(filePath, fileName, options = {}) {
@@ -190,6 +502,8 @@ function pollFile(filePath, fileName, options = {}) {
       lastState: null,
       assistantLastOutput: null,
       assistantLastOutputTruncated: false,
+      pendingUserInputs: new Map(),
+      initializing: true,
       partial: "",
       stale: false,
     };
@@ -236,6 +550,17 @@ function pollFile(filePath, fileName, options = {}) {
     if (!line.trim()) continue;
     processLine(line, entry, options);
   }
+  if (entry.initializing) {
+    entry.initializing = false;
+    if (!entry.isSubagent && entry.pendingUserInputs instanceof Map) {
+      const postStateFn = typeof options.postState === "function" ? options.postState : postState;
+      for (const request of entry.pendingUserInputs.values()) {
+        postStateFn(entry.sessionId, "notification", "CodexUserInputRequest", entry.cwd, false, {
+          codexUserInput: request,
+        });
+      }
+    }
+  }
 }
 
 // Post a one-shot "sleeping" after a session goes idle, but KEEP the tracked
@@ -268,8 +593,27 @@ function pruneTrackedOutOfWindow(options = {}) {
   }
 }
 
+function runRecoverySweep(candidates, options = {}) {
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let filesScanned = 0;
+  let bytesScanned = 0;
+  for (const candidate of candidates) {
+    if (filesScanned >= RECOVERY_SWEEP_MAX_FILES) break;
+    const candidateCost = Math.min(candidate.size, RECOVERY_HEAD_LINE_MAX_BYTES + RECOVERY_TAIL_SCAN_BYTES);
+    // Check BEFORE adding — accumulating post-hoc lets exactly one
+    // over-budget candidate slip through every time the running total lands
+    // just under the cap (#707 follow-up review round 4).
+    if (bytesScanned + candidateCost > RECOVERY_SWEEP_MAX_TOTAL_BYTES) break;
+    filesScanned += 1;
+    bytesScanned += candidateCost;
+    const recovered = recoverStalePendingUserInputEntry(candidate.filePath, candidate.file, options);
+    if (recovered) tracked.set(candidate.filePath, recovered);
+  }
+}
+
 function poll() {
   const dirs = getSessionDirs();
+  const recoveryCandidates = [];
   for (const dir of dirs) {
     let files;
     try {
@@ -282,13 +626,28 @@ function poll() {
       if (!file.startsWith("rollout-") || !file.endsWith(".jsonl")) continue;
       const filePath = path.join(dir, file);
       if (!tracked.has(filePath)) {
+        let stat;
         try {
-          const mtime = fs.statSync(filePath).mtimeMs;
-          if (now - mtime > 120000) continue;
+          stat = fs.statSync(filePath);
         } catch { continue; }
+        if (now - stat.mtimeMs > 120000) {
+          // Only the one-time startup sweep may even consider it. Collected
+          // here, not read yet: candidates are sorted and budgeted in
+          // runRecoverySweep so an unbounded NUMBER of stale files can't add
+          // up to unbounded blocking even though each individual read is
+          // already capped.
+          if (!didInitialRecoveryScan) {
+            recoveryCandidates.push({ filePath, file, mtimeMs: stat.mtimeMs, size: stat.size });
+          }
+          continue;
+        }
       }
       pollFile(filePath, file);
     }
+  }
+  if (!didInitialRecoveryScan) {
+    runRecoverySweep(recoveryCandidates);
+    didInitialRecoveryScan = true;
   }
   cleanStaleFiles();
   pruneTrackedOutOfWindow();
@@ -324,6 +683,10 @@ module.exports.__test = {
   buildPostStateBody,
   processLine,
   pollFile,
+  recoverStalePendingUserInputEntry,
+  readByteRange,
+  readCompleteFirstLine,
+  runRecoverySweep,
   cleanStaleFiles,
   pruneTrackedOutOfWindow,
   tracked,

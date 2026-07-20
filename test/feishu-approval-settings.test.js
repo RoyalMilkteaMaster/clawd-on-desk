@@ -28,17 +28,64 @@ test("normalizeFeishuApproval trims config and defaults to open_id", () => {
     connectionTimeoutSeconds: 30,
   }), {
     enabled: true,
+    platform: "feishu",
     idType: "user_id",
     approverId: "user_123",
     connectionTimeoutSeconds: 30,
   });
   assert.deepEqual(settings.normalizeFeishuApproval({ idType: "bad", approverId: "" }), {
     enabled: false,
+    platform: "feishu",
     idType: "open_id",
     approverId: "",
     connectionTimeoutSeconds: 15,
   });
   assert.equal(settings.normalizeFeishuApproval({ connectionTimeoutSeconds: 999 }).connectionTimeoutSeconds, 15);
+});
+
+// The upgrade contract: an existing Feishu user must land on Feishu without
+// touching anything, and must not be asked to re-enter credentials.
+test("normalizeFeishuApproval migrates a pre-platform config to feishu", () => {
+  const legacy = {
+    enabled: true,
+    idType: "open_id",
+    approverId: "ou_legacy",
+    connectionTimeoutSeconds: 15,
+  };
+  assert.equal(settings.normalizeFeishuApproval(legacy).platform, "feishu");
+  assert.equal(settings.normalizeFeishuApproval(legacy).approverId, "ou_legacy");
+  assert.equal(settings.DEFAULT_FEISHU_APPROVAL.platform, "feishu");
+  assert.equal(settings.normalizeFeishuApproval(undefined).platform, "feishu");
+});
+
+test("normalizeFeishuApproval keeps lark and falls back to feishu for anything else", () => {
+  assert.equal(settings.normalizeFeishuApproval({ platform: "lark" }).platform, "lark");
+  assert.equal(settings.normalizeFeishuApproval({ platform: " lark " }).platform, "lark");
+  for (const bad of ["Lark", "LARK", "feishu.cn", "", "evil.example.com", 1, null, {}]) {
+    assert.equal(
+      settings.normalizeFeishuApproval({ platform: bad }).platform,
+      "feishu",
+      `platform ${JSON.stringify(bad)} must fall back to feishu`
+    );
+  }
+});
+
+test("validateFeishuApproval accepts both platforms, rejects anything else", () => {
+  const base = { enabled: true, idType: "open_id", approverId: "ou_abc" };
+  assert.equal(settings.validateFeishuApproval({ ...base, platform: "feishu" }).status, "ok");
+  assert.equal(settings.validateFeishuApproval({ ...base, platform: "lark" }).status, "ok");
+  // Absent stays valid: configs saved before the field existed must not be
+  // rejected on the way back in.
+  assert.equal(settings.validateFeishuApproval(base).status, "ok");
+  // A user must never be able to aim the App Secret at an arbitrary host.
+  for (const bad of ["", "Lark", "custom", "https://evil.example.com", 1, null]) {
+    assert.equal(
+      settings.validateFeishuApproval({ ...base, platform: bad }).status,
+      "error",
+      `platform ${JSON.stringify(bad)} must be rejected`
+    );
+  }
+  assert.deepEqual([...settings.FEISHU_PLATFORMS].sort(), ["feishu", "lark"]);
 });
 
 test("validateFeishuApproval permits incomplete saved config and rejects unknown keys", () => {
@@ -109,6 +156,29 @@ test("writeSecretsEnvFile stores Feishu secrets outside prefs and preserves blan
   assert.equal(env.encryptKey, "encrypt-key");
 });
 
+// A disk/permission failure is platform-independent, and the settings page
+// shows this text. Naming Feishu tells a Lark user their setup is the problem.
+test("writeSecretsEnvFile reports failures brand-neutrally with a stable code", () => {
+  const failing = {
+    readFileSync: () => "",
+    mkdirSync: () => { throw new Error("EACCES: permission denied, mkdir"); },
+    writeFileSync: () => {},
+  };
+  const results = [
+    settings.writeSecretsEnvFile({ fs: failing, path, filePath: "/x/feishu-approval.env", secrets: { appId: "cli_1", appSecret: "s" }, platform: "linux" }),
+    settings.writeSecretsEnvFile({ fs: failing, path, filePath: "", secrets: {} }),
+    settings.writeSecretsEnvFile({}),
+  ];
+  for (const result of results) {
+    assert.equal(result.status, "error");
+    assert.equal(result.code, "write-failed", "a stable code lets the UI localize the failure");
+    assert.doesNotMatch(result.message, /Feishu/i, `must not name a brand: ${result.message}`);
+    assert.doesNotMatch(result.message, /Lark/i, `must not name a brand: ${result.message}`);
+  }
+  // The underlying cause survives as the detail the UI appends.
+  assert.match(results[0].message, /EACCES/);
+});
+
 test("readiness requires enabled config, approver id, and app credentials", () => {
   assert.equal(settings.readiness({ enabled: false }, {}).reason, "disabled");
   assert.equal(settings.readiness({ enabled: true, idType: "open_id", approverId: "" }, {
@@ -132,6 +202,43 @@ test("readiness rejects obviously invalid Feishu app ids", () => {
   });
   assert.equal(result.reason, "invalid-secret");
   assert.match(result.message, /App ID/);
+});
+
+// Lark self-built apps use the same cli_ prefix as Feishu, so a real Lark App
+// ID must sail through the format gate — the gate is not a platform detector.
+test("readiness accepts real-shaped Lark cli_ app ids on the lark platform", () => {
+  for (const appId of ["cli_a1b2c3d4e5f6g7h8", "cli_9f8e7d6c5b4a3210", "cli_A1b2-C3d4_E5f6"]) {
+    const result = settings.readiness(
+      { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_lark_1" },
+      { appId, appSecret: "lark-secret" }
+    );
+    assert.equal(result.ready, true, `${appId} should pass readiness on Lark`);
+    assert.equal(result.config.platform, "lark");
+  }
+  // ...and the same id is equally valid on Feishu.
+  assert.equal(settings.readiness(
+    { enabled: true, platform: "feishu", idType: "open_id", approverId: "ou_1" },
+    { appId: "cli_a1b2c3d4e5f6g7h8", appSecret: "s" }
+  ).ready, true);
+});
+
+// A Lark user reading "Feishu App ID is invalid" is being told their correct
+// setup is wrong. These messages are log/fallback diagnostics shown to users
+// when no localized mapping exists, so they must not name one brand.
+test("readiness diagnostics are platform-neutral", () => {
+  const cases = [
+    settings.readiness({ enabled: true, platform: "lark", idType: "open_id", approverId: "" }, { appId: "cli_1", appSecret: "s" }),
+    settings.readiness({ enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1" }, { appId: "", appSecret: "" }),
+    settings.readiness({ enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1" }, { appId: "nope", appSecret: "s" }),
+  ];
+  for (const result of cases) {
+    assert.equal(result.ready, false);
+    assert.ok(result.message, "a diagnostic message is still provided");
+    assert.doesNotMatch(result.message, /Feishu/i, `must not hardcode a brand: ${result.message}`);
+    assert.doesNotMatch(result.message, /Lark/i, `must not hardcode a brand: ${result.message}`);
+  }
+  // The stable reason codes the UI maps to localized copy are unchanged.
+  assert.deepEqual(cases.map((r) => r.reason), ["invalid-config", "missing-secret", "invalid-secret"]);
 });
 
 test("redactionSecretsForFeishuApproval includes saved ids and secrets", () => {

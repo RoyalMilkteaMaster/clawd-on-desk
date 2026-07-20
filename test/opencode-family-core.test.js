@@ -194,11 +194,32 @@ describe("opencode-family registry", () => {
     assert.strictEqual(isOpencodeFamilyEntry(null), false);
   });
 
-  it("agents/opencode.js sources the shared family contract", () => {
-    const opencodeAgent = require("../agents/opencode");
-    assert.strictEqual(opencodeAgent.eventMap, FAMILY_EVENT_MAP);
-    assert.strictEqual(opencodeAgent.capabilities, FAMILY_CAPABILITIES);
-    assert.strictEqual(opencodeAgent.eventSource, "plugin-event");
+  it("EVERY member's agents/<id>.js sources the shared family contract by REFERENCE", () => {
+    // strictEqual (same object), not deepStrictEqual: a look-alike copy with
+    // one drifted value (e.g. Stop: "idle", or permissionApproval: false —
+    // which silently kills the member's permission bubbles) must fail here
+    // (dual-review S-F2).
+    for (const agentId of Object.keys(OPENCODE_FAMILY)) {
+      // eslint-disable-next-line global-require
+      const agent = require(`../agents/${agentId}`);
+      assert.strictEqual(agent.eventMap, FAMILY_EVENT_MAP, `${agentId} eventMap must be the shared object`);
+      assert.strictEqual(agent.capabilities, FAMILY_CAPABILITIES, `${agentId} capabilities must be the shared object`);
+      assert.strictEqual(agent.eventSource, "plugin-event");
+      assert.strictEqual(agent.id, agentId);
+    }
+  });
+
+  it("every member's logFileName is in the doctor's default log allowlist", () => {
+    // doctor-logs falls back to this basename list when picking the most
+    // recent log; a typo'd entry silently drops the member from that path.
+    // eslint-disable-next-line global-require
+    const { DEFAULT_LOG_BASENAMES } = require("../src/doctor-logs");
+    for (const [agentId, cfg] of Object.entries(OPENCODE_FAMILY)) {
+      assert.ok(
+        DEFAULT_LOG_BASENAMES.includes(cfg.logFileName),
+        `${agentId}: ${cfg.logFileName} missing from doctor-logs DEFAULT_LOG_BASENAMES`
+      );
+    }
   });
 
   it("every member's plugin entry literals match the registry (no drift)", async () => {
@@ -207,11 +228,9 @@ describe("opencode-family registry", () => {
     // (plan §3.1 CJS/ESM note).
     for (const [agentId, cfg] of Object.entries(OPENCODE_FAMILY)) {
       const entryPath = path.join(HOOKS_DIR, cfg.pluginDirName, "index.mjs");
-      if (!fs.existsSync(entryPath)) {
-        // mimocode's entry lands with the #607 rebase; opencode must exist NOW.
-        assert.notStrictEqual(agentId, "opencode", "opencode entry must exist");
-        continue;
-      }
+      // Every registry member ships its thin entry — a missing one must fail
+      // loudly here, not silently skip (the pre-#607 escape hatch is gone).
+      assert.ok(fs.existsSync(entryPath), `${agentId} plugin entry missing: ${entryPath}`);
       const source = fs.readFileSync(entryPath, "utf8");
       const expectations = {
         agentId,

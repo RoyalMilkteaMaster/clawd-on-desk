@@ -77,7 +77,7 @@ describe("CodexLogMonitor", () => {
       type: "session_meta",
       payload: {
         cwd: "/projects/foo",
-        originator: "Codex Desktop",
+        originator: "codex_work_desktop",
         source: "vscode",
       },
     }) + "\n");
@@ -94,8 +94,966 @@ describe("CodexLogMonitor", () => {
     assert.strictEqual(events[0].sid, EXPECTED_SID);
     assert.strictEqual(events[0].state, "idle");
     assert.strictEqual(events[0].extra.cwd, "/projects/foo");
-    assert.strictEqual(events[0].extra.codexOriginator, "Codex Desktop");
+    assert.strictEqual(events[0].extra.codexOriginator, "codex_work_desktop");
     assert.strictEqual(events[0].extra.codexSource, "vscode");
+  });
+
+  it("emits request_user_input and closes only the matching call", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo", source: "cli" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_question",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [
+            { label: "A", description: "First" },
+            { label: "B", description: "Second" },
+          ] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+
+    const requests = [];
+    const resolved = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+      onUserInputResolved: (...args) => resolved.push(args),
+    });
+    monitor._findCodexWriterPid = () => null;
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(requests.length, 1);
+    assert.strictEqual(requests[0][0], EXPECTED_SID);
+    assert.strictEqual(requests[0][1].callId, "call_question");
+    assert.strictEqual(requests[0][2].cwd, "/projects/foo");
+
+    fs.appendFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      payload: { type: "function_call_output", call_id: "unrelated", output: "{}" },
+    }) + "\n");
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(resolved, []);
+
+    fs.appendFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      payload: { type: "function_call_output", call_id: "call_question", output: "{}" },
+    }) + "\n");
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(resolved, [[EXPECTED_SID, "call_question"]]);
+  });
+
+  it("does not flash a request_user_input already resolved before initial attach", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_done",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "function_call_output", call_id: "call_done", output: "{}" },
+      }),
+    ].join("\n") + "\n");
+    const requests = [];
+    const resolved = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+      onUserInputResolved: (...args) => resolved.push(args),
+    });
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(requests, []);
+    assert.deepStrictEqual(resolved, []);
+  });
+
+  it("recovers a still-open request_user_input from an old (>5min mtime) untracked file on startup", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_stale_pending",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000); // 10 minutes ago
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.strictEqual(requests.length, 1);
+      assert.strictEqual(requests[0][0], EXPECTED_SID);
+      assert.strictEqual(requests[0][1].callId, "call_stale_pending");
+      done();
+    }, 300);
+  });
+
+  it("does not recover an old untracked file whose request_user_input was already resolved", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_stale_done",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "function_call_output", call_id: "call_stale_done", output: "{}" },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    let anyState = false;
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => { anyState = true; }, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.deepStrictEqual(requests, []);
+      assert.strictEqual(anyState, false, "an already-resolved old file must stay untracked, not just card-less");
+      done();
+    }, 300);
+  });
+
+  it("only sweeps for stale pending questions once, on the first poll after start", (_, done) => {
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      // Drop in an old, untracked file with a pending question AFTER the
+      // startup sweep already ran — this must not be recovered. Only the
+      // one-time sweep at start() is allowed to look past the active window.
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_too_late",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }) + "\n");
+      const oldTime = new Date(Date.now() - 600000);
+      fs.utimesSync(testFile, oldTime, oldTime);
+
+      setTimeout(() => {
+        assert.deepStrictEqual(requests, [], "a file that only appears after the startup sweep must not be recovered");
+        done();
+      }, 300);
+    }, 150);
+  });
+
+  it("recovers a pending request whose own timestamp is stale even though the file's mtime is fresh (token_count refresh)", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const oldTimestamp = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    fs.writeFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      timestamp: oldTimestamp,
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_fresh_mtime_stale_ts",
+        arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+      },
+    }) + "\n");
+    // File was just written — mtime is "now", well inside BACKFILL_GRACE_MS,
+    // so this attaches in LIVE mode (backfilling=false) despite the stale
+    // embedded timestamp on the only line it contains.
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.strictEqual(requests.length, 1);
+    assert.strictEqual(requests[0][1].callId, "call_fresh_mtime_stale_ts");
+  });
+
+  it("recovering a stale pending question does not replay the file's ordinary historical state", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/stale" } }),
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_amid_history",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const states = [];
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      states.push({ state, event });
+    }, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.strictEqual(requests.length, 1);
+      assert.strictEqual(requests[0][1].callId, "call_amid_history");
+      assert.deepStrictEqual(states, [], "task_started/task_complete history must stay silent, only the pending question surfaces");
+      done();
+    }, 300);
+  });
+
+  it("keeps a subagent's normal headless backfill snapshot when it has a pending question within the active window", (_, done) => {
+    // Within ACTIVE_SESSION_WINDOW_MS (mtime 3 min old): discovered through
+    // the normal slow-write-cadence path, so it runs the full _pollFile
+    // pipeline and _emitBackfillSnapshot's subagent carve-out applies.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          cwd: "/projects/sub",
+          source: { subagent: { thread_spawn: { parent_thread_id: "root", agent_role: "explorer" } } },
+          agent_role: "explorer",
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\\"command\\":\\"ls\\"}"}}',
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_sub_pending",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const recent = new Date(Date.now() - 3 * 60 * 1000);
+    fs.utimesSync(testFile, recent, recent);
+
+    const states = [];
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event, extra) => {
+      states.push({ state, event, headless: extra.headless });
+    }, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.deepStrictEqual(requests, [], "subagents never get a question card");
+      assert.strictEqual(states.length, 1);
+      assert.strictEqual(states[0].state, "working");
+      assert.strictEqual(states[0].headless, true);
+      done();
+    }, 300);
+  });
+
+  it("recovering a stale (>5min) subagent file never shows a card and never crashes, even with a pending question", (_, done) => {
+    // The bounded startup recovery sweep does not run the full state
+    // pipeline (that's the point — see #707 follow-up review on read cost),
+    // so it can't reconstruct a subagent's last sustained state the way the
+    // active-window path above does. It only decides card-or-not, and a
+    // subagent must never get a card either way.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          cwd: "/projects/sub",
+          source: { subagent: { thread_spawn: { parent_thread_id: "root", agent_role: "explorer" } } },
+          agent_role: "explorer",
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_sub_stale",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.deepStrictEqual(requests, [], "subagents never get a question card, recovered or not");
+      done();
+    }, 300);
+  });
+
+  it("does not resurrect a request_user_input abandoned by task_complete before the restart that recovers it", () => {
+    // #707 follow-up review, finding 1: the recovery sweep must apply the
+    // same "turn ended -> question moot" rule the live path applies, or a
+    // long-dead request survives every future restart forever.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_ended_before_restart",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    const recovered = monitor._recoverStalePendingUserInput(testFile, path.basename(testFile));
+    assert.strictEqual(recovered, null, "task_complete after the request must prevent recovery, not just live clearing");
+  });
+
+  it("does not resurrect a request_user_input a turn_aborted already abandoned before the restart that recovers it", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_aborted_before_restart",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+      '{"type":"event_msg","payload":{"type":"turn_aborted"}}',
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const recovered = monitor._recoverStalePendingUserInput(testFile, path.basename(testFile));
+    assert.strictEqual(recovered, null);
+  });
+
+  it("does not recover a file older than RECOVERY_MAX_AGE_MS even with a genuinely unresolved question", () => {
+    // #707 follow-up review, finding 3: without an age cap, a session killed
+    // with an unanswered question resurrects as a permanent ghost card on
+    // every future restart. This bounds the damage.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_ancient",
+        arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+      },
+    }) + "\n");
+    const ancient = new Date(Date.now() - 25 * 60 * 60 * 1000); // 25h — past the 24h cap
+    fs.utimesSync(testFile, ancient, ancient);
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const recovered = monitor._recoverStalePendingUserInput(testFile, path.basename(testFile));
+    assert.strictEqual(recovered, null);
+  });
+
+  it("does not lose a trailing partial line split by the recovery scan's read window", () => {
+    // #700 follow-up: recovery must not silently swallow a line that's
+    // genuinely still being appended. #700 removed the tracker's `partial`
+    // buffer entirely (offset now stops at the last complete newline; an
+    // incomplete tail is simply left on disk for the next poll to reread
+    // whole), so recovery must follow the same convention instead of
+    // consuming through true EOF and stashing the fragment separately.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const sessionMetaLine = JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } });
+    const requestLine = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_partial_tail",
+        arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+      },
+    });
+    fs.writeFileSync(
+      testFile,
+      sessionMetaLine + "\n"
+      + requestLine + "\n"
+      + '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_partial_ta' // deliberately unterminated
+    );
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const recovered = monitor._recoverStalePendingUserInput(testFile, path.basename(testFile));
+    assert.ok(recovered, "the request itself is still genuinely pending");
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(recovered, "partial"), false,
+      "#700's tracker shape has no `partial` field — the incomplete tail stays on disk instead"
+    );
+    assert.strictEqual(
+      recovered.offset,
+      Buffer.byteLength(sessionMetaLine + "\n" + requestLine + "\n", "utf8"),
+      "offset must stop at the last complete newline (matching _pollFile's own commit convention), not run through the unterminated tail"
+    );
+    assert.notStrictEqual(recovered.fileIdentity, null);
+
+    // Completing the line on a normal poll must resolve the question — this
+    // is what an unconditional offset-to-EOF would have permanently broken
+    // once _pollFile stopped reading a `partial` prefix.
+    monitor._tracked.set(testFile, recovered);
+    fs.appendFileSync(testFile, 'il","output":"{}"}}\n');
+    const resolved = [];
+    monitor._onUserInputResolved = (...args) => resolved.push(args);
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(resolved, [[recovered.sessionId, "call_partial_tail"]]);
+  });
+
+  it("seeds fileIdentity on the recovered tracker and mirrors it into the read-position ledger", () => {
+    // _runRecoverySweep bypasses _pollFile's normal new-tracker construction,
+    // which is where fileIdentity and _readPositions are otherwise populated
+    // together. Leaving fileIdentity unset reads as "identity changed" on
+    // the very next regular poll (undefined !== null, same as a real
+    // identity string would), silently resetting the offset to EOF and
+    // dropping whatever landed between the sweep and that poll. Leaving the
+    // ledger unseeded defeats #700's own fix the next time this tracker is
+    // evicted from both LRUs.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_identity_check",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const expectedIdentity = monitor._getFileIdentity(fs.statSync(testFile));
+    assert.notStrictEqual(expectedIdentity, null, "sanity: this file must have a real dev/ino identity");
+
+    monitor._runRecoverySweep([{
+      filePath: testFile,
+      file: path.basename(testFile),
+      mtimeMs: oldTime.getTime(),
+      size: fs.statSync(testFile).size,
+    }]);
+    const tracked = monitor._tracked.get(testFile);
+    assert.ok(tracked);
+    assert.strictEqual(tracked.fileIdentity, expectedIdentity);
+    assert.deepStrictEqual(monitor._readPositions.get(testFile), {
+      offset: tracked.offset,
+      identity: expectedIdentity,
+    });
+
+    // Prove the fix actually matters: a normal poll right after recovery
+    // must not misfire the identityChanged guard and skip freshly appended
+    // bytes.
+    fs.appendFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      payload: { type: "function_call_output", call_id: "call_identity_check", output: "{}" },
+    }) + "\n");
+    const resolved = [];
+    monitor._onUserInputResolved = (...args) => resolved.push(args);
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(resolved, [[tracked.sessionId, "call_identity_check"]]);
+  });
+
+  it("resets the recovery sweep on every real start(), not just the first one this instance ever saw", (_, done) => {
+    // #707 follow-up review, finding 4: the agent gate can stop() then
+    // start() the same CodexLogMonitor instance (disable -> re-enable Codex
+    // within one Clawd process run).
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    monitor.start();
+    assert.strictEqual(monitor._didInitialRecoveryScan, true);
+    monitor.stop();
+    assert.strictEqual(monitor._interval, null);
+
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_after_restart",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    monitor._onUserInputRequest = (...args) => requests.push(args);
+    monitor.start();
+
+    setTimeout(() => {
+      assert.strictEqual(requests.length, 1, "the second start() must run its own recovery sweep");
+      assert.strictEqual(requests[0][1].callId, "call_after_restart");
+      done();
+    }, 300);
+  });
+
+  it("correctly classifies a subagent whose session_meta exceeds the old 16KB head-scan bound", (_, done) => {
+    // #707 follow-up review round 3, finding 1: a session_meta that runs
+    // past a fixed head-read window makes JSON.parse throw on the truncated
+    // fragment, and the caller silently defaults to "not a subagent" —
+    // exactly backwards from the intended fail-closed behavior.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const bigSessionMeta = JSON.stringify({
+      type: "session_meta",
+      payload: {
+        cwd: "/projects/sub-big",
+        source: { subagent: { thread_spawn: { parent_thread_id: "root", agent_role: "explorer" } } },
+        agent_role: "explorer",
+        _pad: "p".repeat(20000), // pushes this single line past the old fixed 16KB window
+      },
+    });
+    fs.writeFileSync(testFile, [
+      bigSessionMeta,
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_big_meta_sub",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.deepStrictEqual(requests, [], "a subagent must not get a card even with an oversized session_meta line");
+      done();
+    }, 300);
+  });
+
+  it("still extracts cwd and recovers a root session whose session_meta exceeds the old 16KB head-scan bound", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const bigSessionMeta = JSON.stringify({
+      type: "session_meta",
+      payload: { cwd: "/projects/root-big", _pad: "p".repeat(20000) },
+    });
+    fs.writeFileSync(testFile, [
+      bigSessionMeta,
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_big_meta_root",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.strictEqual(requests.length, 1);
+      assert.strictEqual(requests[0][1].callId, "call_big_meta_root");
+      assert.strictEqual(requests[0][2].cwd, "/projects/root-big");
+      done();
+    }, 300);
+  });
+
+  it("fails closed (no recovery) when session_meta exceeds even the new head-line budget", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const hugeSessionMeta = JSON.stringify({
+      type: "session_meta",
+      payload: { cwd: "/projects/huge", _pad: "p".repeat(400 * 1024) }, // past RECOVERY_HEAD_LINE_MAX_BYTES (256KB)
+    });
+    fs.writeFileSync(testFile, [
+      hugeSessionMeta,
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_huge_meta",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const recovered = monitor._recoverStalePendingUserInput(testFile, path.basename(testFile));
+    assert.strictEqual(
+      recovered, null,
+      "must fail closed rather than guess a role when session_meta can't be read completely within budget"
+    );
+  });
+
+  it("_readByteRange reports the true raw bytesRead, not a length re-derived from the decoded string", () => {
+    // #707 follow-up review round 3, finding 2: reading raw bytes and then
+    // computing Buffer.byteLength(decoded_string) are NOT interchangeable
+    // when the read window starts mid-character.
+    const testFile = path.join(dateDir, "utf8-boundary.jsonl");
+    // "中" is 3 bytes in UTF-8. Reading starting 1 byte into one of them
+    // makes the leading malformed byte decode as U+FFFD (3 UTF-8 bytes
+    // itself) — its re-encoded length does not equal the 1 raw byte read.
+    fs.writeFileSync(testFile, "中".repeat(50), "utf8");
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const { text, bytesRead } = monitor._readByteRange(testFile, 1, 30);
+    assert.strictEqual(bytesRead, 30, "bytesRead must equal the raw byte count requested");
+    assert.notStrictEqual(
+      Buffer.byteLength(text, "utf8"), bytesRead,
+      "sanity check: this exact case is where byteLength(text) would have been wrong"
+    );
+  });
+
+  it("does not overshoot true EOF when the tail window starts mid-character, and still resolves after completion", () => {
+    // #707 follow-up review round 3, finding 2 — full scenario: construct a
+    // file where the 1MB tail window's start byte deterministically lands
+    // inside a 3-byte CJK character, then verify the recovered offset never
+    // exceeds true EOF and the question still resolves once its
+    // function_call_output is appended.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const CJK = "中";
+    const CJK_BYTES = Buffer.byteLength(CJK, "utf8");
+    assert.strictEqual(CJK_BYTES, 3);
+    const sessionMetaLine = JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }) + "\n";
+    const requestLine = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_utf8_boundary",
+        arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+      },
+    }) + "\n";
+    const TAIL_WINDOW = 1024 * 1024;
+    const sessionMetaBytes = Buffer.byteLength(sessionMetaLine, "utf8");
+    const paddingCharCount = Math.ceil(TAIL_WINDOW / CJK_BYTES) + 1000;
+    const paddingBytes = paddingCharCount * CJK_BYTES;
+
+    // Find a filler length (0-2 ASCII bytes, inserted AFTER the padding) that
+    // puts the tail window's start byte strictly inside a CJK character
+    // rather than on a clean 3-byte boundary. Filler placed BEFORE the
+    // padding would shift both the window start and the padding start by the
+    // same amount and cancel out — it has to go after.
+    let filler = "";
+    for (let k = 0; k < CJK_BYTES; k++) {
+      const candidateFiller = "X".repeat(k);
+      const totalSize = sessionMetaBytes + paddingBytes + candidateFiller.length + 1 /* \n */ + Buffer.byteLength(requestLine, "utf8");
+      const tailStart = totalSize - TAIL_WINDOW;
+      const offsetIntoPadding = tailStart - sessionMetaBytes;
+      if (((offsetIntoPadding % CJK_BYTES) + CJK_BYTES) % CJK_BYTES !== 0) {
+        filler = candidateFiller;
+        break;
+      }
+    }
+
+    fs.writeFileSync(testFile, sessionMetaLine + CJK.repeat(paddingCharCount) + filler + "\n" + requestLine, "utf8");
+    const stat = fs.statSync(testFile);
+    const tailStart = stat.size - TAIL_WINDOW;
+    const offsetIntoPadding = tailStart - sessionMetaBytes;
+    assert.notStrictEqual(
+      offsetIntoPadding % CJK_BYTES, 0,
+      "test construction sanity check: the tail window must start mid-character or this isn't exercising the bug"
+    );
+    const oldTime = new Date(Date.now() - 600000);
+    fs.utimesSync(testFile, oldTime, oldTime);
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const recovered = monitor._recoverStalePendingUserInput(testFile, path.basename(testFile));
+    assert.ok(recovered, "the request must still be found despite the mid-character tail cut");
+    assert.strictEqual(recovered.pendingUserInputs.size, 1);
+    assert.ok(recovered.offset <= stat.size, `offset (${recovered.offset}) must not overshoot true EOF (${stat.size})`);
+
+    monitor._tracked.set(testFile, recovered);
+    fs.appendFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      payload: { type: "function_call_output", call_id: "call_utf8_boundary", output: "{}" },
+    }) + "\n");
+    const resolved = [];
+    monitor._onUserInputResolved = (...args) => resolved.push(args);
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(resolved, [[recovered.sessionId, "call_utf8_boundary"]]);
+  });
+
+  it("caps the recovery sweep to RECOVERY_SWEEP_MAX_FILES, prioritizing the most recently modified candidates", (_, done) => {
+    // #707 follow-up review round 3, finding 3: each candidate's own read is
+    // bounded, but an unbounded NUMBER of candidates still adds up to
+    // unbounded main-process blocking.
+    const CANDIDATE_COUNT = 25; // > RECOVERY_SWEEP_MAX_FILES (20)
+    for (let i = 0; i < CANDIDATE_COUNT; i++) {
+      const uniqueName = `rollout-2026-03-25T15-10-51-${String(i).padStart(8, "0")}-f1a9-7633-b9c7-758327137228.jsonl`;
+      const filePath = path.join(dateDir, uniqueName);
+      fs.writeFileSync(filePath, [
+        JSON.stringify({ type: "session_meta", payload: { cwd: `/projects/n${i}` } }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            name: "request_user_input",
+            call_id: `call_budget_${i}`,
+            arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+          },
+        }),
+      ].join("\n") + "\n");
+      // Spread mtimes across the recoverable range (10min .. ~24h ago); i=0
+      // is the MOST recent and must always survive a budget cut.
+      const ageMs = 600000 + i * 60 * 60 * 1000;
+      const mtime = new Date(Date.now() - ageMs);
+      fs.utimesSync(filePath, mtime, mtime);
+    }
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.ok(requests.length <= 20, `sweep must not exceed RECOVERY_SWEEP_MAX_FILES, got ${requests.length}`);
+      assert.ok(requests.length > 0, "at least the most recent candidates must still be recovered");
+      const recoveredCallIds = requests.map((args) => args[1].callId);
+      assert.ok(
+        recoveredCallIds.includes("call_budget_0"),
+        "the most recently modified candidate must survive the budget cut"
+      );
+      done();
+    }, 800);
+  });
+
+  it("rejects a request whose own timestamp is 48h old even when the file's mtime is fresh (Desktop refresh bypass)", (_, done) => {
+    // #707 follow-up review round 4, finding 1: the recovery sweep's own
+    // age cap only protects files it actually opens (mtime outside the
+    // active window). A file Codex Desktop refreshed back into the active
+    // window attaches via the normal live path instead, which had no age
+    // check at all.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const oldTimestamp = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: oldTimestamp,
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_desktop_refresh_bypass",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count" } }),
+    ].join("\n") + "\n");
+    // mtime is "now" (just written) — well inside the active window, so this
+    // attaches via the normal live path, not the recovery sweep.
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.deepStrictEqual(
+        requests, [],
+        "a 48h-old request must not flash a card just because the file's mtime is fresh"
+      );
+      done();
+    }, 300);
+  });
+
+  it("does not reject a request with a genuinely recent embedded timestamp on the fresh-mtime attach path", (_, done) => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const recentTimestamp = new Date(Date.now() - 60 * 1000).toISOString();
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: recentTimestamp,
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_recent_ts",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor.start();
+
+    setTimeout(() => {
+      assert.strictEqual(requests.length, 1);
+      assert.strictEqual(requests[0][1].callId, "call_recent_ts");
+      done();
+    }, 300);
+  });
+
+  it("does not overshoot RECOVERY_SWEEP_MAX_TOTAL_BYTES (20MB) even when the next candidate would push it over the line", () => {
+    // #707 follow-up review round 4, finding 2: checking bytesScanned BEFORE
+    // adding the next candidate's cost, not after — otherwise exactly one
+    // over-budget candidate slips through whenever the running total lands
+    // just under the cap.
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {});
+    const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+    const perCandidateCost = 1.1 * 1024 * 1024; // matches the review's own repro numbers
+    const candidateCount = Math.ceil(MAX_TOTAL_BYTES / perCandidateCost) + 3;
+    const candidates = [];
+    for (let i = 0; i < candidateCount; i++) {
+      const testFile = path.join(
+        dateDir,
+        `rollout-2026-03-25T15-10-51-${String(i).padStart(8, "0")}-f1a9-7633-b9c7-758327137228.jsonl`
+      );
+      fs.writeFileSync(testFile, [
+        JSON.stringify({ type: "session_meta", payload: { cwd: `/projects/n${i}` } }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            name: "request_user_input",
+            call_id: `call_ledger_${i}`,
+            arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+          },
+        }),
+      ].join("\n") + "\n");
+      // The real file is tiny; the candidate's claimed size simulates a
+      // large rollout so the byte budget (not RECOVERY_SWEEP_MAX_FILES) is
+      // what actually gets exercised.
+      candidates.push({
+        filePath: testFile,
+        file: path.basename(testFile),
+        mtimeMs: Date.now() - i,
+        size: perCandidateCost,
+      });
+    }
+
+    monitor._runRecoverySweep(candidates);
+
+    const maxCandidatesUnderBudget = Math.floor(MAX_TOTAL_BYTES / perCandidateCost);
+    assert.ok(
+      monitor._tracked.size <= maxCandidatesUnderBudget,
+      `expected at most ${maxCandidatesUnderBudget} candidates processed within the 20MB budget, got ${monitor._tracked.size}`
+    );
+    assert.ok(monitor._tracked.size > 0, "at least some candidates within budget must still be recovered");
+  });
+
+  it("clears a pending question's card on task_complete even without a matching function_call_output", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_abandoned",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+
+    const requests = [];
+    const resolved = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: (...args) => requests.push(args),
+      onUserInputResolved: (...args) => resolved.push(args),
+    });
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.strictEqual(requests.length, 1);
+    assert.deepStrictEqual(resolved, []);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_complete"}}\n');
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.deepStrictEqual(resolved, [[EXPECTED_SID, "call_abandoned"]]);
+  });
+
+  it("clears a pending question's card on turn_aborted even without a matching function_call_output", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/projects/foo" } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "request_user_input",
+          call_id: "call_aborted",
+          arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+        },
+      }),
+    ].join("\n") + "\n");
+
+    const resolved = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {}, {
+      onUserInputRequest: () => {},
+      onUserInputResolved: (...args) => resolved.push(args),
+    });
+    monitor._pollFile(testFile, path.basename(testFile));
+    assert.deepStrictEqual(resolved, []);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"turn_aborted"}}\n');
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    assert.deepStrictEqual(resolved, [[EXPECTED_SID, "call_aborted"]]);
   });
 
   it("uses stale Codex Desktop session_meta for later live events without replaying it", () => {
@@ -415,6 +1373,292 @@ describe("CodexLogMonitor", () => {
     setTimeout(() => {
       fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
     }, 200);
+  });
+
+  it("advances only by bytesRead when a poll encounters a short read", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const firstLine = '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n';
+    fs.writeFileSync(testFile, firstLine +
+      '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+
+    const originalReadSync = fs.readSync;
+    fs.readSync = (fd, buffer, offset, length, position) =>
+      originalReadSync(fd, buffer, offset, Math.min(length, Buffer.byteLength(firstLine)), position);
+    try {
+      monitor._poll();
+    } finally {
+      fs.readSync = originalReadSync;
+    }
+    assert.deepStrictEqual(events.map((entry) => entry.state), ["idle"]);
+
+    monitor._poll();
+    assert.deepStrictEqual(events.map((entry) => entry.state), ["idle", "thinking"]);
+  });
+
+  it("closes the rollout fd and preserves its offset when readSync throws", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state) => events.push({ sid, state }));
+
+    const originalReadSync = fs.readSync;
+    const originalCloseSync = fs.closeSync;
+    let closes = 0;
+    fs.readSync = () => { throw new Error("simulated read failure"); };
+    fs.closeSync = (fd) => {
+      closes += 1;
+      return originalCloseSync(fd);
+    };
+    try {
+      monitor._poll();
+    } finally {
+      fs.readSync = originalReadSync;
+      fs.closeSync = originalCloseSync;
+    }
+    assert.strictEqual(closes, 1);
+    assert.deepStrictEqual(events, []);
+
+    monitor._poll();
+    assert.deepStrictEqual(events.map((entry) => entry.state), ["idle"]);
+  });
+
+  it("keeps successfully read bytes when closeSync reports an error", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state) => events.push({ sid, state }));
+
+    const originalCloseSync = fs.closeSync;
+    fs.closeSync = (fd) => {
+      originalCloseSync(fd);
+      throw new Error("simulated close failure");
+    };
+    try {
+      monitor._poll();
+    } finally {
+      fs.closeSync = originalCloseSync;
+    }
+    assert.deepStrictEqual(events.map((entry) => entry.state), ["idle"]);
+  });
+
+  it("recovers when a rollout is truncated between statSync and readSync", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+    events.length = 0;
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+
+    const originalReadSync = fs.readSync;
+    fs.readSync = () => {
+      fs.truncateSync(testFile, 0);
+      return 0;
+    };
+    try {
+      monitor._poll();
+    } finally {
+      fs.readSync = originalReadSync;
+    }
+    assert.deepStrictEqual(events, []);
+
+    monitor._poll();
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events, [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("uses birthtime identity when Windows reports dev and ino as zero", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const initial = '{"type":"session_meta","payload":{"cwd":"/old"}}\n';
+    fs.writeFileSync(testFile, initial);
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+
+    const originalStatSync = fs.statSync;
+    const originalFstatSync = fs.fstatSync;
+    let simulatedBirthtime = 1000;
+    fs.statSync = (candidate) => {
+      const stat = originalStatSync(candidate);
+      if (candidate !== testFile) return stat;
+      return { ...stat, dev: 0, ino: 0, birthtimeMs: simulatedBirthtime };
+    };
+    fs.fstatSync = (fd) => {
+      const stat = originalFstatSync(fd);
+      return { ...stat, dev: 0, ino: 0, birthtimeMs: simulatedBirthtime };
+    };
+    try {
+      monitor._poll();
+      events.length = 0;
+      fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+      monitor._poll();
+      assert.deepStrictEqual(events.map((entry) => entry.state), ["thinking"]);
+      events.length = 0;
+
+      const replacement = path.join(dateDir, "windows-zero-identity.jsonl");
+      fs.writeFileSync(replacement, " ".repeat(Buffer.byteLength(initial)) +
+        '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+      fs.renameSync(replacement, testFile);
+      simulatedBirthtime = 2000;
+      monitor._poll();
+      assert.deepStrictEqual(events, []);
+
+      fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+      monitor._poll();
+      assert.deepStrictEqual(events.map((entry) => entry.state), ["thinking"]);
+    } finally {
+      fs.statSync = originalStatSync;
+      fs.fstatSync = originalFstatSync;
+    }
+  });
+
+  it("silently rebaselines an actively tracked rollout after truncation", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/old"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command"}}',
+    ].join("\n") + "\n");
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+    events.length = 0;
+
+    fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/new"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events, []);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events, [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("silently rebaselines an actively tracked rollout after inode replacement", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const initial = '{"type":"session_meta","payload":{"cwd":"/old"}}\n';
+    fs.writeFileSync(testFile, initial);
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+    events.length = 0;
+
+    const replacement = path.join(dateDir, "active-replacement.jsonl");
+    fs.writeFileSync(replacement, " ".repeat(Buffer.byteLength(initial)) +
+      '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    fs.renameSync(replacement, testFile);
+    monitor._poll();
+    assert.deepStrictEqual(events, []);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events, [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("silently rebaselines when a rollout is replaced between statSync and openSync", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const initial = '{"type":"session_meta","payload":{"cwd":"/old"}}\n';
+    const taskStarted = '{"type":"event_msg","payload":{"type":"task_started"}}\n';
+    fs.writeFileSync(testFile, initial);
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+    events.length = 0;
+
+    fs.appendFileSync(testFile, taskStarted);
+    const replacement = path.join(dateDir, "stat-open-replacement.jsonl");
+    fs.writeFileSync(replacement, " ".repeat(Buffer.byteLength(initial)) + taskStarted);
+    const originalOpenSync = fs.openSync;
+    let replaced = false;
+    fs.openSync = (candidate, flags, mode) => {
+      if (candidate === testFile && !replaced) {
+        replaced = true;
+        fs.renameSync(replacement, testFile);
+      }
+      return originalOpenSync(candidate, flags, mode);
+    };
+    try {
+      monitor._poll();
+    } finally {
+      fs.openSync = originalOpenSync;
+    }
+    assert.strictEqual(replaced, true);
+    assert.deepStrictEqual(events, []);
+
+    fs.appendFileSync(testFile, taskStarted);
+    monitor._poll();
+    assert.deepStrictEqual(events, [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("closes the rollout fd without advancing when fstatSync fails", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state) => events.push({ sid, state }));
+
+    const originalOpenSync = fs.openSync;
+    const originalFstatSync = fs.fstatSync;
+    const originalCloseSync = fs.closeSync;
+    let rolloutFd = null;
+    let closes = 0;
+    fs.openSync = (candidate, flags, mode) => {
+      const fd = originalOpenSync(candidate, flags, mode);
+      if (candidate === testFile) rolloutFd = fd;
+      return fd;
+    };
+    fs.fstatSync = (fd) => {
+      if (fd === rolloutFd) throw new Error("simulated fstat failure");
+      return originalFstatSync(fd);
+    };
+    fs.closeSync = (fd) => {
+      if (fd === rolloutFd) {
+        closes += 1;
+        rolloutFd = null;
+      }
+      return originalCloseSync(fd);
+    };
+    try {
+      monitor._poll();
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.fstatSync = originalFstatSync;
+      fs.closeSync = originalCloseSync;
+    }
+    assert.strictEqual(closes, 1);
+    assert.deepStrictEqual(events, []);
+    assert.strictEqual(monitor._tracked.get(testFile).offset, 0);
+
+    monitor._poll();
+    assert.deepStrictEqual(events.map((entry) => entry.state), ["idle"]);
   });
 
   it("should ignore unmapped event types", (_, done) => {
@@ -861,6 +2105,221 @@ describe("CodexLogMonitor", () => {
       event: "event_msg:task_started",
       cwd: "/tmp",
       contextUsage: { used: 1200, limit: 12000, percent: 10, source: "codex" },
+    }]);
+  });
+
+  it("does not replay a rollout after its active and retired trackers are both evicted", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/target"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+
+    // Exercise the public polling seam throughout: first consume the target,
+    // then force it out of both the 50 active and 100 retired tracker LRUs.
+    monitor._poll();
+    for (let i = 0; i < 150; i++) {
+      const suffix = String(i + 1).padStart(12, "0");
+      const fileName = `rollout-2026-03-25T15-11-51-019d23d4-f1a9-7633-b9c7-${suffix}.jsonl`;
+      fs.writeFileSync(
+        path.join(dateDir, fileName),
+        `{"type":"session_meta","payload":{"cwd":"/filler-${i}"}}\n`
+      );
+    }
+    monitor._poll();
+
+    assert.strictEqual(monitor._tracked.has(testFile), false);
+    assert.strictEqual(monitor._retiredTracked.has(testFile), false);
+    events.length = 0;
+
+    // A live append makes the old path discoverable again. Only that append
+    // should emit; the historical thinking/working/attention turn must not.
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._poll();
+
+    assert.deepStrictEqual(events.filter((entry) => entry.sid === EXPECTED_SID), [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("emits exactly one request when a pending question arrives after both trackers are evicted", () => {
+    // #700/#707 integration: the read-position ledger must let a rollout
+    // resume from its saved offset after eviction from both the 50-active
+    // and 100-retired LRUs — this exercises that same real _poll() reattach
+    // path for a request_user_input line rather than a plain state event.
+    // The request must fire exactly once: not zero (silently absorbed by a
+    // stale-identity reattach or a ledger that failed to survive eviction),
+    // and not duplicated by initializingUserInputs' deferred-emit firing on
+    // top of an inline one.
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/target"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command"}}',
+      '{"type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n") + "\n");
+
+    const states = [];
+    const requests = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      states.push({ sid, state, event });
+    }, {
+      onUserInputRequest: (...args) => requests.push(args),
+    });
+    monitor._findCodexWriterPid = () => null;
+
+    monitor._poll();
+    for (let i = 0; i < 150; i++) {
+      const suffix = String(i + 1).padStart(12, "0");
+      const fileName = `rollout-2026-03-25T15-16-51-019d23d4-f1a9-7633-b9c7-${suffix}.jsonl`;
+      fs.writeFileSync(
+        path.join(dateDir, fileName),
+        `{"type":"session_meta","payload":{"cwd":"/filler-${i}"}}\n`
+      );
+    }
+    monitor._poll();
+
+    assert.strictEqual(monitor._tracked.has(testFile), false);
+    assert.strictEqual(monitor._retiredTracked.has(testFile), false);
+    assert.strictEqual(monitor._readPositions.has(testFile), true, "the ledger must survive double eviction");
+    states.length = 0;
+    requests.length = 0;
+
+    fs.appendFileSync(testFile, JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "request_user_input",
+        call_id: "call_after_double_eviction",
+        arguments: JSON.stringify({ questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }] }),
+      },
+    }) + "\n");
+    monitor._poll();
+
+    assert.deepStrictEqual(
+      states.filter((entry) => entry.sid === EXPECTED_SID), [],
+      "the historical turn must not replay"
+    );
+    assert.strictEqual(requests.length, 1, "the fresh request must fire exactly once");
+    assert.strictEqual(requests[0][0], EXPECTED_SID);
+    assert.strictEqual(requests[0][1].callId, "call_after_double_eviction");
+  });
+
+  it("preserves an incomplete JSONL record across 150-file tracker churn", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile,
+      '{"type":"session_meta","payload":{"cwd":"/target"}}\n' +
+      '{"type":"event_msg","payload":{"type":"task_');
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+
+    for (let i = 0; i < 150; i++) {
+      const suffix = String(i + 601).padStart(12, "0");
+      const fileName = `rollout-2026-03-25T15-14-51-019d23d4-f1a9-7633-b9c7-${suffix}.jsonl`;
+      fs.writeFileSync(path.join(dateDir, fileName), '{"type":"session_meta","payload":{}}\n');
+    }
+    monitor._poll();
+    assert.strictEqual(monitor._tracked.has(testFile), false);
+    assert.strictEqual(monitor._retiredTracked.has(testFile), false);
+    events.length = 0;
+
+    fs.appendFileSync(testFile, 'started"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events.filter((entry) => entry.sid === EXPECTED_SID), [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("silently rebaselines a truncated rollout after its rich trackers are evicted", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    fs.writeFileSync(testFile, [
+      '{"type":"session_meta","payload":{"cwd":"/old"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+      '{"type":"response_item","payload":{"type":"function_call","name":"shell_command"}}',
+    ].join("\n") + "\n");
+
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+    for (let i = 0; i < 150; i++) {
+      const suffix = String(i + 201).padStart(12, "0");
+      const fileName = `rollout-2026-03-25T15-12-51-019d23d4-f1a9-7633-b9c7-${suffix}.jsonl`;
+      fs.writeFileSync(path.join(dateDir, fileName), '{"type":"session_meta","payload":{}}\n');
+    }
+    monitor._poll();
+    assert.strictEqual(monitor._tracked.has(testFile), false);
+    assert.strictEqual(monitor._retiredTracked.has(testFile), false);
+    events.length = 0;
+
+    fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/replacement"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events.filter((entry) => entry.sid === EXPECTED_SID), []);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events.filter((entry) => entry.sid === EXPECTED_SID), [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
+    }]);
+  });
+
+  it("silently rebaselines a replaced rollout after its rich trackers are evicted", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const initial = [
+      '{"type":"session_meta","payload":{"cwd":"/old"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+    ].join("\n") + "\n";
+    fs.writeFileSync(testFile, initial);
+
+    const events = [];
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), (sid, state, event) => {
+      events.push({ sid, state, event });
+    });
+    monitor._poll();
+    for (let i = 0; i < 150; i++) {
+      const suffix = String(i + 401).padStart(12, "0");
+      const fileName = `rollout-2026-03-25T15-13-51-019d23d4-f1a9-7633-b9c7-${suffix}.jsonl`;
+      fs.writeFileSync(path.join(dateDir, fileName), '{"type":"session_meta","payload":{}}\n');
+    }
+    monitor._poll();
+    assert.strictEqual(monitor._tracked.has(testFile), false);
+    assert.strictEqual(monitor._retiredTracked.has(testFile), false);
+    events.length = 0;
+
+    // Replace the inode with a larger file whose valid events begin exactly
+    // at the old offset. Offset-only recovery would replay these records.
+    const replacement = path.join(dateDir, "replacement.jsonl");
+    fs.writeFileSync(replacement, " ".repeat(Buffer.byteLength(initial)) + [
+      '{"type":"session_meta","payload":{"cwd":"/replacement"}}',
+      '{"type":"event_msg","payload":{"type":"task_started"}}',
+    ].join("\n") + "\n");
+    fs.renameSync(replacement, testFile);
+    monitor._poll();
+    assert.deepStrictEqual(events.filter((entry) => entry.sid === EXPECTED_SID), []);
+
+    fs.appendFileSync(testFile, '{"type":"event_msg","payload":{"type":"task_started"}}\n');
+    monitor._poll();
+    assert.deepStrictEqual(events.filter((entry) => entry.sid === EXPECTED_SID), [{
+      sid: EXPECTED_SID,
+      state: "thinking",
+      event: "event_msg:task_started",
     }]);
   });
 

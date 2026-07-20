@@ -8,6 +8,7 @@ const agentCommands = require("../src/settings-actions-agents");
 
 test("settings agent actions expose the command surface", () => {
   assert.deepStrictEqual(Object.keys(agentCommands).sort(), [
+    "AUTO_REPAIRABLE_AGENT_IDS",
     "INSTALLABLE_AGENT_IDS",
     "clearAgentCleanupHints",
     "clearAgentInstallHints",
@@ -468,4 +469,22 @@ test("settings agent actions report repair payload errors with the repair comman
 
   assert.strictEqual(result.status, "error");
   assert.match(result.message, /repairAgentIntegration\.agentId/);
+});
+
+test("every opencode-family member is installable AND auto-repairable (R10 P3)", () => {
+  // AUTO_REPAIRABLE_AGENT_IDS gates repairAgentIntegration; INSTALLABLE
+  // gates install/uninstall. Dropping a family member from either set turns
+  // the Settings/Doctor Repair buttons into "no automatic repair available"
+  // with every other test green (GPT-5.5 review mutation).
+  const { OPENCODE_FAMILY } = require("../agents/opencode-family");
+  for (const agentId of Object.keys(OPENCODE_FAMILY)) {
+    assert.ok(
+      agentCommands.INSTALLABLE_AGENT_IDS.has(agentId),
+      `${agentId} missing from INSTALLABLE_AGENT_IDS`
+    );
+    assert.ok(
+      agentCommands.AUTO_REPAIRABLE_AGENT_IDS.has(agentId),
+      `${agentId} missing from AUTO_REPAIRABLE_AGENT_IDS`
+    );
+  }
 });

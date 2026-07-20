@@ -33,7 +33,7 @@ function createTempLogPath() {
   return logPath;
 }
 
-function createPermissionHarness({ logPath = null } = {}) {
+function createPermissionHarness({ logPath = null, agentPermissionsEnabled = true } = {}) {
   class FakeBrowserWindow {
     constructor() {
       this.destroyed = false;
@@ -94,6 +94,7 @@ function createPermissionHarness({ logPath = null } = {}) {
   };
   const permissionFactory = loadPermissionWithElectron(fakeElectron);
   let notificationAutoCloseMs = 10_000;
+  const focused = [];
   const api = permissionFactory({
     win: { isDestroyed() { return false; } },
     permDebugLog: logPath,
@@ -108,6 +109,7 @@ function createPermissionHarness({ logPath = null } = {}) {
       return { enabled: true, autoCloseMs: null };
     },
     getSettingsSnapshot: () => ({ shortcuts: {} }),
+    isAgentPermissionsEnabled: () => agentPermissionsEnabled,
     subscribeShortcuts: () => () => {},
     clearShortcutFailure: () => {},
     reportShortcutFailure: () => {},
@@ -116,13 +118,14 @@ function createPermissionHarness({ logPath = null } = {}) {
     getHitRectScreen: () => null,
     getHudReservedOffset: () => 0,
     repositionUpdateBubble: () => {},
-    focusTerminalForSession: () => {},
+    focusTerminalForSession: (...args) => focused.push(args),
     guardAlwaysOnTop: () => {},
     reapplyMacVisibility: () => {},
   });
 
   return {
     api,
+    focused,
     setNotificationAutoCloseMs(value) {
       notificationAutoCloseMs = value;
     },
@@ -240,6 +243,58 @@ describe("permission passive notify auto-close refresh", () => {
       logContent.includes("passive notify dismiss: agent=codex session=codex-a reason=codex-state-transition"),
       "clearing a Codex passive notification should log the active-dismiss reason"
     );
+  });
+
+  it("keeps Codex user-input cards passive until resolution and focuses native Codex", () => {
+    const harness = createPermissionHarness();
+    const { api } = harness;
+    const shown = api.showCodexUserInputBubble({
+      sessionId: "codex-a",
+      callId: "call_1",
+      questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }],
+      sourcePid: 42,
+      cwd: "/repo",
+    });
+
+    assert.strictEqual(shown, true);
+    assert.strictEqual(api.pendingPermissions.length, 1);
+    const entry = api.pendingPermissions[0];
+    assert.strictEqual(entry.isCodexUserInputNotify, true);
+    assert.strictEqual(entry.autoExpireTimer, null, "blocking questions must not use notification auto-expiry");
+    assert.strictEqual(api.buildPermissionBubblePayload(entry).isCodexUserInputNotify, true);
+    assert.strictEqual(api.refreshPassiveNotifyAutoClose(), 0);
+    assert.strictEqual(api.pendingPermissions.length, 1);
+
+    api.handleDecide({ sender: { __window: entry.bubble } }, "codex-user-input-focus");
+    assert.strictEqual(api.pendingPermissions.length, 0);
+    assert.strictEqual(harness.focused.length, 1);
+    assert.strictEqual(harness.focused[0][0], "codex-a");
+  });
+
+  it("clears only the matching Codex user-input call", () => {
+    const { api } = createPermissionHarness();
+    for (const callId of ["call_1", "call_2"]) {
+      api.showCodexUserInputBubble({
+        sessionId: "codex-a",
+        callId,
+        questions: [{ id: "q", header: "Choice", question: callId, options: [] }],
+      });
+    }
+    assert.strictEqual(api.clearCodexUserInputBubbles("codex-a", "call_1"), 1);
+    assert.deepStrictEqual(api.pendingPermissions.map((entry) => entry.codexUserInputCallId), ["call_2"]);
+  });
+
+  it("does not treat a Codex question as a permission-mode feature", () => {
+    const { api } = createPermissionHarness({ agentPermissionsEnabled: false });
+    assert.strictEqual(api.showCodexUserInputBubble({
+      sessionId: "codex-a",
+      callId: "call_question",
+      questions: [{ id: "q", header: "Choice", question: "Pick one", options: [] }],
+    }), true);
+    assert.strictEqual(api.pendingPermissions.length, 1);
+
+    api.showCodexNotifyBubble({ sessionId: "codex-legacy", command: "rm" });
+    assert.strictEqual(api.pendingPermissions.length, 1, "legacy permission cue remains gated");
   });
 
   it("logs an explicit reason when Kimi passive notifications are actively cleared", () => {

@@ -337,6 +337,13 @@ body { padding: 6px; }
   }
 }
 
+/* Codex request_user_input preview — the options are a read-only echo of
+   what's on screen in Codex's own terminal, not a picker. Override the base
+   .option-item's pointer cursor so it doesn't look clickable. */
+.option-item-readonly {
+  cursor: default;
+}
+
 .option-item input {
   margin-top: 2px;
   accent-color: #d97757;

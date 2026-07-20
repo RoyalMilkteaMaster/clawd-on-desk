@@ -6,6 +6,7 @@ const {
   isFocusableLocalHudSession,
 } = require("./session-focus");
 const { createTranslator } = require("./i18n");
+const { isPassiveNotifyEntry } = require("./passive-notify-entry");
 
 const DEFAULT_MAPPING_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_REPLY_TEXT = 3800;
@@ -59,8 +60,7 @@ function findSession(snapshot, sessionId) {
 function isInteractivePermissionEntryForSession(permEntry, sessionId) {
   return !!permEntry
     && String(permEntry.sessionId || "") === String(sessionId || "")
-    && permEntry.isCodexNotify !== true
-    && permEntry.isKimiNotify !== true;
+    && !isPassiveNotifyEntry(permEntry);
 }
 
 function hasInteractivePermissionPending(entry, getPendingPermissions) {

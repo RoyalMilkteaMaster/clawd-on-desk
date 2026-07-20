@@ -54,9 +54,10 @@ const AGENT_INSTALL_SCRIPT = {
   "kimi-cli": "kimi-install.js",
   "qwen-code": "qwen-code-install.js",
   codewhale: "codewhale-install.js",
-  // opencode / pi / openclaw / hermes are intentionally absent: their install
-  // scripts need non-.js assets (pi-extension.ts, hermes-plugin/, opencode-plugin/,
-  // openclaw-plugin/) that the flat stdin file pipe cannot transfer. Re-add them
+  // opencode / mimocode / pi / openclaw / hermes are intentionally absent: their
+  // install scripts need non-.js assets (pi-extension.ts, hermes-plugin/,
+  // opencode-plugin/, mimocode-plugin/, openclaw-plugin/) that the flat stdin
+  // file pipe cannot transfer. Re-add them
   // once deploy supports directory transfer (e.g. tar over stdin).
   qoder: "qoder-install.js",
   reasonix: "reasonix-install.js",

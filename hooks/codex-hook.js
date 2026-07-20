@@ -23,6 +23,7 @@ const {
   extractLastAssistantTextFromTranscript,
 } = require("./codex-assistant-output");
 const { readCodexThreadName } = require("./codex-session-index");
+const { isCodexDesktopOriginator } = require("./codex-originator");
 const { fitStateBodyToByteBudget } = require("./state-payload-size");
 
 const TOOL_MATCH_STRING_MAX = 240;
@@ -191,7 +192,7 @@ function applyCodexSessionMetaFields(body, payload, sessionMeta) {
 function isCodexDesktopSession(payload, sessionMeta) {
   const source = payload && typeof payload === "object" ? payload : {};
   const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
-  return firstString(meta.originator, source.originator).toLowerCase() === "codex desktop";
+  return isCodexDesktopOriginator(firstString(meta.originator, source.originator));
 }
 
 function shouldReportForegroundWtHwnd(event) {

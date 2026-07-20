@@ -24,6 +24,16 @@ function session(overrides = {}) {
   };
 }
 
+function desktopSession(overrides = {}) {
+  return session({
+    agentId: "codex",
+    codexOriginator: "codex_work_desktop",
+    agentPid: 10,
+    sourcePid: 10,
+    ...overrides,
+  });
+}
+
 function decision(target, overrides = {}) {
   const calls = [];
   const alivePids = overrides.alivePids || new Set();
@@ -162,6 +172,68 @@ describe("state stale cleanup decisions", () => {
     assert.deepStrictEqual(result, { action: "delete", reason: "unreachable" });
   });
 
+  it("keeps an idle Codex Desktop thread before its configured timeout", () => {
+    const { result } = decision(desktopSession({
+      updatedAt: 1000000 - 59_999,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("deletes an idle Codex Desktop thread after timeout even while its shared pid is alive", () => {
+    const { result, calls } = decision(desktopSession({
+      updatedAt: 1000000 - 60_001,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: "delete", reason: "codex-desktop-idle-timeout" });
+    assert.deepStrictEqual(calls, [10]);
+  });
+
+  it("keeps idle Codex Desktop threads forever when sessionStaleMs=0", () => {
+    const { result } = decision(desktopSession({
+      updatedAt: 1000000 - 24 * 60 * 60 * 1000,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 0 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("restarts the Codex Desktop idle timeout from ackedAt", () => {
+    const { result } = decision(desktopSession({
+      updatedAt: 1000000 - 120_000,
+      ackedAt: 1000000 - 30_000,
+    }), {
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000 },
+    });
+
+    assert.deepStrictEqual(result, { action: null });
+  });
+
+  it("does not apply the Desktop idle timeout to guardian, remote, or unknown Codex sessions", () => {
+    const staleConfig = { sessionStaleMs: 60_000 };
+    const alivePids = new Set([10]);
+    const updatedAt = 1000000 - 60_001;
+    const cases = [
+      desktopSession({ headless: true, updatedAt }),
+      desktopSession({ host: "remote-box", updatedAt }),
+      desktopSession({ codexOriginator: "codex_exec", updatedAt }),
+      desktopSession({ codexOriginator: null, updatedAt }),
+    ];
+
+    for (const target of cases) {
+      assert.deepStrictEqual(decision(target, { alivePids, staleConfig }).result, { action: null });
+    }
+  });
+
   it("treats sessionStaleMs=0 as disabled — does not delete by age", () => {
     // 10h-old idle remote session, sessionStaleMs disabled -> stays alive.
     const { result } = decision(session({
@@ -188,14 +260,12 @@ describe("state stale cleanup decisions", () => {
   });
 
   it("keeps local Codex working through the default short stale windows", () => {
-    const { result } = decision(session({
+    const { result } = decision(desktopSession({
       state: "working",
-      agentId: "codex",
       updatedAt: 1000000 - 11 * 60 * 1000,
-      agentPid: 10,
-      sourcePid: 20,
     }), {
-      alivePids: new Set([10, 20]),
+      alivePids: new Set([10]),
+      staleConfig: { sessionStaleMs: 60_000, workingStaleMs: 60_000 },
     });
     assert.deepStrictEqual(result, { action: null });
   });

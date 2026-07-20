@@ -2,6 +2,7 @@
 
 const crypto = require("crypto");
 const { redactSecrets } = require("./secret-redact");
+const { createTranslator } = require("./i18n");
 
 const ACTION_ROW_SIZE = 3;
 const MAX_ELICITATION_QUESTIONS = 5;
@@ -40,6 +41,32 @@ function safeLarkMd(value) {
 }
 function safePlainText(value) {
   return stripInvisible(redactSecrets(value == null ? "" : String(value)));
+}
+
+// ── Card render context ──
+// Cards take an explicit { t, platform } context instead of reading global
+// prefs, so every builder stays a pure function that tests can drive language
+// by language. `t` is a live translator (a language switch needs no client
+// rebuild); `platform` only selects which brand the source label shows.
+const translateEn = createTranslator(() => "en");
+
+function renderContext(ctx) {
+  const source = ctx && typeof ctx === "object" ? ctx : {};
+  return {
+    t: typeof source.t === "function" ? source.t : translateEn,
+    platform: normalizePlatform(source.platform),
+  };
+}
+
+// The function form of the replacement argument is mandatory here:
+// agent-controlled text (agent id, titles, answers) lands in these slots, and a
+// string replacement would treat $&/$`/$'/$$ inside it as replacement patterns.
+function fill(template, token, value) {
+  return String(template == null ? "" : template).replace(token, () => value);
+}
+
+function labeledLine(ctx, label, value) {
+  return fill(fill(ctx.t("feishuCardLine"), "{label}", label), "{value}", value);
 }
 
 function loadLarkSdk() {
@@ -155,23 +182,23 @@ function buildActionRows(actions) {
   return rows;
 }
 
-function buildApprovalDetail(normalized) {
+function buildApprovalDetail(normalized, ctx) {
   if (normalized.agentId || normalized.toolName || normalized.folder || normalized.summary) {
     return [
-      normalized.agentId ? `**智能体**：${safeLarkMd(normalized.agentId)}` : null,
-      normalized.toolName ? `**工具**：${safeLarkMd(normalized.toolName)}` : null,
-      normalized.folder ? `**目录**：${safeLarkMd(normalized.folder)}` : null,
-      normalized.summary ? `**摘要**：${safeLarkMd(normalized.summary)}` : null,
+      normalized.agentId ? labeledLine(ctx, ctx.t("feishuCardFieldAgent"), safeLarkMd(normalized.agentId)) : null,
+      normalized.toolName ? labeledLine(ctx, ctx.t("feishuCardFieldTool"), safeLarkMd(normalized.toolName)) : null,
+      normalized.folder ? labeledLine(ctx, ctx.t("feishuCardFieldFolder"), safeLarkMd(normalized.folder)) : null,
+      normalized.summary ? labeledLine(ctx, ctx.t("feishuCardFieldSummary"), safeLarkMd(normalized.summary)) : null,
     ].filter(Boolean).join("\n");
   }
   return safeLarkMd(normalized.detail || normalized.title);
 }
 
-function buildElicitationDetail(normalized) {
+function buildElicitationDetail(normalized, ctx) {
   const lines = [];
-  if (normalized.agentId) lines.push(`**智能体**：${safeLarkMd(normalized.agentId)}`);
-  if (normalized.folder) lines.push(`**目录**：${safeLarkMd(normalized.folder)}`);
-  if (normalized.detail) lines.push(`**说明**：${safeLarkMd(normalized.detail)}`);
+  if (normalized.agentId) lines.push(labeledLine(ctx, ctx.t("feishuCardFieldAgent"), safeLarkMd(normalized.agentId)));
+  if (normalized.folder) lines.push(labeledLine(ctx, ctx.t("feishuCardFieldFolder"), safeLarkMd(normalized.folder)));
+  if (normalized.detail) lines.push(labeledLine(ctx, ctx.t("feishuCardFieldDetail"), safeLarkMd(normalized.detail)));
   return lines.join("\n");
 }
 
@@ -198,38 +225,44 @@ function selectOption(option, optionIndex) {
   };
 }
 
-function buildQuestionText(question, index, total = 1) {
-  const title = question.header || `问题 ${index + 1}`;
+function questionTitle(question, index, ctx) {
+  return question.header || fill(ctx.t("feishuCardQuestionTitle"), "{n}", String(index + 1));
+}
+
+function buildQuestionText(question, index, total = 1, ctx) {
+  const title = questionTitle(question, index, ctx);
   const progress = total > 1 ? `**${index + 1} / ${total}**\n` : "";
   const optionText = question.options.length
     ? question.multiSelect
-      ? `\n\n请选择一个或多个选项，也可以填写其他答案。`
-      : `\n\n请选择一个选项，也可以填写其他答案。`
-    : `\n\n请在输入框填写答案。`;
+      ? `\n\n${ctx.t("feishuCardQuestionHintMulti")}`
+      : `\n\n${ctx.t("feishuCardQuestionHintSingle")}`
+    : `\n\n${ctx.t("feishuCardQuestionHintInput")}`;
   return `${progress}**${safeLarkMd(title)}**\n${safeLarkMd(question.question)}${optionText}`;
 }
 
-function buildAnsweredSummaries(questions, answers, activeQuestionIndex) {
+function buildAnsweredSummaries(questions, answers, activeQuestionIndex, ctx) {
   const lines = [];
   for (let i = 0; i < questions.length; i += 1) {
     if (i === activeQuestionIndex) continue;
     const question = questions[i];
     const questionText = question && question.question;
     if (!questionText || !answers || !answers[questionText]) continue;
-    const title = question.header || `问题 ${i + 1}`;
-    lines.push(`**${safeLarkMd(title)}**：${safeLarkMd(answers[questionText])}`);
+    lines.push(labeledLine(ctx, safeLarkMd(questionTitle(question, i, ctx)), safeLarkMd(answers[questionText])));
   }
   return lines.join("\n");
 }
 
-function buildQuestionInput(question, questionIndex, answers = {}) {
+function buildQuestionInput(question, questionIndex, answers = {}, ctx) {
   if (!question.options.length) return null;
   const selectedLabels = parseAnswerParts(answers[question.question]);
   const labelToIndex = new Map(question.options.map((option, oi) => [optionValue(option.label), String(oi)]));
   const component = {
     tag: question.multiSelect ? "multi_select_static" : "select_static",
     name: questionFormName(questionIndex),
-    placeholder: { tag: "plain_text", content: question.multiSelect ? "选择一个或多个选项" : "选择一个选项" },
+    placeholder: {
+      tag: "plain_text",
+      content: ctx.t(question.multiSelect ? "feishuCardSelectPlaceholderMulti" : "feishuCardSelectPlaceholderSingle"),
+    },
     options: question.options.map((option, oi) => selectOption(option, oi)),
   };
   // Re-select prior answers by mapping their raw labels back to option indices.
@@ -244,19 +277,22 @@ function buildQuestionInput(question, questionIndex, answers = {}) {
   return component;
 }
 
-function buildOtherInput(question, questionIndex, answers = {}) {
+function buildOtherInput(question, questionIndex, answers = {}, ctx) {
   const selected = parseAnswerParts(answers[question.question]);
   const optionValues = new Set(question.options.map((option) => optionValue(option.label)));
   const otherText = selected.filter((value) => !optionValues.has(value)).join(", ");
   return {
     tag: "input",
     name: questionOtherFormName(questionIndex),
-    placeholder: { tag: "plain_text", content: question.options.length ? "输入其他答案" : "输入答案" },
+    placeholder: {
+      tag: "plain_text",
+      content: ctx.t(question.options.length ? "feishuCardOtherPlaceholder" : "feishuCardAnswerPlaceholder"),
+    },
     default_value: safePlainText(otherText),
   };
 }
 
-function normalizeStatusOutcome(outcome) {
+function normalizeStatusOutcome(outcome, ctx) {
   const raw = outcome && typeof outcome === "object" ? outcome : { decision: outcome };
   const decision = String(raw.decision || raw.behavior || "").trim();
   const actionLabel = String(raw.actionLabel || raw.message || "").trim();
@@ -267,8 +303,8 @@ function normalizeStatusOutcome(outcome) {
     return {
       decision,
       template: "red",
-      title: "已拒绝",
-      result: actionLabel || "拒绝",
+      title: ctx.t("feishuCardStatusDeniedTitle"),
+      result: actionLabel || ctx.t("feishuCardStatusDeniedResult"),
       source,
     };
   }
@@ -276,8 +312,8 @@ function normalizeStatusOutcome(outcome) {
     return {
       decision,
       template: "blue",
-      title: "已转到终端处理",
-      result: actionLabel || "前往终端处理",
+      title: ctx.t("feishuCardStatusTerminalTitle"),
+      result: actionLabel || ctx.t("feishuCardStatusTerminalResult"),
       source,
     };
   }
@@ -285,8 +321,8 @@ function normalizeStatusOutcome(outcome) {
     return {
       decision,
       template: "blue",
-      title: "已取消",
-      result: actionLabel || "未返回审批结果",
+      title: ctx.t("feishuCardStatusCancelledTitle"),
+      result: actionLabel || ctx.t("feishuCardStatusCancelledResult"),
       source,
     };
   }
@@ -294,34 +330,39 @@ function normalizeStatusOutcome(outcome) {
     return {
       decision,
       template: "green",
-      title: "已批准并更新权限",
-      result: actionLabel || "已应用权限建议",
+      title: ctx.t("feishuCardStatusSuggestionTitle"),
+      result: actionLabel || ctx.t("feishuCardStatusSuggestionResult"),
       source,
     };
   }
   return {
     decision: "allow",
     template: "green",
-    title: "已批准",
-    result: actionLabel || "批准一次",
+    title: ctx.t("feishuCardStatusApprovedTitle"),
+    result: actionLabel || ctx.t("feishuCardStatusApprovedResult"),
     source,
   };
 }
 
-function sourceLabel(source) {
-  if (source === "desktop") return "桌面弹窗";
-  if (source === "feishu") return "飞书卡片";
-  if (source === "remote") return "远程审批";
+// `source === "feishu"` stays the internal routing value for both platforms —
+// renaming it would churn the whole approval path. What the approver reads must
+// still match the platform they are actually on, so the brand is resolved here
+// and never by mapping the routing value straight to a fixed label.
+function sourceLabel(source, ctx) {
+  if (source === "desktop") return ctx.t("feishuCardSourceDesktop");
+  if (source === "feishu") return ctx.t(ctx.platform === "lark" ? "feishuCardSourceLark" : "feishuCardSourceFeishu");
+  if (source === "remote") return ctx.t("feishuCardSourceRemote");
   return "";
 }
 
-function buildApprovalCard(payload, options = {}) {
+function buildApprovalCard(payload, options = {}, context = {}) {
+  const ctx = renderContext(context);
   const normalized = normalizeApprovalPayload(payload);
   const requestId = String(options.requestId || "");
   const actions = [
-    button("批准一次", { requestId, decision: "allow" }, "primary"),
-    button("拒绝", { requestId, decision: "deny" }, "danger"),
-    button("前往终端", { requestId, decision: "terminal" }, "default"),
+    button(ctx.t("feishuCardButtonAllow"), { requestId, decision: "allow" }, "primary"),
+    button(ctx.t("feishuCardButtonDeny"), { requestId, decision: "deny" }, "danger"),
+    button(ctx.t("feishuCardButtonTerminal"), { requestId, decision: "terminal" }, "default"),
     ...normalized.suggestions.map((entry) => (
       button(safePlainText(entry.label), { requestId, decision: `suggestion:${entry.index}` }, "default")
     )),
@@ -330,19 +371,23 @@ function buildApprovalCard(payload, options = {}) {
     config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: "orange",
-      title: { tag: "plain_text", content: `权限确认：${safePlainText(normalized.agentId || normalized.title)}` },
+      title: {
+        tag: "plain_text",
+        content: fill(ctx.t("feishuCardApprovalHeader"), "{name}", safePlainText(normalized.agentId || normalized.title)),
+      },
     },
     elements: [
       {
         tag: "div",
-        text: { tag: "lark_md", content: buildApprovalDetail(normalized) },
+        text: { tag: "lark_md", content: buildApprovalDetail(normalized, ctx) },
       },
       ...buildActionRows(actions),
     ],
   };
 }
 
-function buildElicitationCard(payload, options = {}) {
+function buildElicitationCard(payload, options = {}, context = {}) {
+  const ctx = renderContext(context);
   const normalized = normalizeElicitationPayload(payload);
   const requestId = String(options.requestId || "");
   const answers = options.answers && typeof options.answers === "object" && !Array.isArray(options.answers)
@@ -354,7 +399,7 @@ function buildElicitationCard(payload, options = {}) {
   ));
   const question = normalized.questions[questionIndex];
   const elements = [];
-  const detail = buildElicitationDetail(normalized);
+  const detail = buildElicitationDetail(normalized, ctx);
   if (detail) {
     elements.push({
       tag: "div",
@@ -364,10 +409,10 @@ function buildElicitationCard(payload, options = {}) {
 
   elements.push({
     tag: "div",
-    text: { tag: "lark_md", content: buildQuestionText(question, questionIndex, normalized.questions.length) },
+    text: { tag: "lark_md", content: buildQuestionText(question, questionIndex, normalized.questions.length, ctx) },
   });
 
-  const answeredSummary = buildAnsweredSummaries(normalized.questions, answers, questionIndex);
+  const answeredSummary = buildAnsweredSummaries(normalized.questions, answers, questionIndex, ctx);
   if (answeredSummary) {
     elements.push({
       tag: "div",
@@ -376,12 +421,12 @@ function buildElicitationCard(payload, options = {}) {
   }
 
   const formElements = [];
-  const selectionInput = buildQuestionInput(question, questionIndex, answers);
+  const selectionInput = buildQuestionInput(question, questionIndex, answers, ctx);
   if (selectionInput) formElements.push(selectionInput);
-  formElements.push(buildOtherInput(question, questionIndex, answers));
+  formElements.push(buildOtherInput(question, questionIndex, answers, ctx));
   const isLastQuestion = questionIndex >= normalized.questions.length - 1;
   formElements.push({
-    ...button(isLastQuestion ? "提交回答" : "下一步", {
+    ...button(ctx.t(isLastQuestion ? "feishuCardButtonSubmit" : "feishuCardButtonNext"), {
       requestId,
       kind: "elicitation-step",
       questionIndex,
@@ -398,30 +443,34 @@ function buildElicitationCard(payload, options = {}) {
   });
   const navigation = [];
   if (questionIndex > 0) {
-    navigation.push(button("上一步", { requestId, kind: "elicitation-back", questionIndex }, "default"));
+    navigation.push(button(ctx.t("feishuCardButtonBack"), { requestId, kind: "elicitation-back", questionIndex }, "default"));
   }
-  navigation.push(button("前往终端", { requestId, decision: "terminal" }, "default"));
+  navigation.push(button(ctx.t("feishuCardButtonTerminal"), { requestId, decision: "terminal" }, "default"));
   elements.push({ tag: "action", actions: navigation });
 
   return {
     config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: "orange",
-      title: { tag: "plain_text", content: `需要输入：${safePlainText(normalized.agentId || normalized.title)}` },
+      title: {
+        tag: "plain_text",
+        content: fill(ctx.t("feishuCardElicitationHeader"), "{name}", safePlainText(normalized.agentId || normalized.title)),
+      },
     },
     elements,
   };
 }
 
-function buildStatusCard(payload, outcome) {
+function buildStatusCard(payload, outcome, context = {}) {
+  const ctx = renderContext(context);
   const normalized = normalizeApprovalPayload(payload);
-  const status = normalizeStatusOutcome(outcome);
-  const source = sourceLabel(status.source);
+  const status = normalizeStatusOutcome(outcome, ctx);
+  const source = sourceLabel(status.source, ctx);
   const detail = [
-    buildApprovalDetail(normalized),
+    buildApprovalDetail(normalized, ctx),
     "",
-    `**处理结果**：${safeLarkMd(status.result)}`,
-    source ? `**处理来源**：${source}` : null,
+    labeledLine(ctx, ctx.t("feishuCardResultLabel"), safeLarkMd(status.result)),
+    source ? labeledLine(ctx, ctx.t("feishuCardSourceLabel"), source) : null,
   ].filter((line) => line !== null).join("\n");
   return {
     config: { wide_screen_mode: true, update_multi: true },
@@ -438,20 +487,25 @@ function buildStatusCard(payload, outcome) {
   };
 }
 
-function buildElicitationStatusCard(payload, outcome) {
+function buildElicitationStatusCard(payload, outcome, context = {}) {
+  const ctx = renderContext(context);
   const normalized = normalizeElicitationPayload(payload);
   const raw = outcome && typeof outcome === "object" ? outcome : { decision: outcome };
-  const source = sourceLabel(String(raw.source || "").trim());
+  const source = sourceLabel(String(raw.source || "").trim(), ctx);
   const terminal = raw.decision === "terminal";
   const submitted = raw.decision === "elicitation-submit";
   const template = submitted ? "green" : "blue";
-  const title = submitted ? "已提交输入" : terminal ? "已转到终端处理" : "已取消";
-  const result = submitted ? "已提交问答结果" : terminal ? "前往终端处理" : "未返回输入结果";
+  const title = ctx.t(submitted
+    ? "feishuCardStatusSubmittedTitle"
+    : terminal ? "feishuCardStatusTerminalTitle" : "feishuCardStatusCancelledTitle");
+  const result = ctx.t(submitted
+    ? "feishuCardStatusSubmittedResult"
+    : terminal ? "feishuCardStatusTerminalResult" : "feishuCardStatusInputCancelledResult");
   const detail = [
-    buildElicitationDetail(normalized),
+    buildElicitationDetail(normalized, ctx),
     "",
-    `**处理结果**：${result}`,
-    source ? `**处理来源**：${source}` : null,
+    labeledLine(ctx, ctx.t("feishuCardResultLabel"), result),
+    source ? labeledLine(ctx, ctx.t("feishuCardSourceLabel"), source) : null,
   ].filter((line) => line !== null).join("\n");
   return {
     config: { wide_screen_mode: true, update_multi: true },
@@ -674,10 +728,55 @@ function normalizeElicitationActionEvent(event, questions, idType = "open_id") {
   return null;
 }
 
+// Approval decisions are strings, but elicitation decisions are objects — and
+// the logger stringifies whatever it is given, so an elicitation step used to
+// log as a useless `decision=[object Object]`. That is the one line you have
+// when debugging a stepper that misbehaves on a real tenant (#493 was diagnosed
+// entirely from this log), so describe the shape instead.
+//
+// Deliberately omits `answers`: those are user/agent content and have no place
+// in a diagnostic line.
+function describeDecision(decision) {
+  if (!decision) return "";
+  if (typeof decision === "string") return decision;
+  if (typeof decision !== "object") return String(decision);
+  const type = typeof decision.type === "string" ? decision.type : "unknown";
+  const parts = [type];
+  if (Number.isInteger(decision.questionIndex)) parts.push(`q${decision.questionIndex}`);
+  if (decision.final === true) parts.push("final");
+  if (decision.answers && typeof decision.answers === "object") {
+    parts.push(`answers=${Object.keys(decision.answers).length}`);
+  }
+  return parts.join(":");
+}
+
 function normalizeApiMessageId(response) {
   return response && response.data && typeof response.data.message_id === "string"
     ? response.data.message_id
     : "";
+}
+
+// Single place that turns our platform enum into an SDK domain. Never build a
+// URL by hand and never accept a user-supplied host: the App Secret rides these
+// requests, so the destination must come from the official SDK enum only.
+//
+// CAUTION: `Domain.Feishu === 0`. It is a valid domain that is *falsy*, so this
+// value must never be run through `||`, `!value`, or a truthiness assert —
+// Feishu would silently look "missing". Compare with === undefined instead.
+function resolveSdkDomain(lark, platform) {
+  if (!lark || !lark.Domain) {
+    // Tolerated for the fake SDKs used in tests, but only for Feishu: that is
+    // the SDK's own default, so omitting the field lands on the same host.
+    // Lark cannot be expressed without the enum, so it must fail loudly rather
+    // than quietly connect to Feishu with Lark credentials.
+    if (platform === "lark") throw new Error("Installed Lark SDK does not expose Domain.Lark");
+    return undefined;
+  }
+  const domain = platform === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
+  if (platform === "lark" && domain === undefined) {
+    throw new Error("Installed Lark SDK does not expose Domain.Lark");
+  }
+  return domain;
 }
 
 function createLarkClient(config = {}) {
@@ -686,7 +785,7 @@ function createLarkClient(config = {}) {
     appId: config.appId,
     appSecret: config.appSecret,
     appType: lark.AppType ? lark.AppType.SelfBuild : undefined,
-    domain: lark.Domain ? lark.Domain.Feishu : undefined,
+    domain: resolveSdkDomain(lark, config.platform),
     loggerLevel: lark.LoggerLevel ? lark.LoggerLevel.warn : undefined,
   });
 }
@@ -703,9 +802,12 @@ function createWsClient(config = {}) {
       return undefined;
     },
   });
+  // The WS long connection must land on the SAME platform as the REST client:
+  // cards would send fine while button callbacks never arrive (#493).
   const wsClient = new lark.WSClient({
     appId: config.appId,
     appSecret: config.appSecret,
+    domain: resolveSdkDomain(lark, config.platform),
     loggerLevel: lark.LoggerLevel ? lark.LoggerLevel.warn : undefined,
     autoReconnect: true,
     handshakeTimeoutMs: config.handshakeTimeoutMs || 15000,
@@ -733,6 +835,14 @@ function statusForConnectionState(state, enabled) {
   return "ready";
 }
 
+// Defence in depth: prefs already normalize this, but the client is also
+// constructed directly in tests and must never end up with a platform it does
+// not understand. Anything unrecognised means Feishu — the pre-platform
+// behaviour, so a corrupt value degrades to what existing users already had.
+function normalizePlatform(value) {
+  return value === "lark" ? "lark" : "feishu";
+}
+
 function normalizeConnectionTimeoutMs(value) {
   const numeric = Number(value);
   if (Number.isFinite(numeric) && numeric > 0) {
@@ -749,6 +859,11 @@ class FeishuApprovalClient {
     this.encryptKey = options.encryptKey || "";
     this.approverId = options.approverId || "";
     this.idType = options.idType || "open_id";
+    this.platform = normalizePlatform(options.platform);
+    // Dynamic language source (same contract as the Telegram runner): the
+    // translator reads it per call, so switching Clawd's language re-renders
+    // later cards without rebuilding the client or dropping the WS connection.
+    this.t = createTranslator(typeof options.getLang === "function" ? options.getLang : () => "en");
     this.lark = options.lark || null;
     this.larkClient = options.larkClient || null;
     this.wsFactory = options.wsFactory || createWsClient;
@@ -759,6 +874,12 @@ class FeishuApprovalClient {
     this.onStatusChange = typeof options.onStatusChange === "function" ? options.onStatusChange : () => {};
     this.connectionState = "idle";
     this.lastErrorMessage = "";
+    this.lastErrorCode = "";
+    // Stable code for failures WE raise, so the settings page can show a
+    // translated string instead of our English diagnostic. Empty when the
+    // failure came from the SDK: that message is an arbitrary upstream string
+    // with no key to map it to, and dropping it would remove the only clue.
+    this.lastErrorCode = "";
     this.connectionTimeoutMs = normalizeConnectionTimeoutMs(options.connectionTimeoutSeconds);
     this.connectionTimer = null;
     this.connectionTimerMode = "";
@@ -772,6 +893,10 @@ class FeishuApprovalClient {
 
   isEnabled() {
     return !!(this.appId && this.appSecret && this.approverId);
+  }
+
+  cardContext() {
+    return { t: this.t, platform: this.platform };
   }
 
   getStatus() {
@@ -791,6 +916,9 @@ class FeishuApprovalClient {
     return {
       status: statusForConnectionState(state, this.isEnabled()),
       message: state === "failed" ? this.lastErrorMessage : "",
+      // Named errorCode, not code: main's status already carries `reason` from
+      // readiness(), and settings commands return their own `code`.
+      errorCode: state === "failed" ? this.lastErrorCode : "",
       connection: { ...connection, state },
     };
   }
@@ -828,7 +956,12 @@ class FeishuApprovalClient {
       this.connectionState = "failed";
       const seconds = Math.max(1, Math.round(this.connectionTimeoutMs / 1000));
       const label = activeMode === "reconnecting" ? "reconnect" : "connection";
-      this.lastErrorMessage = `Feishu long ${label} timed out after ${this.connectionTimeoutMs}ms. Check app credentials, long connection event subscription, and network.`;
+      // This is our own failure, so it carries a code the settings page maps to
+      // translated copy. The message stays English as the log/fallback
+      // diagnostic, and must not name a single brand — one client, two
+      // platforms.
+      this.lastErrorCode = activeMode === "reconnecting" ? "reconnect-timeout" : "connection-timeout";
+      this.lastErrorMessage = `Long ${label} timed out after ${this.connectionTimeoutMs}ms. Check app credentials, long connection event subscription, and network.`;
       this.log("warn", "connection timeout", { error: this.lastErrorMessage, timeoutSeconds: seconds });
       this.clearConnectionTimer();
       this.notifyStatusChange();
@@ -852,25 +985,41 @@ class FeishuApprovalClient {
       verificationToken: this.verificationToken || "",
       encryptKey: this.encryptKey || "",
       lark: this.lark,
+      platform: this.platform,
       handshakeTimeoutMs: this.connectionTimeoutMs,
       onCardAction: (event) => this.handleCardAction(event),
       onReady: ifCurrent(() => {
         this.clearConnectionTimer();
         this.connectionState = "connected";
         this.lastErrorMessage = "";
+        this.lastErrorCode = "";
         this.log("info", "connected");
         this.notifyStatusChange();
       }),
       onError: ifCurrent((err) => {
         this.clearConnectionTimer();
         this.connectionState = "failed";
-        this.lastErrorMessage = err && err.message ? err.message : String(err || "Feishu long connection failed");
+        const raw = err && err.message ? err.message : String(err || "Long connection failed");
+        // Gateway code 1000040351 ("Incorrect domain name") is the platform
+        // rejecting an app that lives on the other deployment — i.e. the
+        // platform picker is set wrong. It is the single most likely
+        // misconfiguration here, and the SDK only surfaces it as English
+        // internals ("pullConnectConfig failed: code=…"), so give it a code the
+        // settings page can turn into an actionable sentence. Verified against
+        // a real Lark app pointed at open.feishu.cn (2026-07-15).
+        //
+        // Matched on the numeric code, not the English text, which is the
+        // stabler half of the response. Anything else keeps an empty code and
+        // falls back to showing the SDK's raw string.
+        this.lastErrorCode = /\b1000040351\b/.test(raw) ? "wrong-platform" : "";
+        this.lastErrorMessage = raw;
         this.log("warn", "connection failed", { error: this.lastErrorMessage });
         this.notifyStatusChange();
       }),
       onReconnecting: ifCurrent(() => {
         this.connectionState = "reconnecting";
         this.lastErrorMessage = "";
+        this.lastErrorCode = "";
         this.startConnectionTimer("reconnecting");
         this.log("info", "reconnecting");
         this.notifyStatusChange();
@@ -879,6 +1028,7 @@ class FeishuApprovalClient {
         this.clearConnectionTimer();
         this.connectionState = "connected";
         this.lastErrorMessage = "";
+        this.lastErrorCode = "";
         this.log("info", "reconnected");
         this.notifyStatusChange();
       }),
@@ -887,6 +1037,7 @@ class FeishuApprovalClient {
     this.dispatcher = created.dispatcher;
     this.connectionState = "connecting";
     this.lastErrorMessage = "";
+    this.lastErrorCode = "";
     this.startConnectionTimer("connecting");
     this.notifyStatusChange();
     if (this.wsClient && typeof this.wsClient.start === "function") {
@@ -926,6 +1077,7 @@ class FeishuApprovalClient {
     this.dispatcher = null;
     this.connectionState = "idle";
     this.lastErrorMessage = "";
+    this.lastErrorCode = "";
     for (const entry of this.pending.values()) {
       entry.resolve(null);
     }
@@ -938,6 +1090,7 @@ class FeishuApprovalClient {
       appId: this.appId,
       appSecret: this.appSecret,
       lark: this.lark,
+      platform: this.platform,
     }));
     return client && client.im && client.im.v1 && client.im.v1.message
       ? client.im.v1.message
@@ -1046,13 +1199,13 @@ class FeishuApprovalClient {
 
   async sendCard(requestId, payload) {
     const message = this.messageApi();
-    if (!message || typeof message.create !== "function") throw new Error("Feishu message.create is unavailable");
+    if (!message || typeof message.create !== "function") throw new Error("message.create is unavailable");
     const response = await message.create({
       params: { receive_id_type: this.idType || "open_id" },
       data: {
         receive_id: this.approverId,
         msg_type: "interactive",
-        content: JSON.stringify(buildApprovalCard(payload, { requestId })),
+        content: JSON.stringify(buildApprovalCard(payload, { requestId }, this.cardContext())),
       },
     });
     const messageId = normalizeApiMessageId(response);
@@ -1062,13 +1215,17 @@ class FeishuApprovalClient {
 
   async sendElicitationCard(requestId, payload, options = {}) {
     const message = this.messageApi();
-    if (!message || typeof message.create !== "function") throw new Error("Feishu message.create is unavailable");
+    if (!message || typeof message.create !== "function") throw new Error("message.create is unavailable");
     const response = await message.create({
       params: { receive_id_type: this.idType || "open_id" },
       data: {
         receive_id: this.approverId,
         msg_type: "interactive",
-        content: JSON.stringify(buildElicitationCard(payload, { requestId, questionIndex: options.questionIndex || 0 })),
+        content: JSON.stringify(buildElicitationCard(
+          payload,
+          { requestId, questionIndex: options.questionIndex || 0 },
+          this.cardContext()
+        )),
       },
     });
     const messageId = normalizeApiMessageId(response);
@@ -1082,7 +1239,7 @@ class FeishuApprovalClient {
     if (!message || typeof message.patch !== "function") return;
     await message.patch({
       path: { message_id: messageId },
-      data: { content: JSON.stringify(buildStatusCard(payload, outcome)) },
+      data: { content: JSON.stringify(buildStatusCard(payload, outcome, this.cardContext())) },
     });
   }
 
@@ -1092,7 +1249,7 @@ class FeishuApprovalClient {
     if (!message || typeof message.patch !== "function") return;
     await message.patch({
       path: { message_id: messageId },
-      data: { content: JSON.stringify(buildElicitationStatusCard(payload, outcome)) },
+      data: { content: JSON.stringify(buildElicitationStatusCard(payload, outcome, this.cardContext())) },
     });
   }
 
@@ -1107,7 +1264,7 @@ class FeishuApprovalClient {
           requestId,
           questionIndex,
           answers,
-        })),
+        }, this.cardContext())),
       },
     });
   }
@@ -1157,7 +1314,7 @@ class FeishuApprovalClient {
       : action;
     this.log("debug", "card action received", {
       requestId,
-      decision: normalizedAction && normalizedAction.decision ? normalizedAction.decision : "",
+      decision: describeDecision(normalizedAction && normalizedAction.decision),
       matched: !!(normalizedAction && normalizedAction.operatorId === this.approverId && entry),
     });
     if (!normalizedAction || normalizedAction.operatorId !== this.approverId) return false;

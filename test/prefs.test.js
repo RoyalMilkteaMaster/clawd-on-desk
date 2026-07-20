@@ -74,6 +74,9 @@ describe("prefs.getDefaults", () => {
     });
     assert.deepStrictEqual(d.feishuApproval, {
       enabled: false,
+      // Feishu (China) is the default so existing users keep the platform they
+      // were implicitly on before this field existed.
+      platform: "feishu",
       idType: "open_id",
       approverId: "",
       connectionTimeoutSeconds: 15,

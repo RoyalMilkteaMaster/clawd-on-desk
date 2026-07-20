@@ -8,14 +8,38 @@ const {
   buildApprovalCard,
   buildElicitationCard,
   buildStatusCard,
+  buildElicitationStatusCard,
   normalizeApprovalPayload,
   normalizeElicitationPayload,
   normalizeActionEvent,
   normalizeElicitationActionEvent,
+  createLarkClient,
+  createWsClient,
 } = require("../src/feishu-approval-client");
+const { createTranslator, i18n, SUPPORTED_LANGS } = require("../src/i18n");
 
 function flush() {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+// Mirrors the real @larksuiteoapi/node-sdk shape closely enough to capture what
+// the factories pass down. Domain.Feishu is 0 and Domain.Lark is 1 in the real
+// SDK — the 0 is the whole point of these tests.
+function fakeSdk(overrides = {}) {
+  const captured = { client: [], ws: [], dispatcher: [] };
+  const sdk = {
+    Domain: { Feishu: 0, Lark: 1 },
+    AppType: { SelfBuild: 0, ISV: 1 },
+    LoggerLevel: { warn: 2 },
+    Client: function Client(params) { captured.client.push(params); this.im = { v1: { message: {} } }; },
+    WSClient: function WSClient(params) { captured.ws.push(params); this.start = async () => {}; this.close = () => {}; },
+    EventDispatcher: function EventDispatcher(params) {
+      captured.dispatcher.push(params);
+      this.register = () => this;
+    },
+    ...overrides,
+  };
+  return { sdk, captured };
 }
 
 test("buildApprovalCard creates an interactive allow deny card", () => {
@@ -28,14 +52,15 @@ test("buildApprovalCard creates an interactive allow deny card", () => {
     suggestions: [{ index: 0, label: "自动接受编辑" }],
   }, { requestId: "req_1" });
   assert.equal(card.config.update_multi, true);
-  assert.equal(card.header.title.content, "权限确认：claude-code");
-  assert.match(card.elements[0].text.content, /智能体/);
-  assert.match(card.elements[0].text.content, /摘要/);
+  // No render context supplied -> English, the neutral default.
+  assert.equal(card.header.title.content, "Permission request: claude-code");
+  assert.match(card.elements[0].text.content, /Agent/);
+  assert.match(card.elements[0].text.content, /Summary/);
   const action = card.elements.find((element) => element.tag === "action");
   assert.equal(action.actions.length, 3);
-  assert.equal(action.actions[0].text.content, "批准一次");
-  assert.equal(action.actions[1].text.content, "拒绝");
-  assert.equal(action.actions[2].text.content, "前往终端");
+  assert.equal(action.actions[0].text.content, "Approve once");
+  assert.equal(action.actions[1].text.content, "Deny");
+  assert.equal(action.actions[2].text.content, "Go to terminal");
   assert.deepEqual(action.actions[0].value, { requestId: "req_1", decision: "allow" });
   assert.deepEqual(action.actions[1].value, { requestId: "req_1", decision: "deny" });
   const secondAction = card.elements.filter((element) => element.tag === "action")[1];
@@ -58,7 +83,7 @@ test("buildApprovalCard neutralizes agent-controlled Markdown and secrets in the
   assert.match(detail, /redacted:token/);
   assert.doesNotMatch(detail, /\n✅/, "an injected newline must not forge a status line");
   assert.ok(!detail.includes("**注意**"), "injected bold markers are stripped");
-  assert.match(detail, /\*\*摘要\*\*/, "our own fixed label keeps its formatting");
+  assert.match(detail, /\*\*Summary\*\*/, "our own fixed label keeps its formatting");
 });
 
 test("buildApprovalCard guards the header and suggestion buttons (secrets + Unicode separators)", () => {
@@ -141,7 +166,7 @@ test("FeishuApprovalClient sends a card and resolves from card action", async ()
   await flush();
   assert.equal(updated.length, 1);
   assert.equal(updated[0].path.message_id, "om_1");
-  assert.match(JSON.parse(updated[0].data.content).header.title.content, /已批准/);
+  assert.match(JSON.parse(updated[0].data.content).header.title.content, /Approved/);
   assert.deepEqual(logs.filter((entry) => entry.level === "debug").map((entry) => ({
     message: entry.message,
     requestIdPrefix: String(entry.meta.requestId || "").slice(0, 3),
@@ -200,7 +225,7 @@ test("FeishuApprovalClient resolves on the first card action; late duplicates ar
   releasePatch();
   await flush();
   assert.equal(patches.length, 1);
-  assert.match(JSON.parse(patches[0].data.content).header.title.content, /已批准/);
+  assert.match(JSON.parse(patches[0].data.content).header.title.content, /Approved/);
 });
 
 test("FeishuApprovalClient reports running only after WS ready", async () => {
@@ -571,7 +596,7 @@ test("FeishuApprovalClient resolves terminal action and external desktop updates
   assert.equal(await decisionPromise, "terminal");
   // The card patch is best-effort and runs after the local decision resolves.
   await flush();
-  assert.match(JSON.parse(updated[0].data.content).header.title.content, /已转到终端处理/);
+  assert.match(JSON.parse(updated[0].data.content).header.title.content, /Moved to the terminal/);
 
   const ac2 = new AbortController();
   const secondPromise = client.requestApproval(
@@ -581,12 +606,12 @@ test("FeishuApprovalClient resolves terminal action and external desktop updates
   await Promise.resolve();
   assert.equal(client.resolveApprovalExternally(ac2.signal, {
     decision: "deny",
-    actionLabel: "拒绝",
+    actionLabel: "Denied",
     source: "desktop",
   }), true);
   assert.equal(await secondPromise, null);
-  assert.match(JSON.parse(updated[1].data.content).header.title.content, /已拒绝/);
-  assert.match(JSON.parse(updated[1].data.content).elements[0].text.content, /桌面弹窗/);
+  assert.match(JSON.parse(updated[1].data.content).header.title.content, /Denied/);
+  assert.match(JSON.parse(updated[1].data.content).elements[0].text.content, /Desktop bubble/);
 });
 
 test("FeishuApprovalClient can update card after local decision before send resolves", async () => {
@@ -617,7 +642,7 @@ test("FeishuApprovalClient can update card after local decision before send reso
   await Promise.resolve();
   assert.equal(client.resolveApprovalExternally(ac.signal, {
     decision: "allow",
-    actionLabel: "批准一次",
+    actionLabel: "Approved once",
     source: "desktop",
   }), true);
   resolveCreate({ data: { message_id: "om_late" } });
@@ -625,7 +650,7 @@ test("FeishuApprovalClient can update card after local decision before send reso
   assert.equal(await decisionPromise, null);
   assert.equal(updated.length, 1);
   assert.equal(updated[0].path.message_id, "om_late");
-  assert.match(JSON.parse(updated[0].data.content).elements[0].text.content, /桌面弹窗/);
+  assert.match(JSON.parse(updated[0].data.content).elements[0].text.content, /Desktop bubble/);
 });
 
 test("FeishuApprovalClient ignores non-approver actions and aborts pending request", async () => {
@@ -736,7 +761,7 @@ test("buildElicitationCard creates a form stepper with selection and other input
   }, { requestId: "req_q" });
 
   assert.equal(card.config.update_multi, true);
-  assert.equal(card.header.title.content, "需要输入：claude-code");
+  assert.equal(card.header.title.content, "Input needed: claude-code");
   assert.ok(card.elements.some((element) => element.tag === "div" && /1 \/ 2/.test(element.text.content)));
   assert.equal(card.elements.some((element) => (
     element.tag === "action"
@@ -869,7 +894,7 @@ test("FeishuApprovalClient only resolves elicitation after final step submit", a
       "Constraints?": "Keep API stable",
     },
   });
-  assert.match(JSON.parse(updated[1].data.content).header.title.content, /已提交输入/);
+  assert.match(JSON.parse(updated[1].data.content).header.title.content, /Input submitted/);
 });
 
 test("FeishuApprovalClient supports back navigation without resolving elicitation", async () => {
@@ -1007,6 +1032,510 @@ test("Feishu elicitation helpers validate payloads and action events", () => {
     operator: { open_id: "ou_1" },
     action: { value: { requestId: "req_q", kind: "elicitation-step", questionIndex: 0 }, form_value: {} },
   }, [{ question: "Q?", options: [] }], "open_id"), null);
+});
+
+// ── Approver id types ──
+// All three are supported paths, so all three need the send parameter AND the
+// callback-matching side covered. open_id alone leaves the id types that most
+// need checking (union_id/user_id, and their camelCase aliases) unverified.
+
+const ID_TYPE_CASES = [
+  { idType: "open_id", approverId: "ou_approver", snake: "open_id", camel: "openId" },
+  { idType: "union_id", approverId: "on_approver", snake: "union_id", camel: "unionId" },
+  { idType: "user_id", approverId: "uid_approver", snake: "user_id", camel: "userId" },
+];
+
+test("sendCard sends receive_id_type matching the configured id type", async () => {
+  for (const { idType, approverId } of ID_TYPE_CASES) {
+    const sent = [];
+    const client = new FeishuApprovalClient({
+      appId: "cli_1",
+      appSecret: "s",
+      approverId,
+      idType,
+      larkClient: { im: { v1: { message: {
+        create: async (payload) => { sent.push(payload); return { data: { message_id: "om_1" } }; },
+        patch: async () => ({ data: {} }),
+      } } } },
+    });
+    client.requestApproval({ title: "Run", detail: "Summary" });
+    await flush();
+    assert.equal(sent[0].params.receive_id_type, idType, `${idType}: approval receive_id_type`);
+    assert.equal(sent[0].data.receive_id, approverId, `${idType}: approval receive_id`);
+
+    client.requestElicitation({ title: "Q", questions: [{ question: "Which?", options: [{ label: "A" }] }] });
+    await flush();
+    assert.equal(sent[1].params.receive_id_type, idType, `${idType}: elicitation receive_id_type`);
+    assert.equal(sent[1].data.receive_id, approverId, `${idType}: elicitation receive_id`);
+  }
+});
+
+test("approval callbacks match the approver under each id type, in snake and camel case", () => {
+  for (const { idType, approverId, snake, camel } of ID_TYPE_CASES) {
+    for (const key of [snake, camel]) {
+      const action = normalizeActionEvent({
+        operator: { [key]: approverId },
+        action: { value: { requestId: "r1", decision: "allow" } },
+      }, idType);
+      assert.equal(action.operatorId, approverId, `${idType}: operator.${key} should be read`);
+      assert.equal(action.decision, "allow");
+
+      // Some payloads carry the id at the top level instead of under operator.
+      const flat = normalizeActionEvent({
+        [key]: approverId,
+        operator: {},
+        action: { value: { requestId: "r1", decision: "deny" } },
+      }, idType);
+      assert.equal(flat.operatorId, approverId, `${idType}: top-level ${key} should be read`);
+    }
+
+    // An id of a DIFFERENT type must not be mistaken for the approver — that
+    // would let the wrong identity resolve a permission.
+    for (const other of ID_TYPE_CASES.filter((c) => c.idType !== idType)) {
+      const mismatched = normalizeActionEvent({
+        operator: { [other.snake]: other.approverId },
+        action: { value: { requestId: "r1", decision: "allow" } },
+      }, idType);
+      assert.equal(mismatched.operatorId, "", `${idType}: must not read ${other.snake} as the approver`);
+    }
+  }
+});
+
+test("the client only accepts a decision from the approver under each id type", async () => {
+  for (const { idType, approverId, snake } of ID_TYPE_CASES) {
+    const client = new FeishuApprovalClient({
+      appId: "cli_1",
+      appSecret: "s",
+      approverId,
+      idType,
+      larkClient: { im: { v1: { message: {
+        create: async () => ({ data: { message_id: "om_1" } }),
+        patch: async () => ({ data: {} }),
+      } } } },
+    });
+    const decision = client.requestApproval({ title: "Run", detail: "Summary" });
+    await flush();
+    const requestId = [...client.pending.keys()][0];
+
+    // Somebody else pressing the button must be ignored.
+    assert.equal(client.handleCardAction({
+      operator: { [snake]: "someone_else" },
+      action: { value: { requestId, decision: "allow" } },
+    }), false, `${idType}: a non-approver must not resolve the request`);
+
+    assert.equal(client.handleCardAction({
+      operator: { [snake]: approverId },
+      action: { value: { requestId, decision: "allow" } },
+    }), true, `${idType}: the approver must resolve the request`);
+    assert.equal(await decision, "allow", `${idType}: decision`);
+  }
+});
+
+test("elicitation callbacks match the approver under each id type", () => {
+  const questions = [{ question: "Which?", options: [{ label: "A" }, { label: "B" }], multiSelect: false }];
+  for (const { idType, approverId, snake, camel } of ID_TYPE_CASES) {
+    for (const key of [snake, camel]) {
+      const step = normalizeElicitationActionEvent({
+        operator: { [key]: approverId },
+        action: {
+          value: { requestId: "r1", kind: "elicitation-step", questionIndex: 0, final: true },
+          form_value: { q_0: "0" },
+        },
+      }, questions, idType);
+      assert.equal(step.operatorId, approverId, `${idType}: elicitation operator.${key}`);
+      assert.equal(step.decision.type, "elicitation-step");
+      assert.deepEqual(step.decision.answers, { "Which?": "A" });
+
+      const terminal = normalizeElicitationActionEvent({
+        operator: { [key]: approverId },
+        action: { value: { requestId: "r1", decision: "terminal" } },
+      }, questions, idType);
+      assert.equal(terminal.operatorId, approverId, `${idType}: elicitation terminal operator.${key}`);
+      assert.equal(terminal.decision, "terminal");
+    }
+
+    for (const other of ID_TYPE_CASES.filter((c) => c.idType !== idType)) {
+      const mismatched = normalizeElicitationActionEvent({
+        operator: { [other.snake]: other.approverId },
+        action: { value: { requestId: "r1", decision: "terminal" } },
+      }, questions, idType);
+      assert.equal(mismatched.operatorId, "", `${idType}: must not read ${other.snake} in elicitation`);
+    }
+  }
+});
+
+// ── Card localization + brand ──
+
+test("card keys exist in every supported language", () => {
+  const cardKeys = Object.keys(i18n.en).filter((key) => key.startsWith("feishuCard"));
+  assert.ok(cardKeys.length >= 40, `expected the full card key set, got ${cardKeys.length}`);
+  for (const lang of SUPPORTED_LANGS) {
+    for (const key of cardKeys) {
+      assert.equal(typeof i18n[lang][key], "string", `${lang}.${key} must be a string`);
+      assert.ok(i18n[lang][key].length, `${lang}.${key} must not be empty`);
+    }
+  }
+});
+
+test("approval cards render in the caller's language, not a hardcoded one", () => {
+  const payload = { title: "t", agentId: "claude-code", toolName: "Bash", folder: "proj", summary: "Run tests" };
+  const expectations = {
+    en: { header: "Permission request: claude-code", allow: "Approve once" },
+    zh: { header: "权限确认：claude-code", allow: "批准一次" },
+    ko: { header: "권한 확인: claude-code", allow: "한 번 승인" },
+    ja: { header: "権限確認：claude-code", allow: "1回だけ許可" },
+    "zh-TW": { header: "權限確認：claude-code", allow: "批准一次" },
+  };
+  for (const [lang, expected] of Object.entries(expectations)) {
+    const t = createTranslator(() => lang);
+    const card = buildApprovalCard(payload, { requestId: "r" }, { t, platform: "feishu" });
+    assert.equal(card.header.title.content, expected.header, `${lang} header`);
+    const actions = card.elements.find((el) => el.tag === "action");
+    assert.equal(actions.actions[0].text.content, expected.allow, `${lang} allow button`);
+    assert.match(card.elements[0].text.content, new RegExp(i18n[lang].feishuCardFieldAgent), `${lang} agent label`);
+  }
+});
+
+// The v0.12.0 defect: cards were Simplified Chinese no matter the language, so
+// a Lark user on English got Chinese buttons.
+test("a non-Chinese card leaks no Simplified-Chinese and no wrong brand", () => {
+  const CJK = /[一-鿿]/;
+  for (const lang of ["en", "ko", "ja"]) {
+    const t = createTranslator(() => lang);
+    const ctx = { t, platform: "lark" };
+    const approval = JSON.stringify(buildApprovalCard(
+      { title: "t", agentId: "claude-code", summary: "Run tests" }, { requestId: "r" }, ctx
+    ));
+    const status = JSON.stringify(buildStatusCard(
+      { title: "t", agentId: "claude-code" }, { decision: "allow", source: "feishu" }, ctx
+    ));
+    const elicitation = JSON.stringify(buildElicitationCard(
+      { title: "t", agentId: "claude-code", questions: [{ question: "Which?", options: [{ label: "A" }] }] },
+      { requestId: "r" },
+      ctx
+    ));
+    for (const [name, serialized] of [["approval", approval], ["status", status], ["elicitation", elicitation]]) {
+      if (lang === "ja") continue; // ja legitimately uses kanji
+      assert.doesNotMatch(serialized, CJK, `${lang} ${name} card must not contain Chinese characters`);
+    }
+    assert.doesNotMatch(status, /飞书|Feishu/, `${lang} Lark status card must not say Feishu`);
+  }
+});
+
+test("the status card source label follows the platform, not the internal routing value", () => {
+  const payload = { title: "t", agentId: "claude-code" };
+  // source stays "feishu" internally on BOTH platforms; only the label differs.
+  const outcome = { decision: "allow", source: "feishu" };
+
+  const larkEn = buildStatusCard(payload, outcome, { t: createTranslator(() => "en"), platform: "lark" });
+  assert.match(larkEn.elements[0].text.content, /Lark card/);
+  assert.doesNotMatch(larkEn.elements[0].text.content, /Feishu/);
+
+  const feishuEn = buildStatusCard(payload, outcome, { t: createTranslator(() => "en"), platform: "feishu" });
+  assert.match(feishuEn.elements[0].text.content, /Feishu card/);
+  assert.doesNotMatch(feishuEn.elements[0].text.content, /Lark/);
+
+  const larkZh = buildStatusCard(payload, outcome, { t: createTranslator(() => "zh"), platform: "lark" });
+  assert.match(larkZh.elements[0].text.content, /Lark 卡片/);
+  assert.doesNotMatch(larkZh.elements[0].text.content, /飞书卡片/);
+
+  const feishuZh = buildStatusCard(payload, outcome, { t: createTranslator(() => "zh"), platform: "feishu" });
+  assert.match(feishuZh.elements[0].text.content, /飞书卡片/);
+
+  // A desktop-side decision is platform-independent.
+  const desktop = buildStatusCard(payload, { decision: "deny", source: "desktop" }, {
+    t: createTranslator(() => "en"), platform: "lark",
+  });
+  assert.match(desktop.elements[0].text.content, /Desktop bubble/);
+});
+
+test("elicitation status cards localize and brand correctly", () => {
+  const payload = { title: "t", agentId: "a", questions: [{ question: "Which?", options: [] }] };
+  const larkEn = buildElicitationStatusCard(payload, { decision: "elicitation-submit", source: "feishu" }, {
+    t: createTranslator(() => "en"), platform: "lark",
+  });
+  assert.equal(larkEn.header.title.content, "Input submitted");
+  assert.match(larkEn.elements[0].text.content, /Lark card/);
+
+  const feishuJa = buildElicitationStatusCard(payload, { decision: "terminal", source: "feishu" }, {
+    t: createTranslator(() => "ja"), platform: "feishu",
+  });
+  assert.equal(feishuJa.header.title.content, i18n.ja.feishuCardStatusTerminalTitle);
+  assert.match(feishuJa.elements[0].text.content, /Feishu カード/);
+});
+
+test("the client renders cards in the language getLang reports at send time", async () => {
+  let lang = "en";
+  const sent = [];
+  const client = new FeishuApprovalClient({
+    appId: "cli_1",
+    appSecret: "s",
+    approverId: "ou_1",
+    platform: "lark",
+    getLang: () => lang,
+    larkClient: { im: { v1: { message: {
+      create: async (payload) => { sent.push(JSON.parse(payload.data.content)); return { data: { message_id: "om_1" } }; },
+      patch: async () => ({ data: {} }),
+    } } } },
+  });
+
+  client.requestApproval({ title: "Run", agentId: "claude-code" });
+  await flush();
+  assert.equal(sent[0].header.title.content, "Permission request: claude-code");
+
+  // A language switch must take effect without rebuilding the client (which
+  // would drop the long connection).
+  lang = "ko";
+  client.requestApproval({ title: "Run", agentId: "claude-code" });
+  await flush();
+  assert.equal(sent[1].header.title.content, "권한 확인: claude-code");
+});
+
+// ── Platform -> SDK domain ──
+// These drive the real exported factories with a fake SDK injected as
+// `config.lark`. Going through `larkClient` / `wsFactory` instead would bypass
+// the very code that picks the domain.
+
+test("createLarkClient sends the REST client to the Feishu domain, accepting the numeric 0", () => {
+  const { sdk, captured } = fakeSdk();
+  createLarkClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform: "feishu" });
+  assert.equal(captured.client.length, 1);
+  // Strict compare, never assert.ok: Domain.Feishu === 0 is falsy but valid.
+  assert.strictEqual(captured.client[0].domain, sdk.Domain.Feishu);
+  assert.strictEqual(captured.client[0].domain, 0);
+  assert.strictEqual(captured.client[0].appType, sdk.AppType.SelfBuild);
+});
+
+test("createLarkClient sends the REST client to the Lark domain", () => {
+  const { sdk, captured } = fakeSdk();
+  createLarkClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform: "lark" });
+  assert.strictEqual(captured.client[0].domain, sdk.Domain.Lark);
+  assert.strictEqual(captured.client[0].domain, 1);
+});
+
+test("createWsClient sends the long connection to the domain matching the platform", () => {
+  for (const [platform, expected] of [["feishu", 0], ["lark", 1]]) {
+    const { sdk, captured } = fakeSdk();
+    createWsClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform });
+    assert.equal(captured.ws.length, 1);
+    assert.strictEqual(captured.ws[0].domain, expected, `${platform} WS domain`);
+    assert.strictEqual(
+      captured.ws[0].domain,
+      platform === "lark" ? sdk.Domain.Lark : sdk.Domain.Feishu
+    );
+  }
+});
+
+// The #493 failure mode: cards send fine over REST while the callback long
+// connection sits on the other platform, so no button press ever arrives.
+test("REST and WS land on the same domain for a given platform", () => {
+  for (const platform of ["feishu", "lark"]) {
+    const { sdk, captured } = fakeSdk();
+    createLarkClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform });
+    createWsClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform });
+    assert.strictEqual(captured.client[0].domain, captured.ws[0].domain, `${platform} REST/WS domain mismatch`);
+  }
+});
+
+test("createLarkClient/createWsClient default an unknown or missing platform to Feishu", () => {
+  for (const platform of [undefined, "", "nope", "LARK", null]) {
+    const { sdk, captured } = fakeSdk();
+    createLarkClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform });
+    createWsClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform });
+    assert.strictEqual(captured.client[0].domain, sdk.Domain.Feishu, `REST for ${JSON.stringify(platform)}`);
+    assert.strictEqual(captured.ws[0].domain, sdk.Domain.Feishu, `WS for ${JSON.stringify(platform)}`);
+  }
+});
+
+test("a fake SDK without Domain still works for Feishu but fails loudly for Lark", () => {
+  // No Domain -> omit the field: the SDK's own default is Feishu, so Feishu
+  // still lands on the right host.
+  const { sdk, captured } = fakeSdk({ Domain: undefined });
+  createLarkClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform: "feishu" });
+  createWsClient({ appId: "cli_1", appSecret: "s", lark: sdk, platform: "feishu" });
+  assert.strictEqual(captured.client[0].domain, undefined);
+  assert.strictEqual(captured.ws[0].domain, undefined);
+
+  // Lark cannot be expressed without the enum. Silently falling back to Feishu
+  // would ship Lark credentials to the Feishu host, so it must throw.
+  const bare = fakeSdk({ Domain: undefined }).sdk;
+  assert.throws(
+    () => createLarkClient({ appId: "cli_1", appSecret: "s", lark: bare, platform: "lark" }),
+    /Domain\.Lark/
+  );
+  assert.throws(
+    () => createWsClient({ appId: "cli_1", appSecret: "s", lark: bare, platform: "lark" }),
+    /Domain\.Lark/
+  );
+
+  // Same for an SDK that has Domain but no Lark member.
+  const partial = fakeSdk({ Domain: { Feishu: 0 } }).sdk;
+  assert.throws(
+    () => createLarkClient({ appId: "cli_1", appSecret: "s", lark: partial, platform: "lark" }),
+    /Domain\.Lark/
+  );
+  assert.throws(
+    () => createWsClient({ appId: "cli_1", appSecret: "s", lark: partial, platform: "lark" }),
+    /Domain\.Lark/
+  );
+});
+
+// Assembly, not just the helper: the platform has to survive the trip from the
+// client's constructor into whatever the factories build.
+test("FeishuApprovalClient propagates its platform to the WS factory and the REST client", async () => {
+  for (const [platform, expected] of [["feishu", 0], ["lark", 1]]) {
+    const { sdk, captured } = fakeSdk();
+    const client = new FeishuApprovalClient({
+      appId: "cli_1",
+      appSecret: "s",
+      approverId: "ou_1",
+      idType: "open_id",
+      platform,
+      lark: sdk,
+    });
+    await client.start();
+    assert.strictEqual(captured.ws[0].domain, expected, `${platform}: WS domain`);
+
+    // messageApi() builds the REST client lazily through createLarkClient.
+    client.messageApi();
+    assert.strictEqual(captured.client[0].domain, expected, `${platform}: REST domain`);
+    client.close();
+  }
+});
+
+test("FeishuApprovalClient hands the platform to an injected wsFactory", async () => {
+  const seen = [];
+  for (const platform of ["feishu", "lark", undefined]) {
+    const client = new FeishuApprovalClient({
+      appId: "cli_1",
+      appSecret: "s",
+      approverId: "ou_1",
+      platform,
+      wsFactory: (params) => {
+        seen.push(params.platform);
+        return { wsClient: { start: async () => {}, close: () => {} }, dispatcher: {} };
+      },
+    });
+    await client.start();
+    client.close();
+  }
+  assert.deepEqual(seen, ["feishu", "lark", "feishu"]);
+});
+
+// Real-machine finding (2026-07-15): a live Lark stepper logged every step as
+// `decision=[object Object]`, because the logger stringifies whatever it gets
+// and elicitation decisions are objects. That is the only diagnostic this
+// channel has, so the shape has to survive — without dragging the answers in.
+test("elicitation steps log a readable decision shape, never [object Object]", async () => {
+  const logs = [];
+  const client = new FeishuApprovalClient({
+    appId: "cli_1",
+    appSecret: "s",
+    approverId: "ou_1",
+    idType: "open_id",
+    log: (level, message, meta) => logs.push({ level, message, meta }),
+    larkClient: { im: { v1: { message: {
+      create: async () => ({ data: { message_id: "om_1" } }),
+      patch: async () => ({ data: {} }),
+    } } } },
+  });
+  client.requestElicitation({
+    title: "Q",
+    questions: [
+      { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+      { question: "Second?", options: [{ label: "C" }] },
+    ],
+  });
+  await flush();
+  const requestId = [...client.pending.keys()][0];
+
+  client.handleCardAction({
+    operator: { open_id: "ou_1" },
+    action: { value: { requestId, kind: "elicitation-step", questionIndex: 0, final: false }, form_value: { q_0: "0" } },
+  });
+  client.handleCardAction({
+    operator: { open_id: "ou_1" },
+    action: { value: { requestId, kind: "elicitation-back", questionIndex: 1 } },
+  });
+
+  const decisions = logs.filter((l) => l.message === "card action received").map((l) => l.meta.decision);
+  assert.equal(decisions.length, 2);
+  for (const d of decisions) {
+    assert.ok(!String(d).includes("[object Object]"), `unreadable decision logged: ${d}`);
+  }
+  assert.equal(decisions[0], "elicitation-step:q0:answers=1");
+  assert.equal(decisions[1], "elicitation-back:q1");
+
+  // The answers themselves are user/agent content and must not ride the log.
+  assert.ok(!JSON.stringify(logs).includes("First?"), "question text must not be logged");
+  client.close();
+});
+
+test("approval decisions still log as plain strings", async () => {
+  const logs = [];
+  const client = new FeishuApprovalClient({
+    appId: "cli_1",
+    appSecret: "s",
+    approverId: "ou_1",
+    log: (level, message, meta) => logs.push({ level, message, meta }),
+    larkClient: { im: { v1: { message: {
+      create: async () => ({ data: { message_id: "om_1" } }),
+      patch: async () => ({ data: {} }),
+    } } } },
+  });
+  const p = client.requestApproval({ title: "Run", detail: "d" });
+  await flush();
+  const requestId = [...client.pending.keys()][0];
+  client.handleCardAction({ operator: { open_id: "ou_1" }, action: { value: { requestId, decision: "deny" } } });
+  assert.equal(await p, "deny");
+  assert.equal(logs.find((l) => l.message === "card action received").meta.decision, "deny");
+  client.close();
+});
+
+// Real-machine finding (2026-07-15): pointing a real Lark app at
+// open.feishu.cn does NOT fail at the token or bot-info endpoints — those
+// accept the app on either gateway. It fails at the WS endpoint, with
+// `code=1000040351, msg=Incorrect domain name`. That is the #493 shape exactly
+// (cards send, callbacks never arrive) and the most likely user mistake, so it
+// gets a stable code instead of leaking "pullConnectConfig failed: …".
+test("a wrong-platform gateway rejection is tagged so the UI can explain it", async () => {
+  const client = new FeishuApprovalClient({
+    appId: "cli_1",
+    appSecret: "s",
+    approverId: "ou_1",
+    platform: "feishu",
+    wsFactory: (params) => {
+      setImmediate(() => params.onError(new Error("pullConnectConfig failed: code=1000040351, msg=Incorrect domain name")));
+      return { wsClient: { start: async () => {}, close: () => {} }, dispatcher: {} };
+    },
+  });
+  await client.start();
+  await flush();
+  const status = client.getStatus();
+  assert.equal(status.status, "failed");
+  assert.equal(status.errorCode, "wrong-platform");
+  assert.match(status.message, /Incorrect domain name/, "the raw diagnostic is kept for logs");
+  client.close();
+});
+
+test("an unrelated SDK failure keeps an empty code so its raw text still shows", async () => {
+  const client = new FeishuApprovalClient({
+    appId: "cli_1",
+    appSecret: "s",
+    approverId: "ou_1",
+    platform: "lark",
+    wsFactory: (params) => {
+      setImmediate(() => params.onError(new Error("app ticket is invalid")));
+      return { wsClient: { start: async () => {}, close: () => {} }, dispatcher: {} };
+    },
+  });
+  await client.start();
+  await flush();
+  const status = client.getStatus();
+  assert.equal(status.status, "failed");
+  assert.equal(status.errorCode, "", "no code -> the renderer shows the upstream string");
+  assert.equal(status.message, "app ticket is invalid");
+  client.close();
 });
 
 test("FeishuApprovalClient resolves null on send failure by default but rejects with rejectOnSendError", async () => {

@@ -44,6 +44,7 @@ function makeRuntime(overrides = {}) {
       return { status: "ok", message: "done" };
     },
     syncOpencodePluginImpl: () => calls.push({ name: "opencode" }),
+    syncMimocodePluginImpl: () => calls.push({ name: "mimocode" }),
     syncPiExtensionImpl: () => calls.push({ name: "pi" }),
     syncOpenClawPluginImpl: () => calls.push({ name: "openclaw" }),
     repairOpenClawPluginImpl: () => {
@@ -187,6 +188,7 @@ describe("integration sync runtime", () => {
       "qwen",
       "codewhale",
       "codex",
+      "mimocode",
       "pi",
       "openclaw",
       "hermes",
@@ -214,6 +216,7 @@ describe("integration sync runtime", () => {
       "codewhale",
       "codex",
       "opencode",
+      "mimocode",
       "openclaw",
       "hermes",
       "qoder",
@@ -454,6 +457,37 @@ describe("integration sync runtime", () => {
       () => {
         const { runtime } = makeRuntime({ ctx: { syncOpencodePluginImpl: undefined } });
         return runtime.syncIntegrationForAgent("opencode");
+      }
+    );
+
+    assert.strictEqual(alreadyCurrent.status, "ok");
+    assert.strictEqual(alreadyCurrent.skipped, true);
+  });
+
+  it("syncIntegrationForAgent distinguishes mimocode missing from already registered (R8 P1)", () => {
+    // Without these, the production mimocode mapping could be swapped for a
+    // no-op and the whole Settings-Install / startup / Doctor-Repair sync
+    // chain would fail green.
+    const missing = withPatchedExport(
+      "../hooks/mimocode-install.js",
+      "registerMimocodePlugin",
+      () => ({ added: false, skipped: true, created: false, reason: "mimocode-not-found" }),
+      () => {
+        const { runtime } = makeRuntime({ ctx: { syncMimocodePluginImpl: undefined } });
+        return runtime.syncIntegrationForAgent("mimocode");
+      }
+    );
+
+    assert.strictEqual(missing.status, "skipped");
+    assert.strictEqual(missing.reason, "mimocode-not-found");
+
+    const alreadyCurrent = withPatchedExport(
+      "../hooks/mimocode-install.js",
+      "registerMimocodePlugin",
+      () => ({ added: false, skipped: true, created: false }),
+      () => {
+        const { runtime } = makeRuntime({ ctx: { syncMimocodePluginImpl: undefined } });
+        return runtime.syncIntegrationForAgent("mimocode");
       }
     );
 

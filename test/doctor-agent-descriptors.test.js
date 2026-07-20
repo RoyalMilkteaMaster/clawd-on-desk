@@ -25,6 +25,7 @@ describe("doctor agent descriptors", () => {
         "qwen-code",
         "codewhale",
         "opencode",
+        "mimocode",
         "pi",
         "openclaw",
         "hermes",

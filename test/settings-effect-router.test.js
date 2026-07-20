@@ -53,6 +53,7 @@ function createHarness(options = {}) {
     syncPermissionShortcuts: () => calls.push(["syncPermissionShortcuts"]),
     dismissInteractivePermissionBubbles: () => calls.push(["dismissInteractivePermissionBubbles"]),
     clearCodexNotifyBubbles: (...args) => calls.push(["clearCodexNotifyBubbles", ...args]),
+    clearCodexUserInputBubbles: (...args) => calls.push(["clearCodexUserInputBubbles", ...args]),
     clearKimiNotifyBubbles: (...args) => calls.push(["clearKimiNotifyBubbles", ...args]),
     refreshPassiveNotifyAutoClose: () => calls.push(["refreshPassiveNotifyAutoClose"]),
     hideUpdateBubbleForPolicy: () => calls.push(["hideUpdateBubbleForPolicy"]),
@@ -120,6 +121,7 @@ describe("settings-effect-router", () => {
       ["syncPermissionShortcuts"],
       ["dismissInteractivePermissionBubbles"],
       ["clearCodexNotifyBubbles", undefined, "settings-policy-disabled"],
+      ["clearCodexUserInputBubbles", undefined, undefined, "settings-policy-disabled"],
       ["clearKimiNotifyBubbles", undefined, "settings-policy-disabled"],
       ["hideUpdateBubbleForPolicy"],
       ["rebuildAllMenus"],
@@ -138,6 +140,32 @@ describe("settings-effect-router", () => {
     assert.deepStrictEqual(calls, [
       ["updateMirrors", { updateBubbleAutoCloseSeconds: 8 }],
       ["refreshUpdateBubbleAutoClose"],
+      ["rebuildAllMenus"],
+    ]);
+  });
+
+  it("clears the Codex user-input card on the notification-policy axis, not the permission-policy axis", () => {
+    const { calls, emit } = createHarness();
+
+    // A Codex request_user_input card is a passive notification, not a
+    // permission request — disabling permission bubbles alone must not
+    // touch it (it has no Allow/Deny decision to withhold).
+    emit({ permissionBubblesEnabled: false });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { permissionBubblesEnabled: false }],
+      ["syncPermissionShortcuts"],
+      ["dismissInteractivePermissionBubbles"],
+      ["rebuildAllMenus"],
+    ]);
+    assert.ok(!calls.some((c) => c[0] === "clearCodexUserInputBubbles"));
+
+    calls.length = 0;
+    emit({ notificationBubbleAutoCloseSeconds: 0 });
+    assert.deepStrictEqual(calls, [
+      ["updateMirrors", { notificationBubbleAutoCloseSeconds: 0 }],
+      ["clearCodexNotifyBubbles", undefined, "settings-policy-disabled"],
+      ["clearCodexUserInputBubbles", undefined, undefined, "settings-policy-disabled"],
+      ["clearKimiNotifyBubbles", undefined, "settings-policy-disabled"],
       ["rebuildAllMenus"],
     ]);
   });

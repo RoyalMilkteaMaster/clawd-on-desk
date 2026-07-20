@@ -128,7 +128,7 @@ describe("Codex official hook", () => {
         type: "session_meta",
         payload: {
           cwd: "/repo",
-          originator: "Codex Desktop",
+          originator: "codex_work_desktop",
           source: "vscode",
         },
       }),
@@ -140,7 +140,7 @@ describe("Codex official hook", () => {
       }, mockResolve);
 
       assert.strictEqual(body.session_id, "codex:019d23d4-f1a9-7633-b9c7-758327137228");
-      assert.strictEqual(body.codex_originator, "Codex Desktop");
+      assert.strictEqual(body.codex_originator, "codex_work_desktop");
       assert.strictEqual(body.codex_source, "vscode");
       assert.strictEqual(body.source_pid, 456);
       assert.strictEqual(body.agent_pid, 456);
@@ -406,7 +406,7 @@ describe("Codex official hook", () => {
       JSON.stringify({
         type: "session_meta",
         payload: {
-          originator: "Codex Desktop",
+          originator: "codex_work_desktop",
           source: "vscode",
         },
       }),
@@ -420,7 +420,7 @@ describe("Codex official hook", () => {
       }, mockResolve);
 
       assert.strictEqual(body.session_id, "codex:019d23d4-f1a9-7633-b9c7-758327137228");
-      assert.strictEqual(body.codex_originator, "Codex Desktop");
+      assert.strictEqual(body.codex_originator, "codex_work_desktop");
       assert.strictEqual(body.codex_source, "vscode");
       assert.strictEqual(body.source_pid, 456);
       assert.strictEqual(body.agent_pid, 456);

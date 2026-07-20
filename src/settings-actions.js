@@ -164,6 +164,7 @@ const MANAGED_CLEANUP_AGENT_IDS = Object.freeze([
   "qwen-code",
   "codewhale",
   "opencode",
+  "mimocode",
   "pi",
   "openclaw",
   "hermes",
@@ -1256,9 +1257,11 @@ async function feishuApprovalSetSecrets(payload, deps = {}) {
   if (!deps || typeof deps.writeFeishuApprovalSecrets !== "function") {
     return { status: "error", message: "feishuApproval.setSecrets requires writeFeishuApprovalSecrets dep" };
   }
+  // Pass the writer's result through untouched: it carries the `code` the
+  // settings page localizes and the English detail naming the real cause.
   const result = await deps.writeFeishuApprovalSecrets(secrets);
   if (!result || result.status !== "ok") {
-    return result || { status: "error", message: "Feishu approval secrets write failed" };
+    return result || { status: "error", code: "write-failed", message: "Secrets write returned no result" };
   }
   return { status: "ok", secretsStored: true };
 }
@@ -1284,7 +1287,9 @@ async function feishuApprovalSendTest(_payload, deps = {}) {
     return { status: "error", message: "feishuApproval.test requires sendFeishuApprovalTest dep" };
   }
   const result = await deps.sendFeishuApprovalTest();
-  return result || { status: "error", message: "Feishu approval test returned no result" };
+  // Defensive only, but the renderer shows a code-less `message` verbatim — so
+  // it stays brand-neutral like every other user-visible string on this path.
+  return result || { status: "error", message: "Remote approval test returned no result" };
 }
 
 function cleanupMessage(result) {

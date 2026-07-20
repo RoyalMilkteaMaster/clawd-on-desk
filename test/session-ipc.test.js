@@ -73,6 +73,10 @@ function createHarness(overrides = {}) {
       calls.push(["ackSessionCompletion", sessionId]);
       return true;
     }),
+    openSessionFolder: overrides.openSessionFolder || (async (sessionId) => {
+      calls.push(["openSessionFolder", sessionId]);
+      return { status: "ok" };
+    }),
   });
   return { ipcMain, runtime, calls };
 }
@@ -84,8 +88,10 @@ test("session IPC registers owned channels and disposes them", () => {
     "dashboard:get-i18n",
     "dashboard:get-snapshot",
     "dashboard:hide-session",
+    "dashboard:open-session-folder",
     "dashboard:set-session-alias",
     "session-hud:get-i18n",
+    "session-hud:open-session-folder",
     "session:ack-completion",
   ]);
   assert.deepStrictEqual([...ipcMain.listeners.keys()].sort(), [
@@ -132,6 +138,14 @@ test("session IPC delegates dashboard and HUD behavior", async () => {
     await ipcMain.invoke("dashboard:set-session-alias", { sessionId: "s1", alias: "Frontend" }),
     { status: "ok", alias: "Frontend" }
   );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("dashboard:open-session-folder", "folder-session"),
+    { status: "ok" }
+  );
+  assert.deepStrictEqual(
+    await ipcMain.invoke("session-hud:open-session-folder", "hud-folder-session"),
+    { status: "ok" }
+  );
 
   assert.deepStrictEqual(calls, [
     ["focusSession", "dash-session", { requestSource: "dashboard" }],
@@ -142,7 +156,20 @@ test("session IPC delegates dashboard and HUD behavior", async () => {
     ["setSessionHudTooltipVisible", false],
     ["hideSession", "hidden-session"],
     ["setSessionAlias", { sessionId: "s1", alias: "Frontend" }],
+    ["openSessionFolder", "folder-session"],
+    ["openSessionFolder", "hud-folder-session"],
   ]);
+});
+
+test("dashboard and HUD open-folder IPC accept only a sessionId string", async () => {
+  const { ipcMain, calls } = createHarness();
+  for (const channel of ["dashboard:open-session-folder", "session-hud:open-session-folder"]) {
+    for (const bad of [null, undefined, "", 42, { sessionId: "s1", cwd: "/tmp" }]) {
+      const result = await ipcMain.invoke(channel, bad);
+      assert.strictEqual(result.status, "error");
+    }
+  }
+  assert.deepStrictEqual(calls, []);
 });
 
 test("session IPC owns dashboard open bridges", () => {
@@ -208,6 +235,7 @@ test("registerSessionIpc requires ackSessionCompletion dep", () => {
       showDashboard: () => {},
       setSessionHudPinned: () => {},
       setSessionHudTooltipVisible: () => {},
+      openSessionFolder: () => {},
       // ackSessionCompletion intentionally absent
     }),
     /ackSessionCompletion/

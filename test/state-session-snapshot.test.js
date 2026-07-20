@@ -262,7 +262,7 @@ describe("state-session-snapshot builder", () => {
       ["webui", session("working", { sourcePid: 456, platform: "webui" })],
       ["codex:019e115a-4df2-7ed0-b90e-8e6345aca777", session("working", {
         agentId: "codex",
-        codexOriginator: "Codex Desktop",
+        codexOriginator: "codex_work_desktop",
         codexSource: "vscode",
       })],
     ]));
@@ -284,7 +284,7 @@ describe("state-session-snapshot builder", () => {
     const snapshot = buildSessionSnapshot(new Map([
       ["codex:019e115a-4df2-7ed0-b90e-8e6345aca777", session("working", {
         agentId: "codex",
-        codexOriginator: "Codex Desktop",
+        codexOriginator: "codex_work_desktop",
         sourcePid: 123,
       })],
       ["codex:019e115b-4df2-7ed0-b90e-8e6345aca777", session("working", {
@@ -535,6 +535,43 @@ describe("state-session-snapshot builder", () => {
     assert.strictEqual(snapshot.hudLastSessionId, "codex:new");
     assert.deepStrictEqual(snapshot.orderedIds, ["codex:new", "codex:old"]);
     assert.deepStrictEqual(snapshot.groups, [{ host: "", ids: ["codex:new", "codex:old"], displayHost: "" }]);
+  });
+
+  it("keeps Codex Desktop sessions that share one agent process visible in HUD", () => {
+    const snapshot = buildSessionSnapshot(new Map([
+      ["codex:desktop-a", session("working", {
+        agentId: "codex",
+        agentPid: 4242,
+        codexOriginator: "codex_work_desktop",
+        updatedAt: 1000,
+        cwd: "/repo/a",
+      })],
+      ["codex:desktop-b", session("thinking", {
+        agentId: "codex",
+        agentPid: 4242,
+        codexOriginator: "codex_work_desktop",
+        updatedAt: 2000,
+        cwd: "/repo/b",
+      })],
+      ["codex:guardian", session("working", {
+        agentId: "codex",
+        agentPid: 4242,
+        codexOriginator: "codex_work_desktop",
+        headless: true,
+        updatedAt: 3000,
+        cwd: "/repo/b",
+      })],
+    ]), {
+      statePriority: STATE_PRIORITY,
+      getAgentIconUrl: () => null,
+    });
+
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "codex:desktop-a").hiddenFromHud, false);
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "codex:desktop-b").hiddenFromHud, false);
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "codex:guardian").headless, true);
+    assert.strictEqual(snapshot.sessions.find((entry) => entry.id === "codex:guardian").hiddenFromHud, false);
+    assert.strictEqual(snapshot.hudTotalNonIdle, 2);
+    assert.strictEqual(snapshot.hudLastSessionId, "codex:desktop-b");
   });
 
   it("snapshot signatures include visible fields but ignore icon URL churn", () => {

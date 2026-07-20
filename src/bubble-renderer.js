@@ -28,6 +28,7 @@ const suggestionsContainer = document.getElementById("suggestions");
 const headerTitle = document.querySelector(".header-title");
 const sessionTag = document.getElementById("sessionTag");
 let elicitationMode = false;
+let codexUserInputMode = false;
 let elicitationQuestions = [];
 let elicitationAnswers = {};
 let activeQuestionIndex = 0;
@@ -82,6 +83,11 @@ const BUBBLE_STRINGS = {
     kimiPermission: "Kimi Permission",
     checkKimiTerminal: "Approve or reject this request in the Kimi terminal.",
     gotIt: "Got it",
+    codexNeedsInput: "Codex Needs Input",
+    goToCodex: "Go to Codex",
+    answerInCodex: "Choose or type your answer in Codex.",
+    returnToRemoteCodex: "Return to the remote Codex terminal to answer.",
+    otherInCodex: "Other (type in Codex)",
     planReview: "Plan Review",
     approve: "Approve",
     reject: "Reject",
@@ -118,6 +124,11 @@ const BUBBLE_STRINGS = {
     kimiPermission: "Kimi \u6743\u9650\u8BF7\u6C42",
     checkKimiTerminal: "\u8BF7\u5728 Kimi \u7EC8\u7AEF\u4E2D\u6279\u51C6\u6216\u62D2\u7EDD\u8BE5\u8BF7\u6C42\u3002",
     gotIt: "\u77E5\u9053\u4E86",
+    codexNeedsInput: "Codex \u9700\u8981\u4F60\u7684\u56DE\u7B54",
+    goToCodex: "\u524D\u5F80 Codex",
+    answerInCodex: "\u8BF7\u5728 Codex \u4E2D\u9009\u62E9\u6216\u8F93\u5165\u56DE\u7B54\u3002",
+    returnToRemoteCodex: "\u8BF7\u8FD4\u56DE\u8FDC\u7AEF Codex \u7EC8\u7AEF\u56DE\u7B54\u3002",
+    otherInCodex: "\u5176\u4ED6\uFF08\u5728 Codex \u4E2D\u8F93\u5165\uFF09",
     planReview: "\u8BA1\u5212\u5BA1\u6279",
     approve: "\u6279\u51C6",
     reject: "\u62D2\u7EDD",
@@ -154,6 +165,11 @@ const BUBBLE_STRINGS = {
     kimiPermission: "Kimi 權限請求",
     checkKimiTerminal: "請在 Kimi 終端機中允許或拒絕此請求。",
     gotIt: "了解",
+    codexNeedsInput: "Codex 需要你的回答",
+    goToCodex: "前往 Codex",
+    answerInCodex: "請在 Codex 中選擇或輸入回答。",
+    returnToRemoteCodex: "請返回遠端 Codex 終端機回答。",
+    otherInCodex: "其他（在 Codex 中輸入）",
     planReview: "計畫審查",
     approve: "允許",
     reject: "拒絕",
@@ -190,6 +206,11 @@ const BUBBLE_STRINGS = {
     kimiPermission: "Kimi \uAD8C\uD55C \uC694\uCCAD",
     checkKimiTerminal: "Kimi \uD130\uBBF8\uB110\uC5D0\uC11C \uC774 \uC694\uCCAD\uC744 \uD5C8\uC6A9\uD558\uAC70\uB098 \uAC70\uBD80\uD558\uC138\uC694.",
     gotIt: "\uD655\uC778",
+    codexNeedsInput: "Codex\uC5D0 \uC785\uB825\uC774 \uD544\uC694\uD569\uB2C8\uB2E4",
+    goToCodex: "Codex\uB85C \uC774\uB3D9",
+    answerInCodex: "Codex\uC5D0\uC11C \uB2F5\uBCC0\uC744 \uC120\uD0DD\uD558\uAC70\uB098 \uC785\uB825\uD558\uC138\uC694.",
+    returnToRemoteCodex: "\uC6D0\uACA9 Codex \uD130\uBBF8\uB110\uB85C \uB3CC\uC544\uAC00 \uB2F5\uBCC0\uD558\uC138\uC694.",
+    otherInCodex: "\uAE30\uD0C0 (Codex\uC5D0\uC11C \uC785\uB825)",
     planReview: "\uACC4\uD68D \uAC80\uD1A0",
     approve: "\uC2B9\uC778",
     reject: "\uAC70\uBD80",
@@ -226,6 +247,11 @@ const BUBBLE_STRINGS = {
     kimiPermission: "Kimi 権限リクエスト",
     checkKimiTerminal: "Kimi ターミナルでこのリクエストを許可または拒否してください。",
     gotIt: "了解",
+    codexNeedsInput: "Codex に入力が必要",
+    goToCodex: "Codex へ移動",
+    answerInCodex: "Codex で回答を選択または入力してください。",
+    returnToRemoteCodex: "リモートの Codex ターミナルに戻って回答してください。",
+    otherInCodex: "その他（Codex で入力）",
     planReview: "計画レビュー",
     approve: "承認",
     reject: "却下",
@@ -280,7 +306,7 @@ function disableAll() {
 }
 
 function withUnconstrainedElicitationForm(fn) {
-  if (!elicitationMode) return fn();
+  if (!elicitationMode && !codexUserInputMode) return fn();
   const previousMaxHeight = elicitationForm.style.maxHeight;
   const wasScrollable = card.classList.contains("elicitation-scrollable");
 
@@ -343,6 +369,7 @@ function resetBubbleContent() {
     heightReportFrame = 0;
   }
   elicitationMode = false;
+  codexUserInputMode = false;
   elicitationQuestions = [];
   elicitationAnswers = {};
   activeQuestionIndex = 0;
@@ -728,6 +755,110 @@ function renderElicitationForm(data) {
   renderElicitationStep();
 }
 
+function createCodexUserInputQuestionCard(question, questionIndex) {
+  const questionCard = document.createElement("div");
+  questionCard.className = "question-card";
+  const header = document.createElement("div");
+  header.className = "question-header";
+  header.textContent = getQuestionLabel(question, questionIndex);
+  questionCard.appendChild(header);
+  const text = document.createElement("div");
+  text.className = "question-text";
+  text.textContent = question.question || "";
+  questionCard.appendChild(text);
+  const hint = document.createElement("div");
+  hint.className = "question-hint";
+  hint.textContent = bubbleText(currentLang, "answerInCodex");
+  questionCard.appendChild(hint);
+  const optionList = document.createElement("div");
+  optionList.className = "option-list";
+  const options = Array.isArray(question.options) ? question.options : [];
+  for (const option of options) {
+    const item = document.createElement("div");
+    item.className = "option-item option-item-readonly";
+    const copy = document.createElement("span");
+    copy.className = "option-item-copy";
+    const label = document.createElement("span");
+    label.className = "option-item-label";
+    label.textContent = option.label || "";
+    copy.appendChild(label);
+    if (option.description) {
+      const description = document.createElement("span");
+      description.className = "option-item-description";
+      description.textContent = option.description;
+      copy.appendChild(description);
+    }
+    item.appendChild(copy);
+    optionList.appendChild(item);
+  }
+  if (question.isOther) {
+    const other = document.createElement("div");
+    other.className = "option-item option-item-other option-item-readonly";
+    const label = document.createElement("span");
+    label.className = "option-item-label";
+    label.textContent = bubbleText(currentLang, "otherInCodex");
+    other.appendChild(label);
+    optionList.appendChild(other);
+  }
+  questionCard.appendChild(optionList);
+  return questionCard;
+}
+
+function renderCodexUserInputStep(data) {
+  const total = elicitationQuestions.length;
+  activeQuestionIndex = Math.max(0, Math.min(activeQuestionIndex, Math.max(0, total - 1)));
+  elicitationForm.innerHTML = "";
+  if (total) {
+    elicitationForm.appendChild(createCodexUserInputQuestionCard(
+      elicitationQuestions[activeQuestionIndex],
+      activeQuestionIndex
+    ));
+  }
+  if (data.isRemote) {
+    const remoteHint = document.createElement("div");
+    remoteHint.className = "question-hint";
+    remoteHint.textContent = bubbleText(currentLang, "returnToRemoteCodex");
+    elicitationForm.appendChild(remoteHint);
+  }
+  elicitationProgress.textContent = total > 1
+    ? bubbleText(currentLang, "questionProgress", { current: activeQuestionIndex + 1, total })
+    : "";
+  elicitationProgress.classList.toggle("visible", total > 1);
+  suggestionsContainer.innerHTML = "";
+  if (activeQuestionIndex > 0) {
+    const previous = document.createElement("button");
+    previous.className = "btn-suggestion";
+    previous.textContent = bubbleText(currentLang, "previousQuestion");
+    previous.addEventListener("click", () => {
+      activeQuestionIndex -= 1;
+      renderCodexUserInputStep(data);
+    });
+    suggestionsContainer.appendChild(previous);
+  }
+  if (activeQuestionIndex < total - 1) {
+    const next = document.createElement("button");
+    next.className = "btn-suggestion";
+    next.textContent = bubbleText(currentLang, "nextQuestion");
+    next.addEventListener("click", () => {
+      activeQuestionIndex += 1;
+      renderCodexUserInputStep(data);
+    });
+    suggestionsContainer.appendChild(next);
+  }
+  scheduleBubbleHeightReport();
+}
+
+function renderCodexUserInputPreview(data) {
+  codexUserInputMode = true;
+  elicitationQuestions = data.toolInput && Array.isArray(data.toolInput.questions)
+    ? data.toolInput.questions
+    : [];
+  activeQuestionIndex = 0;
+  elicitationForm.classList.add("visible");
+  commandBlock.style.display = "none";
+  renderCodexUserInputStep(data);
+}
+
 function show(data) {
   resetBubbleContent();
   currentLang = data.lang || "en";
@@ -810,6 +941,21 @@ function show(data) {
     renderElicitationForm(data);
     btnAllow.style.display = "";
     btnDeny.style.display = "";
+    revealCard();
+    return;
+  }
+
+  if (data.isCodexUserInputNotify) {
+    headerTitle.textContent = bubbleText(data.lang, "codexNeedsInput");
+    toolPillText.textContent = "CODEX";
+    toolPill.setAttribute("data-tool", "CodexUserInput");
+    toolPill.style.display = "";
+    renderCodexUserInputPreview(data);
+    btnAllow.textContent = data.isRemote
+      ? bubbleText(data.lang, "gotIt")
+      : bubbleText(data.lang, "goToCodex");
+    btnAllow.disabled = false;
+    btnDeny.style.display = "none";
     revealCard();
     return;
   }
@@ -997,6 +1143,12 @@ function handleElicitationBackAction() {
 btnAllow.addEventListener("click", () => {
   if (elicitationMode) {
     handleElicitationPrimaryAction();
+    return;
+  }
+  if (codexUserInputMode) {
+    btnAllow.textContent = "...";
+    disableAll();
+    window.bubbleAPI.decide("codex-user-input-focus");
     return;
   }
   btnAllow.textContent = "...";

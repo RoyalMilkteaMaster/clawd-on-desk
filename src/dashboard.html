@@ -230,6 +230,17 @@ h1 {
   background: var(--surface);
 }
 
+.card-unfocusable {
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
+}
+
+.card-unfocusable .actions {
+  grid-column: 2;
+  min-width: 0;
+  justify-content: flex-start;
+}
+
 .session-id-badge {
   position: absolute;
   top: 8px;
@@ -359,8 +370,34 @@ h1 {
 
 .actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
+}
+
+.focus-unavailable-reason,
+.session-action-feedback {
+  flex-basis: 100%;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.card-unfocusable .focus-unavailable-reason,
+.card-unfocusable .session-action-feedback {
+  text-align: left;
+}
+
+.session-action-feedback:empty { display: none; }
+
+.open-folder-button {
+  background: var(--surface-alt);
+  color: var(--text);
+  border-color: var(--border);
 }
 
 .mark-read-button {
@@ -476,6 +513,7 @@ button:disabled {
     </header>
     <main id="content" class="content" aria-live="polite"></main>
   </div>
+  <script src="./session-focus-unavailable.js"></script>
   <script src="./dashboard-renderer.js"></script>
 </body>
 </html>

@@ -48,12 +48,15 @@ function callStatePost(body, overrides = {}) {
       setState: [],
       recorder: [],
       resolved: [],
+      userInputShown: [],
+      userInputCleared: [],
     };
     const ctx = {
       STATE_SVGS: {
         idle: "x.svg",
         working: "x.svg",
         attention: "x.svg",
+        notification: "x.svg",
         "mini-idle": "x.svg",
       },
       pendingPermissions: [],
@@ -62,6 +65,8 @@ function callStatePost(body, overrides = {}) {
       setState: (...args) => calls.setState.push(args),
       updateSession: (...args) => calls.updateSession.push(args),
       resolvePermissionEntry: (perm, behavior, message) => calls.resolved.push({ perm, behavior, message }),
+      showCodexUserInputBubble: (input) => { calls.userInputShown.push(input); return true; },
+      clearCodexUserInputBubbles: (...args) => calls.userInputCleared.push(args),
       ...overrides.ctx,
     };
     handleStatePost(makeReq(body), res, {
@@ -71,6 +76,7 @@ function callStatePost(body, overrides = {}) {
         return {
           acceptedUnlessDnd: (dropForDnd) => calls.recorder.push({ outcome: dropForDnd ? "dnd" : "accepted" }),
           droppedByDisabled: () => calls.recorder.push({ outcome: "disabled" }),
+          droppedByDnd: () => calls.recorder.push({ outcome: "dnd" }),
         };
       },
       shouldDropForDnd: () => false,
@@ -119,7 +125,7 @@ describe("server-route-state POST", () => {
       platform: "webui",
       model: "gpt-5.4",
       provider: "openai",
-      codex_originator: "Codex Desktop",
+      codex_originator: "codex_work_desktop",
       codex_source: "vscode",
       ghostty_terminal_id: "ghostty-term-7",
       session_title: "  Work title  ",
@@ -151,7 +157,7 @@ describe("server-route-state POST", () => {
         platform: "webui",
         model: "gpt-5.4",
         provider: "openai",
-        codexOriginator: "Codex Desktop",
+        codexOriginator: "codex_work_desktop",
         codexSource: "vscode",
         ghosttyTerminalId: "ghostty-term-7",
         displayHint: "display.svg",
@@ -178,6 +184,65 @@ describe("server-route-state POST", () => {
         stdinDiag: null,
       },
     ]]);
+  });
+
+  it("shows and resolves a normalized remote Codex user-input request", async () => {
+    const request = await callStatePost(JSON.stringify({
+      state: "notification",
+      session_id: "codex:remote",
+      event: "CodexUserInputRequest",
+      agent_id: "codex",
+      cwd: "/repo",
+      host: "remote-box",
+      codex_user_input: {
+        phase: "request",
+        call_id: "call_remote",
+        questions: [{
+          id: "scope",
+          header: "Scope",
+          question: "Which scope?",
+          options: [{ label: "Focused", description: "One module" }],
+        }],
+      },
+    }));
+
+    assert.strictEqual(request.statusCode, 200);
+    assert.strictEqual(request.calls.userInputShown.length, 1);
+    assert.deepStrictEqual(request.calls.userInputShown[0], {
+      sessionId: "codex:remote",
+      callId: "call_remote",
+      questions: [{
+        id: "scope",
+        header: "Scope",
+        question: "Which scope?",
+        options: [{ label: "Focused", description: "One module" }],
+        isOther: false,
+        isSecret: false,
+      }],
+      autoResolutionMs: null,
+      sourcePid: null,
+      agentPid: null,
+      cwd: "/repo",
+      host: "remote-box",
+      codexOriginator: null,
+      codexSource: null,
+    });
+    assert.strictEqual(request.calls.updateSession[0][1], "notification");
+    assert.strictEqual(request.calls.updateSession[0][2], "CodexUserInputRequest");
+    assert.strictEqual(request.calls.updateSession[0][3].transientPermissionEvent, true);
+
+    const resolved = await callStatePost(JSON.stringify({
+      state: "idle",
+      session_id: "codex:remote",
+      event: "CodexUserInputResolved",
+      agent_id: "codex",
+      codex_user_input: { phase: "resolved", call_id: "call_remote" },
+    }));
+    assert.strictEqual(resolved.statusCode, 200);
+    assert.deepStrictEqual(resolved.calls.userInputCleared, [[
+      "codex:remote", "call_remote", "codex-user-input-resolved",
+    ]]);
+    assert.deepStrictEqual(resolved.calls.updateSession, []);
   });
 
   it("forwards Kimi Code permission context to updateSession (#563)", async () => {

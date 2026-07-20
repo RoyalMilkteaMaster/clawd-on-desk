@@ -2,13 +2,46 @@
 
 [Back to README](../../README.md)
 
+## Source Development Prerequisites
+
+Use Node.js 24.18.0 (the repository `.nvmrc`) for installs, tests, and local
+launches. Electron's maintained installer requires Node.js 22.12.0 or newer.
+
+Node 24.16.x and 24.17.x have a known stream compatibility regression that can
+silently truncate ZIP extraction when an older `extract-zip` / `yauzl` chain is
+present ([nodejs/node#63487](https://github.com/nodejs/node/issues/63487)). The
+current Electron dependency no longer uses that chain, but 24.18.0 is the
+supported development baseline for the repository and for adjacent tooling.
+
+If Electron reports a missing Framework or the integrity check fails, remove
+the whole package and reinstall; do not create only `path.txt`:
+
+```bash
+rm -rf node_modules/electron
+npm install
+```
+
+PowerShell equivalent:
+
+```powershell
+Remove-Item -Recurse -Force node_modules/electron
+npm install
+```
+
+For custom development distributions, a Linux launch with
+`ELECTRON_OVERRIDE_DIST_PATH` mirrors Electron's resolver and falls back to the
+`electron` executable at the override root when `path.txt` is absent. macOS and
+Windows overrides must retain Electron's exact standard `path.txt` because
+their supported executable layouts use an app bundle and `electron.exe` rather
+than the Linux root executable.
+
 ## Agent Setup
 
 Fresh installs enable and install only Claude Code and Codex by default. For other local agents, open **Settings → Agents** and click **Install** for that agent first; after that, Clawd keeps the hook/plugin/extension synced on launch while the agent remains enabled. Turning an enabled agent off stops event intake but does not uninstall files. **Uninstall** removes only Clawd-managed hook/plugin/extension entries and also disables that agent.
 
 **Claude Code** — works out of the box. Hooks are auto-registered on launch. Versioned hooks (`PreCompact`, `PostCompact`, `StopFailure`) are registered only when Clawd can positively detect a compatible Claude Code version; if detection fails (common for packaged macOS launches), Clawd falls back to core hooks and removes stale incompatible versioned hooks automatically. Beyond watching the directory `~/.claude/settings.json` lives in, Clawd also runs a read-only health check every 5 minutes — this catches the hook script being deleted from somewhere like a system Temp folder even when `settings.json` itself never changes. If the same problem fails to auto-repair 3 times in a row, Clawd stops retrying automatically and Doctor will prompt for a manual Fix; if the currently-installed hook script itself is missing (a broken install), Clawd won't blindly rewrite the config — it'll prompt you to reinstall or re-extract instead.
 
-**Codex CLI** — works out of the box. Clawd auto-registers official Codex hooks in `~/.codex/hooks.json` when Codex is installed, and enables `[features].hooks = true` unless the user explicitly set hooks to `false`. The installer migrates the deprecated `[features].codex_hooks` key to `hooks` while preserving an explicit false value. The official hook path gives live state updates plus real Allow/Deny permission bubbles. JSONL polling of `~/.codex/sessions/` remains as a state/metadata fallback for hook-disabled sessions and events Codex hooks do not cover; approval prompts are no longer inferred from JSONL.
+**Codex CLI** — works out of the box. Clawd auto-registers official Codex hooks in `~/.codex/hooks.json` when Codex is installed, and enables `[features].hooks = true` unless the user explicitly set hooks to `false`. The installer migrates the deprecated `[features].codex_hooks` key to `hooks` while preserving an explicit false value. The official hook path gives live state updates plus real Allow/Deny permission bubbles. JSONL polling of `~/.codex/sessions/` remains as a state/metadata fallback for hook-disabled sessions and events Codex hooks do not cover; approval prompts are no longer inferred from JSONL. Codex `request_user_input` calls are detected from that transcript stream: Clawd plays the notification reaction and shows a read-only preview of the questions/options. Answer in Codex itself; the card never injects a choice and closes when the matching tool output is recorded.
 
 **Copilot CLI** — install it from **Settings → Agents** when you want local Copilot CLI tracking. Once installed and enabled, Clawd auto-registers hooks in `<COPILOT_HOME or ~/.copilot>/hooks/hooks.json` on launch (marker-based merge — your other hook entries and `hooks/*.json` files are preserved). Remote SSH installs are automatic via the in-app **Settings → Remote SSH → One-click deploy**. If `hooks.json` or `settings.json` has `disableAllHooks: true`, doctor reports a warning and skips the Fix button. See [copilot-setup.md](copilot-setup.md) for manual fallback and `COPILOT_HOME` notes.
 
@@ -32,6 +65,8 @@ Fresh installs enable and install only Claude Code and Codex by default. For oth
 
 **opencode** — uses a plugin entry in `~/.config/opencode/opencode.json`. Install it from **Settings → Agents** when you want local opencode tracking; after that Clawd keeps the plugin synced on launch while opencode remains enabled. You can also run `node hooks/opencode-install.js` manually.
 
+**MiMo Code** — uses a plugin entry in `~/.config/mimocode/mimocode.jsonc`. Install it from **Settings → Agents** when you want local MiMo Code tracking; after that Clawd keeps the plugin synced on launch while MiMo Code remains enabled. You can also run `node hooks/mimocode-install.js` manually. MiMo Code shares the same `@mimo-ai/plugin` SDK as opencode, so it has the same zero-latency event streaming, Allow/Always/Deny permission bubbles, and building animations when parallel subagents are spawned via the `task` tool.
+
 **Pi** — uses a global extension directory at `~/.pi/agent/extensions/clawd-on-desk`. Install it from **Settings → Agents** when you want local Pi tracking; after that Clawd keeps the extension synced on launch while Pi remains enabled. You can also run `npm run install:pi-extension` manually. Interactive Pi sessions report lifecycle and tool activity to Clawd, but Pi is state-only: Clawd does not show permission bubbles, does not call Pi terminal confirmation, and preserves Pi's default YOLO execution behavior.
 
 **OpenClaw** — uses a plugin path under `~/.openclaw/openclaw.json`. Install it from **Settings → Agents** when you want local OpenClaw tracking; after that Clawd keeps the plugin synced on launch while OpenClaw remains enabled. You can also run `npm run install:openclaw-plugin` manually to let OpenClaw's CLI handle first-time setup. Phase 1 is state-only and targets local `openclaw tui --local` sessions.
@@ -45,6 +80,16 @@ Clawd can optionally mirror supported permission bubbles to a dedicated Telegram
 bot, so you can Allow or Deny from Telegram while the local desktop bubble
 remains available. See [telegram-approval.md](telegram-approval.md) for setup,
 token ownership, supported agents, and fallback behavior.
+
+## Feishu / Lark Approval
+
+Clawd can also mirror permission bubbles to a Feishu (China) or Lark
+(International) self-built app as an interactive card. Pick the platform in
+**Settings → Remote Approval → Feishu / Lark**; both are the same channel, so
+existing Feishu users keep their credentials and stay on Feishu by default. See
+[feishu-lark-remote-approval.md](feishu-lark-remote-approval.md) for the
+platform choice, permission scope, `open_id` / `union_id` / `user_id`
+differences, and card language.
 
 ## Remote SSH (Claude Code, Codex CLI & Copilot CLI)
 
@@ -65,7 +110,7 @@ in the dedicated guide:
 
 **How it works:**
 - **Claude Code** — command hooks on the remote server POST state changes to `localhost:23333`, which the SSH tunnel forwards back to your local Clawd. Permission bubbles work too — the HTTP round-trip goes through the tunnel.
-- **Codex CLI** — official hooks on the remote server POST state changes and permission requests through the same tunnel. If Codex hooks are unavailable or disabled on the remote install, use the fallback log monitor: `node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
+- **Codex CLI** — official hooks on the remote server POST state changes and permission requests through the same tunnel. The fallback log monitor also forwards `request_user_input` reminders; because Clawd cannot focus a window on the remote host, the card tells you to return to the remote Codex terminal. If Codex hooks are unavailable or disabled on the remote install, run: `node ~/.claude/hooks/codex-remote-monitor.js --port 23333`
 - **Copilot CLI** — one-click deploy writes `~/.copilot/hooks/hooks.json` on the remote (when Copilot CLI is installed, i.e. `~/.copilot/` exists). Hooks POST state and session titles through the same tunnel.
 
 For remote-only Copilot CLI tracking on a fresh local install, turn on **Copilot CLI** in **Settings → Agents** so Clawd accepts those remote hook events. You do not need to click **Install** unless you also want local Copilot hooks on this machine.
@@ -174,6 +219,9 @@ node hooks/codebuddy-install.js
 
 # opencode
 node hooks/opencode-install.js
+
+# MiMo Code
+node hooks/mimocode-install.js
 
 # Pi
 node hooks/pi-install.js

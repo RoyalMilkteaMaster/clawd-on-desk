@@ -30,7 +30,14 @@ describe("session HUD visual shell", () => {
     assert.match(sessionHudHtml, /\.focus-unavailable\s*\{[\s\S]*width:\s*13px;[\s\S]*\}/);
     assert.match(sessionHudRenderer, /session\.canFocus\s*===\s*true/);
     assert.match(sessionHudRenderer, /row\.classList\.add\("row-unfocusable"\)/);
-    assert.match(sessionHudRenderer, /if \(canFocus\) window\.sessionHudAPI\.focusSession\(session\.id\);/);
+    assert.match(sessionHudRenderer, /window\.sessionHudAPI\.focusSession\(session\.id\);/);
+  });
+
+  it("renders transient feedback inline instead of covering fixed-height rows", () => {
+    assert.match(sessionHudHtml, /\.session-inline-feedback\s*\{/);
+    assert.doesNotMatch(sessionHudHtml, /\.session-action-feedback\s*\{/);
+    assert.match(sessionHudRenderer, /SESSION_ACTION_FEEDBACK_MS\s*=\s*4000/);
+    assert.match(sessionHudRenderer, /title\.className = feedbackText \? "title session-inline-feedback"/);
   });
 
   it("renders state labels without replacing unread completed-session bells", () => {
@@ -54,7 +61,7 @@ describe("session HUD visual shell", () => {
   it("uses a compact HUD-only title without mutating the full session title", () => {
     assert.match(sessionHudRenderer, /HUD_TITLE_MAX_UNITS\s*=\s*15/);
     assert.match(sessionHudRenderer, /function shortenHudTitle\(value\)/);
-    assert.match(sessionHudRenderer, /title\.textContent = shortTitle/);
+    assert.match(sessionHudRenderer, /title\.textContent = feedbackText \|\| shortTitle/);
     assert.doesNotMatch(sessionHudRenderer, /title\.title = fullTitle/);
   });
 

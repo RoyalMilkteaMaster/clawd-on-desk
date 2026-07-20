@@ -82,12 +82,14 @@ const {
 const { registerSettingsIpc } = require("./settings-ipc");
 const createSettingsEffectRouter = require("./settings-effect-router");
 const { registerSessionIpc } = require("./session-ipc");
+const { createSessionFolderOpener } = require("./session-open-folder");
 const { registerPetInteractionIpc } = require("./pet-interaction-ipc");
 const { createSystemWakeRecovery } = require("./system-wake-recovery");
 const { formatLocalTimestamp } = require("./log-timestamp");
 const { launchClaudeSession, openTerminalAt } = require("./launch-claude");
 const { dialog: electronDialog } = require("electron");
 const initPermission = require("./permission");
+const { isPassiveNotifyEntry } = require("./passive-notify-entry");
 const { registerPermissionIpc } = initPermission;
 const { createTelegramApprovalSidecar } = require("./telegram-approval-sidecar");
 const telegramApprovalSettings = require("./telegram-approval-settings");
@@ -1433,7 +1435,7 @@ const _permCtx = {
   },
 };
 const _perm = initPermission(_permCtx);
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, maybeStartRemoteApproval, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodeFamilyPermission } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, maybeStartRemoteApproval, clearCodexNotifyBubbles, showCodexUserInputBubble, clearCodexUserInputBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodeFamilyPermission } = _perm;
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
@@ -1795,6 +1797,11 @@ function hideDashboardSession(sessionId) {
     : { status: "not-found" };
 }
 
+const openDashboardSessionFolder = createSessionFolderOpener({
+  getSession: (sessionId) => sessions.get(sessionId),
+  openPath: (cwd) => shell.openPath(cwd),
+});
+
 const _dashboard = require("./dashboard")({
   get lang() { return lang; },
   t: (key) => translate(key),
@@ -1958,6 +1965,8 @@ agentRuntime = createAgentRuntimeMain({
   updateSession: (sessionId, state, event, opts) => updateSession(sessionId, state, event, opts),
   captureGhosttyTerminalId,
   clearCodexNotifyBubbles: (...args) => clearCodexNotifyBubbles(...args),
+  showCodexUserInputBubble: (...args) => showCodexUserInputBubble(...args),
+  clearCodexUserInputBubbles: (...args) => clearCodexUserInputBubbles(...args),
 });
 
 // ── HTTP server — delegated to src/server.js ──
@@ -1993,6 +2002,8 @@ const _serverCtx = {
   addPendingPermission,
   removePendingPermission,
   showPermissionBubble,
+  showCodexUserInputBubble,
+  clearCodexUserInputBubbles,
   maybeStartRemoteApproval,
   replyOpencodeFamilyPermission,
   syncPermissionShortcuts,
@@ -2384,9 +2395,16 @@ function getFeishuApprovalSecretInfo() {
   });
 }
 
+// Anything that changes the live connection must be in here. `platform` in
+// particular: switching Feishu <-> Lark has to tear the client down so the WS
+// reconnects to the new host and the cached REST client (and its token cache,
+// which is per-domain) is dropped with it. `lang` is deliberately absent — the
+// translator reads it dynamically, so a language switch must not bounce the
+// long connection.
 function buildFeishuApprovalSignature(config, paths, secrets) {
   return JSON.stringify({
     enabled: config.enabled === true,
+    platform: config.platform,
     idType: config.idType,
     approverId: config.approverId,
     secretsEnvFilePath: paths.secretsEnvFilePath,
@@ -2409,11 +2427,20 @@ function getFeishuApprovalStatus() {
   return {
     ...clientStatus,
     enabled: config.enabled === true,
+    // The platform the runtime actually resolved, so the settings page renders
+    // the right brand/guide and a mismatch is visible while troubleshooting.
+    platform: config.platform,
     configured: ready.ready === true,
     reason: ready.reason || "",
     message: clientStatus.message || ready.message || "",
     connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    // Two different questions, deliberately two fields:
+    //   secretsStored     — is ANY secret on disk? (drives render gating only)
+    //   secretsConfigured — are the two REQUIRED ones both present?
+    // Conflating them lets a half-written env file (App ID but no App Secret,
+    // or just a Verification Token) render as a complete setup.
     secretsStored: !!(secrets.appId || secrets.appSecret || secrets.verificationToken || secrets.encryptKey),
+    secretsConfigured: !!(secrets.appId && secrets.appSecret),
   };
 }
 
@@ -2472,7 +2499,9 @@ async function startFeishuApprovalClient() {
     encryptKey: secrets.encryptKey,
     approverId: config.approverId,
     idType: config.idType,
+    platform: config.platform,
     connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    getLang: () => _settingsController.get("lang") || lang || "en",
     log: feishuApprovalLog,
     onStatusChange: () => broadcastFeishuApprovalStatus(),
   });
@@ -2518,12 +2547,15 @@ function queueFeishuApprovalSync(reason) {
   return feishuApprovalSyncPromise;
 }
 
+// Brand-neutral: this channel now serves Feishu and Lark, and `message` is the
+// untranslated fallback shown when the renderer has no mapping for `code`.
+// Naming one brand here would tell half the users their working setup is wrong.
 function feishuApprovalUnavailableMessage(status) {
   if (status && status.message) return status.message;
-  if (status && status.reason === "disabled") return "Feishu approval is disabled";
-  if (status && status.reason === "missing-secret") return "Feishu App ID and App Secret are not configured";
-  if (status && status.reason === "invalid-config") return "Feishu approval config is incomplete";
-  return "Feishu approval client is not running";
+  if (status && status.reason === "disabled") return "Remote approval is disabled";
+  if (status && status.reason === "missing-secret") return "App ID and App Secret are not configured";
+  if (status && status.reason === "invalid-config") return "Remote approval config is incomplete";
+  return "Remote approval client is not running";
 }
 
 // The `code` field lets the renderer map failures to localized, actionable
@@ -2557,14 +2589,17 @@ async function sendFeishuApprovalTest() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60 * 1000);
   try {
+    // Title/detail go through the same dictionary the client uses for the
+    // buttons, so the test card can no longer mix an English heading with
+    // Chinese buttons.
     const decision = await client.requestApproval({
-      title: "Clawd Feishu approval test",
-      detail: "This is a settings test message. It is not attached to any agent permission request.",
+      title: translate("feishuCardTestTitle"),
+      detail: translate("feishuCardTestDetail"),
     }, { signal: controller.signal, rejectOnSendError: true });
     if (decision === "allow" || decision === "deny") {
       return { status: "ok", decision };
     }
-    return { status: "error", code: "no-button-response", message: "Feishu test did not receive a button response" };
+    return { status: "error", code: "no-button-response", message: "Test card did not receive a button response" };
   } catch (err) {
     return { status: "error", code: "card-send-failed", message: err && err.message ? err.message : String(err) };
   } finally {
@@ -2631,11 +2666,7 @@ function getTelegramApprovalStatus() {
 }
 
 function getPendingTelegramApprovalCount() {
-  return pendingPermissions.filter((entry) =>
-    entry
-    && !entry.isCodexNotify
-    && !entry.isKimiNotify
-  ).length;
+  return pendingPermissions.filter((entry) => entry && !isPassiveNotifyEntry(entry)).length;
 }
 
 function getTelegramNativeRunnerStatus() {
@@ -3396,6 +3427,7 @@ const settingsEffectRouter = createSettingsEffectRouter({
   syncPermissionShortcuts,
   dismissInteractivePermissionBubbles: () => callRuntimeMethod(_perm, "dismissInteractivePermissionBubbles"),
   clearCodexNotifyBubbles,
+  clearCodexUserInputBubbles,
   clearKimiNotifyBubbles,
   refreshPassiveNotifyAutoClose: () => callRuntimeMethod(_perm, "refreshPassiveNotifyAutoClose"),
   refreshPermissionAutoCloseForPolicy: () => callRuntimeMethod(_perm, "refreshPermissionAutoCloseForPolicy"),
@@ -3634,6 +3666,7 @@ registerSessionIpc({
   getI18n: () => getDashboardI18nPayload(),
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
+  openSessionFolder: (sessionId) => openDashboardSessionFolder(sessionId),
   ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
   showDashboard: (options) => showDashboard(options),

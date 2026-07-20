@@ -219,8 +219,9 @@
     }
     pushIfValue(lines, "kiro", formatKiroScan(detail.kiroScan));
     pushIfValue(lines, "hook issue", detail.hookCommandIssue);
-    pushIfValue(lines, "opencode issue", detail.opencodeEntryIssue);
-    pushIfValue(lines, "opencode entry", detail.opencodeEntry);
+    // Agent-neutral labels: mimocode shares these fields (R9 F3).
+    pushIfValue(lines, "plugin issue", detail.opencodeEntryIssue);
+    pushIfValue(lines, "plugin entry", detail.opencodeEntry);
     return lines.filter(Boolean).join("; ");
   }
 

@@ -160,6 +160,19 @@ class FakeClassList {
   }
 }
 
+// FakeElement.textContent is a plain field, not an aggregating DOM getter, so
+// reading it on a container yields "" and any "does this text appear?" check
+// against it passes vacuously. Walk the tree instead, and include innerHTML —
+// the guide rows render through it.
+function collectText(el) {
+  if (!el) return "";
+  const parts = [];
+  if (el.textContent) parts.push(String(el.textContent));
+  if (el.innerHTML) parts.push(String(el.innerHTML));
+  for (const child of el.children || []) parts.push(collectText(child));
+  return parts.join(" ");
+}
+
 class FakeElement {
   constructor(tagName) {
     this.tagName = String(tagName || "").toUpperCase();
@@ -2287,6 +2300,9 @@ describe("settings renderer browser environment", () => {
       key: "feishuApproval",
       value: {
         enabled: false,
+        // The snapshot in this test predates the platform field; the save must
+        // still carry the migrated value rather than dropping it.
+        platform: "feishu",
         idType: "open_id",
         approverId: "ou_f1a6f7f520883298be9b9fb9488c1aef",
         connectionTimeoutSeconds: 15,
@@ -2361,6 +2377,7 @@ describe("settings renderer browser environment", () => {
       key: "feishuApproval",
       value: {
         enabled: true,
+        platform: "feishu",
         idType: "open_id",
         approverId: "ou_1",
         connectionTimeoutSeconds: 30,
@@ -2445,13 +2462,433 @@ describe("settings renderer browser environment", () => {
     ]);
   });
 
-  it("expands only whitelisted hosts in Feishu guide links", async () => {
+  it("defaults the platform selector to Feishu and saves Lark through the settings controller", async () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        // A pre-platform config, exactly as an upgrading Feishu user has it.
+        feishuApproval: { enabled: true, idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+    });
+    harness.render();
+
+    const buttons = harness.content.querySelector(".feishu-approval-platform").querySelectorAll("button");
+    assert.deepStrictEqual(buttons.map((b) => b.dataset.platform), ["feishu", "lark"]);
+    assert.equal(buttons[0].classList.contains("active"), true, "an old config must render as Feishu");
+    assert.equal(buttons[1].classList.contains("active"), false);
+
+    buttons[1].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+
+    // Saved via settings-controller (window.settingsAPI.update), not written
+    // directly, and carrying the whole normalized config.
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates.find((call) => call.key === "feishuApproval"))), {
+      key: "feishuApproval",
+      value: {
+        enabled: true,
+        platform: "lark",
+        idType: "open_id",
+        approverId: "ou_1",
+        connectionTimeoutSeconds: 15,
+      },
+    });
+
+    // Clicking the already-active platform must not churn a save.
+    const before = harness.updates.length;
+    harness.content.querySelector(".feishu-approval-platform").querySelectorAll("button")[0]
+      .dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    assert.equal(harness.updates.length, before, "re-selecting the current platform should be a no-op");
+  });
+
+  it("keeps the Lark platform selected across re-render and shows Lark brand copy", async () => {
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    harness.render();
+    harness.render();
+
+    const buttons = harness.content.querySelector(".feishu-approval-platform").querySelectorAll("button");
+    assert.equal(buttons[1].classList.contains("active"), true, "Lark must survive a re-render");
+
+    const text = collectText(harness.content.querySelector(".feishu-approval-channel-card"));
+    assert.ok(text.length > 0, "sanity: the card must render some text");
+    assert.ok(!text.includes("{brand}"), "no raw {brand} token may reach the user");
+    assert.ok(text.includes("Lark"), "Lark brand copy should render");
+    assert.ok(
+      !/Enable Feishu approval|Feishu app credentials|Feishu approver user id/.test(text),
+      "Feishu-branded copy must not render while Lark is selected"
+    );
+    // The channel name names both platforms so a Lark user can find it at all.
+    assert.equal(strings.feishuApprovalChannelName, "Feishu / Lark");
+    // Brand-bearing copy must not say Feishu while Lark is selected.
+    assert.equal(
+      strings.feishuApprovalToggle.split("{brand}").join("Lark"),
+      "Enable Lark approval"
+    );
+  });
+
+  it("shows the extra-permission note for user_id only", async () => {
+    const strings = loadSettingsI18nForTest().en;
+    for (const [idType, shouldShow] of [["open_id", false], ["union_id", false], ["user_id", true]]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: { enabled: true, platform: "lark", idType, approverId: "ou_1", connectionTimeoutSeconds: 15 },
+        },
+      });
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      harness.render();
+      const note = harness.content.querySelector(".feishu-approval-id-type-note");
+      assert.equal(!!note, shouldShow, `${idType}: user-ID permission note presence`);
+      if (shouldShow) assert.match(note.textContent, /Get user user ID/);
+    }
+  });
+
+  it("reports an invalid App ID instead of claiming the setup is ready to enable", async () => {
+    // The real shape main.js produces for a saved-but-malformed App ID: every
+    // field is filled in, so the old code fell through to "ready to enable"
+    // while configured=false silently disabled the test button.
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                enabled: true,
+                platform: "lark",
+                configured: false,
+                reason: "invalid-secret",
+                message: "App ID format is invalid",
+                secretsStored: true,
+                connectionTimeoutSeconds: 15,
+              },
+            });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "not-......d-id" });
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const card = harness.content.querySelector(".feishu-approval-channel-card");
+    const statusText = card.querySelector(".tg-approval-channel-status-text").textContent;
+    assert.equal(
+      statusText,
+      "That App ID does not look like a self-built app id — Lark self-built app ids start with cli_.",
+      "the card must report the blocking reason"
+    );
+    assert.ok(!statusText.includes("Flip the switch"), "must not claim the setup is ready to enable");
+    assert.ok(!statusText.includes("Feishu"), "a Lark user must not be shown Feishu copy");
+
+    // The tooltip explaining the dead test button must be translated too.
+    const testButton = card.querySelectorAll("button").find((b) => b.textContent === strings.feishuApprovalSendTest);
+    assert.equal(testButton.disabled, true, "an unusable config must not offer a test");
+    assert.equal(testButton.title, statusText, "the tooltip must give the same translated reason");
+    assert.ok(!testButton.title.includes("App ID format is invalid"), "the raw English diagnostic must not surface");
+  });
+
+  it("shows a localized secrets-save failure with the underlying cause as detail", async () => {
+    // A disk failure has nothing to do with the platform, and the writer's
+    // English diagnostic used to be shown verbatim — Feishu-branded, to a Lark
+    // user. Localized sentence first, real cause appended.
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: false, platform: "lark", idType: "open_id", approverId: "", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped", enabled: false, platform: "lark", configured: false, reason: "disabled", secretsStored: false, secretsConfigured: false } });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: false });
+          if (name === "feishuApproval.setSecrets") {
+            return Promise.resolve({ status: "error", code: "write-failed", message: "Secrets write failed: EACCES: permission denied, mkdir" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const toasts = [];
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    const card = harness.content.querySelector(".feishu-approval-channel-card");
+    // The secrets row reads all four inputs (App ID, App Secret, Verification
+    // Token, Encrypt Key) before saving.
+    const inputs = card.querySelectorAll("input");
+    inputs[0].value = "cli_app";
+    inputs[1].value = "app-secret";
+    inputs[2].value = "";
+    inputs[3].value = "";
+    card.querySelectorAll("button").find((b) => b.textContent === strings.feishuApprovalSaveSecrets)
+      .dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(toasts.length, 1);
+    assert.equal(
+      toasts[0].message,
+      "Could not save Lark secrets. (Secrets write failed: EACCES: permission denied, mkdir)"
+    );
+    assert.ok(!toasts[0].message.includes("Feishu"), "a Lark user must not be shown Feishu branding");
+  });
+
+  it("treats a half-written secrets file as incomplete, not ready", async () => {
+    // status.secretsStored is true for ANY stored secret. Only App ID (no App
+    // Secret), or only a Verification Token, must never read as a finished
+    // setup: readiness says missing-secret, so the switch and the copy have to
+    // agree with it.
+    const strings = loadSettingsI18nForTest().en;
+    for (const [label, secretInfo, state] of [
+      [
+        "app id only",
+        { configured: false, appId: "cli_......abcd", appSecret: "" },
+        { status: "stopped", enabled: true, platform: "lark", configured: false, reason: "missing-secret", message: "App ID and App Secret are not configured", secretsStored: true, secretsConfigured: false },
+      ],
+      [
+        "verification token only",
+        { configured: false, appId: "", appSecret: "" },
+        { status: "stopped", enabled: true, platform: "lark", configured: false, reason: "missing-secret", message: "App ID and App Secret are not configured", secretsStored: true, secretsConfigured: false },
+      ],
+    ]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+        },
+        settingsAPI: {
+          command: (name) => {
+            if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+            if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+            if (name === "feishuApproval.status") return Promise.resolve({ status: "ok", state });
+            if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", ...secretInfo });
+            return Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      await Promise.resolve();
+      await Promise.resolve();
+      harness.render();
+
+      const card = harness.content.querySelector(".feishu-approval-channel-card");
+      const statusText = card.querySelector(".tg-approval-channel-status-text").textContent;
+      assert.equal(statusText, "Save Lark app credentials below to continue.", `${label}: card must ask for credentials`);
+      assert.ok(!statusText.includes("Flip the switch"), `${label}: must not claim ready to enable`);
+
+      // The enable switch must not be operable on an incomplete credential set.
+      const sw = card.querySelectorAll(".switch")[0];
+      assert.equal(sw.classList.contains("disabled"), true, `${label}: enable switch must be disabled`);
+      assert.equal(sw.getAttribute("aria-disabled"), "true", `${label}: switch must be marked disabled`);
+
+      // And step 3 must list app credentials as still missing.
+      const prereq = card.querySelector(".tg-approval-prereq-row");
+      assert.ok(prereq, `${label}: prerequisites row should render`);
+      assert.match(prereq.querySelectorAll(".row-desc")[0].textContent, /app credentials/, `${label}: prereq lists credentials`);
+    }
+  });
+
+  it("keeps 'ready to enable' for a valid config whose switch is simply off", async () => {
+    // readiness() short-circuits on `disabled` before it ever inspects the App
+    // ID, so a switched-off config must keep its normal copy — the blocking
+    // reason path must not swallow it.
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: false, platform: "feishu", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", enabled: false, platform: "feishu", configured: false, reason: "disabled", message: "", secretsStored: true },
+            });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const statusText = harness.content.querySelector(".feishu-approval-channel-card")
+      .querySelector(".tg-approval-channel-status-text").textContent;
+    assert.equal(statusText, strings.feishuApprovalCardReadyToEnable);
+  });
+
+  it("translates a connection timeout and falls back to the raw SDK error otherwise", async () => {
+    const strings = loadSettingsI18nForTest().en;
+    // The brand comes from the saved config (what the user picked), so the
+    // snapshot platform must track the case under test.
+    async function statusText(state) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: {
+            enabled: true,
+            platform: state.platform,
+            idType: "open_id",
+            approverId: "ou_1",
+            connectionTimeoutSeconds: state.connectionTimeoutSeconds,
+          },
+        },
+        settingsAPI: {
+          command: (name) => {
+            if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+            if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+            if (name === "feishuApproval.status") return Promise.resolve({ status: "ok", state });
+            if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+            return Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      await Promise.resolve();
+      await Promise.resolve();
+      harness.render();
+      return harness.content.querySelector(".feishu-approval-channel-card")
+        .querySelector(".tg-approval-channel-status-text").textContent;
+    }
+
+    // Our own timeout carries a code -> real copy, with the brand and the
+    // configured timeout filled in. Wrong-platform lands here first.
+    const timeout = await statusText({
+      status: "failed",
+      enabled: true,
+      platform: "lark",
+      configured: true,
+      errorCode: "connection-timeout",
+      message: "Long connection timed out after 15000ms. Check app credentials, long connection event subscription, and network.",
+      connectionTimeoutSeconds: 15,
+      secretsStored: true,
+    });
+    assert.equal(timeout, "Could not reach Lark within 15s. Check that the platform above matches your app, then the App ID / App Secret and your network.");
+    assert.ok(!timeout.includes("15000ms"), "the raw English diagnostic must not surface");
+
+    const reconnect = await statusText({
+      status: "failed", enabled: true, platform: "feishu", configured: true,
+      errorCode: "reconnect-timeout", message: "Long reconnect timed out after 30000ms.", connectionTimeoutSeconds: 30, secretsStored: true,
+    });
+    assert.match(reconnect, /Lost the Feishu long connection and could not reconnect within 30s/);
+
+    // An SDK failure has no code; showing the upstream string beats hiding the
+    // only clue the user has.
+    const sdk = await statusText({
+      status: "failed", enabled: true, platform: "lark", configured: true,
+      errorCode: "", message: "app ticket is invalid", connectionTimeoutSeconds: 15, secretsStored: true,
+    });
+    assert.equal(sdk, "app ticket is invalid");
+  });
+
+  it("maps readiness reason codes to localized, brand-aware toasts", async () => {
+    // Previously these fell through to main's raw English Feishu-branded
+    // message, which is wrong copy for a Lark user.
+    const strings = loadSettingsI18nForTest().en;
+    const testResults = [
+      { status: "error", code: "invalid-secret", message: "App ID format is invalid" },
+      { status: "error", code: "missing-secret", message: "App ID and App Secret are not configured" },
+      { status: "error", code: "invalid-config", message: "Approver id is not configured" },
+      { status: "error", code: "disabled", message: "Remote approval is disabled" },
+    ];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "running", configured: true, secretsStored: true, platform: "lark" } });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+          if (name === "feishuApproval.test") return Promise.resolve(testResults.shift());
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const toasts = [];
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    const testButton = harness.content.querySelector(".feishu-approval-channel-card")
+      .querySelectorAll("button")
+      .find((button) => button.textContent === strings.feishuApprovalSendTest);
+    for (let i = 0; i < 4; i += 1) {
+      testButton.dispatchEvent({ type: "click" });
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+
+    assert.deepStrictEqual(toasts.map((toast) => toast.message), [
+      "That App ID does not look like a self-built app id — Lark self-built app ids start with cli_.",
+      "App ID and App Secret are not saved yet.",
+      "The Lark approval config is incomplete — check the approver user id.",
+      "Lark approval is turned off.",
+    ]);
+    for (const toast of toasts) {
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(toast.options)), { error: true });
+      assert.ok(!toast.message.includes("Feishu"), `Lark user must not be shown Feishu copy: ${toast.message}`);
+      assert.ok(!toast.message.includes("{brand}"), "no raw token may reach the user");
+    }
+  });
+
+  it("expands only whitelisted hosts in Feishu/Lark guide links", async () => {
     const harness = loadTelegramApprovalTabForTest({});
     const probe = [
+      // Feishu near-misses
       "[evil](https://open.feishu.cn.evil.com/x)",
       "[good](https://open.feishu.cn/app)",
-      "[tg](https://t.me/x)",
       "[userinfo](https://evil.com@open.feishu.cn/app)",
+      "[hyphen](https://open-feishu.cn/app)",
+      // Lark near-misses: the same attacks must be blocked on the new host.
+      "[larkEvil](https://open.larksuite.com.evil.com/x)",
+      "[larkGood](https://open.larksuite.com/app)",
+      "[larkUserinfo](https://evil.com@open.larksuite.com/app)",
+      // An unescaped "." in the whitelist would let this hyphen host through.
+      "[larkHyphen](https://open-larksuite.com/app)",
+      "[larkSub](https://evil.open.larksuite.com/app)",
+      // Non-https and arbitrary custom domains stay out.
+      "[http](http://open.larksuite.com/app)",
+      "[custom](https://feishu.example.com/app)",
+      "[tg](https://t.me/x)",
       "[html <b>label</b>](https://open.feishu.cn/lbl)",
     ].join(" ");
     const originalT = harness.core.helpers.t;
@@ -2460,16 +2897,51 @@ describe("settings renderer browser environment", () => {
 
     const guideRow = harness.content.querySelector(".feishu-approval-event-sub-row");
     const hrefs = guideRow.querySelectorAll("a").map((a) => a.getAttribute("href"));
-    assert.deepStrictEqual(hrefs, ["https://open.feishu.cn/app", "https://t.me/x", "https://open.feishu.cn/lbl"]);
+    assert.deepStrictEqual(hrefs, [
+      "https://open.feishu.cn/app",
+      "https://open.larksuite.com/app",
+      "https://t.me/x",
+      "https://open.feishu.cn/lbl",
+    ]);
 
-    // The en string itself must stay on a whitelisted host, and the source
-    // whitelist must keep allowing it.
-    const guideStep1 = loadSettingsI18nForTest().en.feishuApprovalEventSubStep1Html;
-    const guideLink = guideStep1.match(/\[[^\]]+\]\((https:\/\/[^)]+)\)/);
-    assert.ok(guideLink, "en guide step 1 should contain a [text](url) link token");
-    assert.ok(guideLink[1].startsWith("https://open.feishu.cn/"), "guide link must stay on open.feishu.cn");
+    // The source whitelist must keep both official hosts, each with its dots
+    // escaped — an unescaped "." is what would admit open-larksuite.com.
     const approvalTabSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-telegram-approval.js"), "utf8");
     assert.ok(approvalTabSource.includes("open\\.feishu\\.cn"), "escapeWithLink whitelist should allow open.feishu.cn");
+    assert.ok(approvalTabSource.includes("open\\.larksuite\\.com"), "escapeWithLink whitelist should allow open.larksuite.com");
+  });
+
+  it("points the guide at the official console of the selected platform only", async () => {
+    // Replaces the old hardcoded startsWith("https://open.feishu.cn/") check:
+    // render each platform and assert it links to that platform's console and
+    // never the other one.
+    for (const [platform, expected, forbidden] of [
+      ["feishu", "https://open.feishu.cn/", "larksuite.com"],
+      ["lark", "https://open.larksuite.com/", "feishu.cn"],
+    ]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: { enabled: false, platform, idType: "open_id", approverId: "", connectionTimeoutSeconds: 15 },
+        },
+      });
+      // Use the real strings so the {consoleUrl}/{brand} tokens are exercised.
+      const strings = loadSettingsI18nForTest().en;
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      harness.render();
+
+      const guideRow = harness.content.querySelector(".feishu-approval-event-sub-row");
+      const hrefs = guideRow.querySelectorAll("a").map((a) => a.getAttribute("href"));
+      assert.equal(hrefs.length, 1, `${platform}: guide should render exactly one console link`);
+      assert.ok(hrefs[0].startsWith(expected), `${platform}: guide link must be on ${expected}, got ${hrefs[0]}`);
+      assert.ok(!hrefs[0].includes(forbidden), `${platform}: guide link must not point at ${forbidden}`);
+
+      // No unresolved token may reach the user.
+      const guideText = collectText(guideRow);
+      assert.ok(guideText.length > 0, `${platform}: sanity: the guide must render some text`);
+      assert.ok(!guideText.includes("{consoleUrl}"), `${platform}: {consoleUrl} must be interpolated`);
+      assert.ok(!guideText.includes("{brand}"), `${platform}: {brand} must be interpolated`);
+    }
   });
 
   it("refreshes Feishu status while long connection is starting", async () => {

@@ -16,6 +16,7 @@ function registerSessionIpc(options = {}) {
   const setSessionHudPinned = requiredDependency(options.setSessionHudPinned, "setSessionHudPinned");
   const setSessionHudTooltipVisible = requiredDependency(options.setSessionHudTooltipVisible, "setSessionHudTooltipVisible");
   const ackSessionCompletion = requiredDependency(options.ackSessionCompletion, "ackSessionCompletion");
+  const openSessionFolder = requiredDependency(options.openSessionFolder, "openSessionFolder");
   const disposers = [];
 
   function handle(channel, listener) {
@@ -34,9 +35,21 @@ function registerSessionIpc(options = {}) {
     focusSession(sessionId, { requestSource: "dashboard" })
   );
   handle("dashboard:hide-session", (_event, sessionId) => hideSession(sessionId));
+  handle("dashboard:open-session-folder", (_event, sessionId) => {
+    if (typeof sessionId !== "string" || !sessionId) {
+      return { status: "error", message: "dashboard:open-session-folder requires a sessionId string" };
+    }
+    return openSessionFolder(sessionId);
+  });
   handle("dashboard:set-session-alias", (_event, payload) => setSessionAlias(payload));
 
   handle("session-hud:get-i18n", () => getI18n());
+  handle("session-hud:open-session-folder", (_event, sessionId) => {
+    if (typeof sessionId !== "string" || !sessionId) {
+      return { status: "error", message: "session-hud:open-session-folder requires a sessionId string" };
+    }
+    return openSessionFolder(sessionId);
+  });
   on("session-hud:focus-session", (_event, sessionId) =>
     focusSession(sessionId, { requestSource: "hud" })
   );

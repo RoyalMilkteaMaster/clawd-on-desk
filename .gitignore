@@ -29,6 +29,7 @@ docs/**
 !docs/guides/state-mapping.md
 !docs/guides/state-mapping.zh-CN.md
 !docs/guides/telegram-approval.md
+!docs/guides/feishu-lark-remote-approval.md
 !docs/guides/codex-wsl-clarification.md
 !docs/guides/codex-wsl-clarification.zh-CN.md
 !docs/guides/codex-wsl-clarification.ko-KR.md
@@ -105,6 +106,7 @@ scripts/*
 !scripts/create-theme.js
 !scripts/export-agent-icons.js
 !scripts/verify-sidecar-binaries.js
+!scripts/verify-electron-install.js
 !scripts/fetch-sidecar-binaries.js
 
 # oh-my-cursor state

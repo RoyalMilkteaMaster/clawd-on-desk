@@ -98,6 +98,7 @@ function update(api, o = {}) {
       backgroundTasksCount: o.backgroundTasksCount ?? 0,
       sessionCronsCount: o.sessionCronsCount ?? 0,
       stopHookActive: o.stopHookActive ?? false,
+      transientPermissionEvent: o.transientPermissionEvent === true,
     },
   );
 }
@@ -1000,6 +1001,31 @@ describe("updateSession()", () => {
     update(api, { id: "perm1", state: "notification", event: "PermissionRequest" });
     assert.ok(!api.sessions.has("perm1"));
     assert.strictEqual(api.getCurrentState(), "notification");
+  });
+
+  it("Codex user-input request flashes notification while preserving session state", () => {
+    update(api, {
+      id: "codex:question",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+    });
+    update(api, {
+      id: "codex:question",
+      state: "notification",
+      event: "CodexUserInputRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+      transientPermissionEvent: true,
+    });
+
+    assert.strictEqual(api.sessions.get("codex:question").state, "working");
+    mock.timers.tick(1000);
+    assert.strictEqual(api.getCurrentState(), "notification");
+    assert.strictEqual(api.sessions.get("codex:question").recentEvents.at(-1).event, "PreToolUse");
   });
 
   it("Codex PermissionRequest persists focus metadata for snapshots", () => {

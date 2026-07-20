@@ -274,13 +274,25 @@ async function writeJsonAtomicWithBackupAsync(filePath, data, options = {}) {
   return backupPath;
 }
 
-function writeTextAtomic(filePath, text, encoding = "utf-8") {
+// `encodingOrOptions` accepts the legacy encoding string or
+// { encoding, mode }. Passing the ORIGINAL file's mode matters for configs
+// that may hold secrets (e.g. a 0600 mimocode.jsonc with provider tokens):
+// the rename-into-place pattern otherwise replaces them with a fresh
+// umask-default 0644 file — a silent permission widening.
+function writeTextAtomic(filePath, text, encodingOrOptions = "utf-8") {
+  const opts = typeof encodingOrOptions === "string" ? { encoding: encodingOrOptions } : (encodingOrOptions || {});
+  const encoding = opts.encoding || "utf-8";
   const dir = path.dirname(filePath);
   const base = path.basename(filePath);
   const tmpPath = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
   fs.mkdirSync(dir, { recursive: true });
   try {
-    fs.writeFileSync(tmpPath, text, encoding);
+    fs.writeFileSync(tmpPath, text, opts.mode === undefined ? encoding : { encoding, mode: opts.mode });
+    // open()'s mode is masked by the process umask (022 turns 0664 into
+    // 0644), so writeFileSync alone only "preserves" bits the umask happens
+    // to allow. chmod is umask-immune — apply the exact bits before the
+    // rename (dual-review S-F1).
+    if (opts.mode !== undefined) fs.chmodSync(tmpPath, opts.mode);
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch {}
@@ -290,7 +302,7 @@ function writeTextAtomic(filePath, text, encoding = "utf-8") {
 
 function writeTextAtomicWithBackup(filePath, text, options = {}) {
   const backupPath = createBackup(filePath, options);
-  writeTextAtomic(filePath, text, options.encoding || "utf-8");
+  writeTextAtomic(filePath, text, { encoding: options.encoding || "utf-8", mode: options.mode });
   if (backupPath) pruneOldBackups(filePath, options, backupPath);
   return backupPath;
 }

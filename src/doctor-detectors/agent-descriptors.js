@@ -2,6 +2,7 @@
 
 const path = require("path");
 const { getAgent } = require("../../agents/registry");
+const { getFamilyConfig } = require("../../agents/opencode-family");
 
 const claude = require("../../hooks/install");
 const codex = require("../../hooks/codex-install");
@@ -15,6 +16,7 @@ const kimi = require("../../hooks/kimi-install");
 const qwen = require("../../hooks/qwen-code-install");
 const codewhale = require("../../hooks/codewhale-install");
 const opencode = require("../../hooks/opencode-install");
+const mimocode = require("../../hooks/mimocode-install");
 const pi = require("../../hooks/pi-install");
 const openclaw = require("../../hooks/openclaw-install");
 const hermes = require("../../hooks/hermes-install");
@@ -191,6 +193,30 @@ const AGENT_DESCRIPTORS = Object.freeze([
     detection: "opencode-plugin",
   }),
   Object.freeze({
+    agentId: "mimocode",
+    agentName: agentName("mimocode"),
+    eventSource: agentEventSource("mimocode"),
+    parentDir: mimocode.DEFAULT_PARENT_DIR,
+    configPath: mimocode.DEFAULT_CONFIG_PATH,
+    configMode: "file",
+    autoInstall: true,
+    // mimocode is an opencode-family member and shares the same plugin
+    // loader contract. Detection reuses the opencode-plugin validator path;
+    // configJsonc routes reads through the JSONC parser so a commented
+    // config is not misreported as config-corrupt, and configCandidates
+    // (highest-priority first, from the family registry) makes the doctor
+    // validate the MERGED effective plugin view rather than one fixed file.
+    configJsonc: true,
+    configCandidates: Object.freeze(
+      getFamilyConfig("mimocode").configCandidates.map((name) => path.join(mimocode.DEFAULT_PARENT_DIR, name))
+    ),
+    // marker derives from the registry: it feeds the plugin-entry basename
+    // match, so a drifted literal would report a healthy install as
+    // not-connected (R8 P2).
+    marker: getFamilyConfig("mimocode").pluginDirName,
+    detection: "opencode-plugin",
+  }),
+  Object.freeze({
     agentId: "pi",
     agentName: agentName("pi"),
     eventSource: agentEventSource("pi"),
@@ -237,6 +263,7 @@ const AGENT_DESCRIPTORS = Object.freeze([
     marker: qoder.MARKER,
     nested: true,
     hookEvents: qoder.QODER_HOOK_EVENTS,
+    hookGroupId: "clawd",
   }),
   Object.freeze({
     agentId: "reasonix",
@@ -261,6 +288,7 @@ const AGENT_DESCRIPTORS = Object.freeze([
     marker: qoderwork.MARKER,
     nested: true,
     hookEvents: qoderwork.QODERWORK_HOOK_EVENTS,
+    hookGroupId: "clawd",
   }),
 ]);
 

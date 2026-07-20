@@ -262,6 +262,7 @@ test("direct send does not treat passive notify entries as pending permissions",
     getPendingPermissions: () => [
       { sessionId: "sess-local-1", isCodexNotify: true },
       { sessionId: "sess-local-1", isKimiNotify: true },
+      { sessionId: "sess-local-1", isCodexUserInputNotify: true },
     ],
     focusSession: (sessionId) => {
       focused.push(sessionId);

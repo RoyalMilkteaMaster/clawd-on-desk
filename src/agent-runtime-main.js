@@ -37,6 +37,8 @@ function createAgentRuntimeMain(options = {}) {
   const updateSession = options.updateSession || (() => {});
   const captureGhosttyTerminalId = options.captureGhosttyTerminalId || null;
   const clearCodexNotifyBubbles = options.clearCodexNotifyBubbles || (() => {});
+  const showCodexUserInputBubble = options.showCodexUserInputBubble || (() => false);
+  const clearCodexUserInputBubbles = options.clearCodexUserInputBubbles || (() => {});
 
   let codexMonitor = null;
   const codexOfficialHookSessions = new Map();
@@ -199,7 +201,26 @@ function createAgentRuntimeMain(options = {}) {
         updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
           includeHeadless: true,
         }));
-      }, { classifier: codexSubagentClassifier });
+      }, {
+        classifier: codexSubagentClassifier,
+        onUserInputRequest: (sid, request, extra) => {
+          const shown = showCodexUserInputBubble({
+            sessionId: sid,
+            callId: request.callId,
+            questions: request.questions,
+            autoResolutionMs: request.autoResolutionMs,
+            ...extra,
+          });
+          if (!shown) return;
+          updateSession(sid, "notification", "CodexUserInputRequest", {
+            ...buildCodexMonitorUpdateOptions(extra, { includeHeadless: true }),
+            transientPermissionEvent: true,
+          });
+        },
+        onUserInputResolved: (sid, callId) => {
+          clearCodexUserInputBubbles(sid, callId, "codex-user-input-resolved");
+        },
+      });
       if (isAgentEnabled("codex")) {
         codexMonitor.start();
       }

@@ -1,5 +1,7 @@
 "use strict";
 
+const { isCodexDesktopOriginator } = require("../hooks/codex-originator");
+
 const SESSION_STALE_MS = 600000;
 const WORKING_STALE_MS = 300000;
 const DETACHED_IDLE_STALE_MS = 30000;
@@ -14,6 +16,15 @@ function isLocalCodexWorkingLikeSession(session) {
     && session.agentId === "codex"
     && !session.host
     && isWorkingLikeState(session.state);
+}
+
+function isLocalCodexDesktopIdleSession(session) {
+  return !!session
+    && session.agentId === "codex"
+    && !session.host
+    && !session.headless
+    && session.state === "idle"
+    && isCodexDesktopOriginator(session.codexOriginator);
 }
 
 function getStaleSessionDecision(session, options = {}) {
@@ -57,6 +68,17 @@ function getStaleSessionDecision(session, options = {}) {
     Number(session.ackedAt) || 0
   );
   const age = now - referenceTs;
+
+  // Codex Desktop threads share one long-lived app-server PID and do not emit
+  // SessionEnd. A live process therefore cannot keep an individual idle thread
+  // alive forever; use the existing user-configured idle-age cutoff instead.
+  if (
+    sessionStaleMs > 0
+    && age > sessionStaleMs
+    && isLocalCodexDesktopIdleSession(session)
+  ) {
+    return { action: "delete", reason: "codex-desktop-idle-timeout" };
+  }
 
   // NOTE: requiresCompletionAck does NOT hold a session out of stale cleanup.
   // The completion notification (e.g. Telegram push) already fires once at the

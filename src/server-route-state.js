@@ -16,6 +16,7 @@ const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
 const { ANTIGRAVITY_QUOTA_FIELDS } = require("../hooks/antigravity-context-usage");
 const { CLAUDE_QUOTA_FIELDS } = require("../hooks/claude-rate-limits");
 const { extractPermissionToolInput } = require("../hooks/kimi-hook");
+const { normalizeCodexUserInputWire } = require("../hooks/codex-user-input");
 
 // /state POST body size cap. Raised 1024 → 4096 → 16384: a CJK
 // assistant_last_output (3 UTF-8 bytes/char) on a Stop completion blew past
@@ -245,6 +246,7 @@ function handleStatePost(req, res, options) {
       const sessionCronsCount = Number.isFinite(data.session_crons_count)
         ? data.session_crons_count : 0;
       const stopHookActive = data.stop_hook_active === true;
+      const codexUserInput = normalizeCodexUserInputWire(data.codex_user_input);
       // Agent gate: user disabled this agent in the settings panel. Drop
       // with 204 so hook scripts get a quick no-op response instead of
       // hanging on our HTTP connection. Still surfaces as a success code
@@ -254,6 +256,43 @@ function handleStatePost(req, res, options) {
         res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
         res.end();
         return;
+      }
+      if (agentId === "codex" && codexUserInput) {
+        const sid = session_id || "default";
+        if (codexUserInput.phase === "resolved") {
+          if (typeof ctx.clearCodexUserInputBubbles === "function") {
+            ctx.clearCodexUserInputBubbles(sid, codexUserInput.callId, "codex-user-input-resolved");
+          }
+          res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end("ok");
+          return;
+        }
+        if (headless || shouldDropForDnd()) {
+          recordRequestHookEvent.droppedByDnd();
+          res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end();
+          return;
+        }
+        const shown = typeof ctx.showCodexUserInputBubble === "function"
+          && ctx.showCodexUserInputBubble({
+            sessionId: sid,
+            callId: codexUserInput.callId,
+            questions: codexUserInput.questions,
+            autoResolutionMs: codexUserInput.autoResolutionMs,
+            sourcePid: source_pid,
+            agentPid,
+            cwd,
+            host,
+            codexOriginator,
+            codexSource,
+          });
+        if (!shown) {
+          res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end();
+          return;
+        }
+        state = "notification";
+        event = "CodexUserInputRequest";
       }
       if (metadataOnly) {
         // Deliberately NOT recorded in the recent-hook-events ring: a
@@ -453,6 +492,7 @@ function handleStatePost(req, res, options) {
             sessionCronsCount,
             stopHookActive,
             stdinDiag,
+            ...(codexUserInput ? { transientPermissionEvent: true } : {}),
             ...(agentIdentity.defaulted ? { agentIdDefaulted: true } : {}),
           });
         }

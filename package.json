@@ -13,7 +13,9 @@
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --win --mac --linux",
     "fetch:sidecars": "node scripts/fetch-sidecar-binaries.js",
+    "verify:electron": "node scripts/verify-electron-install.js",
     "verify:sidecars": "node scripts/verify-sidecar-binaries.js",
+    "postinstall": "node scripts/verify-electron-install.js --context postinstall",
     "prebuild": "node scripts/verify-sidecar-binaries.js",
     "prebuild:win:x64": "node scripts/verify-sidecar-binaries.js",
     "prebuild:win:arm64": "node scripts/verify-sidecar-binaries.js",
@@ -38,6 +40,8 @@
     "uninstall:pi-extension": "node hooks/pi-install.js --uninstall",
     "install:openclaw-plugin": "node hooks/openclaw-install.js",
     "uninstall:openclaw-plugin": "node hooks/openclaw-install.js --uninstall",
+    "install:mimocode-plugin": "node hooks/mimocode-install.js",
+    "uninstall:mimocode-plugin": "node hooks/mimocode-install.js --uninstall",
     "install:codex-hooks": "node hooks/codex-install.js",
     "uninstall:codex-hooks": "node hooks/codex-install.js --uninstall",
     "install:codex-debug-hooks": "node hooks/codex-debug-install.js",
@@ -175,8 +179,11 @@
       }
     ]
   },
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "devDependencies": {
-    "electron": "^41.0.2",
+    "electron": "^41.10.2",
     "electron-builder": "^26.8.1"
   },
   "dependencies": {
@@ -184,6 +191,7 @@
     "electron-updater": "^6.8.3",
     "dom-serializer": "^3.0.0",
     "htmlparser2": "^12.0.0",
+    "jsonc-parser": "^3.3.1",
     "koffi": "^2.15.2",
     "ws": "^8.21.0"
   }

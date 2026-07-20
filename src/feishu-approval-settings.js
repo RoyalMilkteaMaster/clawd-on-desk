@@ -4,11 +4,18 @@ const path = require("path");
 
 const DEFAULT_FEISHU_APPROVAL = Object.freeze({
   enabled: false,
+  platform: "feishu",
   idType: "open_id",
   approverId: "",
   connectionTimeoutSeconds: 15,
 });
 
+// Feishu (China) and Lark (international) are separate deployments of the same
+// product with separate API hosts. The value only ever selects an official SDK
+// domain enum — users cannot type a host, so an App Secret can never be sent to
+// a non-official server. Old configs have no platform key and normalize to
+// "feishu", which is what they were implicitly using before this field existed.
+const FEISHU_PLATFORMS = new Set(["feishu", "lark"]);
 const FEISHU_ID_TYPES = new Set(["open_id", "user_id", "union_id"]);
 const CONNECTION_TIMEOUT_SECONDS = new Set([5, 10, 15, 30, 60]);
 const SECRET_KEYS = Object.freeze({
@@ -38,16 +45,22 @@ function normalizeConnectionTimeoutSeconds(value, fallback = DEFAULT_FEISHU_APPR
 
 function normalizeFeishuApproval(value, defaultsValue = DEFAULT_FEISHU_APPROVAL) {
   const defaults = isPlainObject(defaultsValue) ? defaultsValue : DEFAULT_FEISHU_APPROVAL;
+  const defaultPlatform = FEISHU_PLATFORMS.has(defaults.platform) ? defaults.platform : DEFAULT_FEISHU_APPROVAL.platform;
   const defaultIdType = FEISHU_ID_TYPES.has(defaults.idType) ? defaults.idType : DEFAULT_FEISHU_APPROVAL.idType;
   const defaultTimeout = normalizeConnectionTimeoutSeconds(defaults.connectionTimeoutSeconds);
   const out = {
     enabled: defaults.enabled === true,
+    platform: defaultPlatform,
     idType: defaultIdType,
     approverId: trimString(defaults.approverId, 128),
     connectionTimeoutSeconds: defaultTimeout,
   };
   if (!isPlainObject(value)) return out;
   if (typeof value.enabled === "boolean") out.enabled = value.enabled;
+  if (typeof value.platform === "string") {
+    const platform = trimString(value.platform, 32);
+    out.platform = FEISHU_PLATFORMS.has(platform) ? platform : DEFAULT_FEISHU_APPROVAL.platform;
+  }
   if (typeof value.idType === "string") {
     const idType = trimString(value.idType, 32);
     out.idType = FEISHU_ID_TYPES.has(idType) ? idType : DEFAULT_FEISHU_APPROVAL.idType;
@@ -62,12 +75,19 @@ function normalizeFeishuApproval(value, defaultsValue = DEFAULT_FEISHU_APPROVAL)
 function validateFeishuApproval(value) {
   if (!isPlainObject(value)) return { status: "error", message: "feishuApproval must be a plain object" };
   for (const key of Object.keys(value)) {
-    if (key !== "enabled" && key !== "idType" && key !== "approverId" && key !== "connectionTimeoutSeconds") {
+    if (key !== "enabled" && key !== "platform" && key !== "idType" && key !== "approverId" && key !== "connectionTimeoutSeconds") {
       return { status: "error", message: `feishuApproval.${key} is not supported` };
     }
   }
   if (typeof value.enabled !== "boolean") {
     return { status: "error", message: "feishuApproval.enabled must be a boolean" };
+  }
+  // Optional on the way in — configs saved before the platform field existed
+  // (and any caller that omits it) stay valid and normalize to "feishu". A
+  // present value must be one of the two official deployments; an arbitrary
+  // host is never accepted here or anywhere downstream.
+  if (value.platform !== undefined && !FEISHU_PLATFORMS.has(value.platform)) {
+    return { status: "error", message: "feishuApproval.platform must be feishu or lark" };
   }
   if (!FEISHU_ID_TYPES.has(value.idType)) {
     return { status: "error", message: "feishuApproval.idType must be open_id, user_id, or union_id" };
@@ -127,12 +147,18 @@ function buildSecretsEnvFile(secrets) {
   ].join("\n");
 }
 
+// Errors here are user-visible (the settings page shows them on a failed save),
+// so they carry a stable `code` for the UI to localize and stay brand-neutral:
+// the same writer serves Feishu and Lark, and a disk/permission failure has
+// nothing to do with which platform was picked. `message` remains the English
+// diagnostic — it names the real cause (EACCES, ENOSPC…) and is the only clue
+// worth showing alongside the translated copy.
 function writeSecretsEnvFile({ fs, path: pathModule = path, filePath, secrets, platform = process.platform } = {}) {
   if (!fs || typeof fs.writeFileSync !== "function") {
-    return { status: "error", message: "writeSecretsEnvFile requires fs" };
+    return { status: "error", code: "write-failed", message: "writeSecretsEnvFile requires fs" };
   }
   if (!filePath || typeof filePath !== "string") {
-    return { status: "error", message: "Feishu secrets env file path is required" };
+    return { status: "error", code: "write-failed", message: "Secrets env file path is required" };
   }
   const current = readSecretsEnvFile({ fs, filePath });
   const incoming = isPlainObject(secrets) ? secrets : {};
@@ -159,7 +185,11 @@ function writeSecretsEnvFile({ fs, path: pathModule = path, filePath, secrets, p
     }
     return { status: "ok", secretsStored: true, filePath };
   } catch (err) {
-    return { status: "error", message: `Feishu secrets write failed: ${err && err.message}` };
+    return {
+      status: "error",
+      code: "write-failed",
+      message: `Secrets write failed: ${err && err.message}`,
+    };
   }
 }
 
@@ -204,20 +234,28 @@ function secretStatus({ fs, filePath } = {}) {
   };
 }
 
+// `reason` is the stable code the UI maps to a localized, platform-aware
+// string; `message` stays English and brand-neutral because it is a log/
+// fallback diagnostic that can surface under either platform. Never name a
+// single brand here — a Lark user reading "Feishu App ID is invalid" is being
+// told their (correct) setup is wrong.
 function readiness(config, secrets) {
   const normalized = normalizeFeishuApproval(config);
   if (!normalized.enabled) return { ready: false, reason: "disabled", config: normalized };
   const valid = validateFeishuApproval(normalized);
   if (valid.status !== "ok") return { ready: false, reason: "invalid-config", message: valid.message, config: normalized };
   if (!normalized.approverId) {
-    return { ready: false, reason: "invalid-config", message: "Feishu approver id is not configured", config: normalized };
+    return { ready: false, reason: "invalid-config", message: "Approver id is not configured", config: normalized };
   }
   if (!secrets || !secrets.appId || !secrets.appSecret) {
-    return { ready: false, reason: "missing-secret", message: "Feishu App ID and App Secret are not configured", config: normalized };
+    return { ready: false, reason: "missing-secret", message: "App ID and App Secret are not configured", config: normalized };
   }
+  // Self-built apps use the `cli_` prefix on BOTH Feishu and Lark, so this
+  // format gate stays platform-independent (and is why credentials alone
+  // cannot be used to auto-detect the platform).
   const appId = String(secrets.appId || "").trim();
   if (!/^cli_[A-Za-z0-9_-]+$/.test(appId)) {
-    return { ready: false, reason: "invalid-secret", message: "Feishu App ID format is invalid", config: normalized };
+    return { ready: false, reason: "invalid-secret", message: "App ID format is invalid", config: normalized };
   }
   return { ready: true, config: normalized };
 }
@@ -236,6 +274,7 @@ function redactionSecretsForFeishuApproval(config, secrets) {
 
 module.exports = {
   DEFAULT_FEISHU_APPROVAL,
+  FEISHU_PLATFORMS,
   FEISHU_ID_TYPES,
   CONNECTION_TIMEOUT_SECONDS,
   cloneDefaultFeishuApproval,
