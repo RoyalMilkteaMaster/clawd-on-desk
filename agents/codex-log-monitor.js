@@ -27,6 +27,7 @@ const {
 const MAX_TRACKED_FILES = 50;
 const MAX_RETIRED_TRACKED_FILES = 100;
 const MAX_PARTIAL_BYTES = 65536;
+const MAX_INITIAL_BACKFILL_BYTES = 8 * 1024 * 1024;
 const RECENT_DAY_DIR_CACHE_MS = 60 * 60 * 1000; // 1 hour
 // A rollout file is considered "active" if written within this window. Used by
 // both the untracked-file pickup gate in _poll and the _getActiveDayDirs scan
@@ -52,6 +53,26 @@ function finiteNonnegativeNumber(value) {
 function positiveNumber(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function finalPathSegment(value) {
+  if (typeof value !== "string") return "";
+  const parts = value.trim().split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+function buildSubagentSessionTitle(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const spawn = payload.source && payload.source.subagent
+    ? payload.source.subagent.thread_spawn
+    : null;
+  const agentPath = payload.agent_path || (spawn && spawn.agent_path);
+  const task = finalPathSegment(agentPath).replace(/[_-]+/g, " ").trim();
+  const rawNickname = payload.agent_nickname || (spawn && spawn.agent_nickname);
+  const nickname = typeof rawNickname === "string" ? rawNickname.trim() : "";
+  const project = finalPathSegment(payload.cwd);
+  const parts = [task, nickname, project].filter(Boolean);
+  return parts.length ? parts.join(" · ") : null;
 }
 
 function extractCodexContextUsage(payload) {
@@ -329,12 +350,23 @@ class CodexLogMonitor {
       const retired = this._retiredTracked.get(filePath) || null;
       const resumeOffset = retired && stat.size >= retired.offset ? retired.offset : 0;
       if (retired) this._retiredTracked.delete(filePath);
+      const backfilling =
+        !retired &&
+        stat.size > 0 &&
+        stat.mtimeMs < this._startedAtMs - BACKFILL_GRACE_MS;
+      // Old Codex Desktop rollouts can grow past Node's maximum string size.
+      // Only the newest records are needed to reconstruct the current state;
+      // starting mid-line is safe because that first fragment fails JSON.parse.
+      const initialOffset = backfilling && stat.size > MAX_INITIAL_BACKFILL_BYTES
+        ? stat.size - MAX_INITIAL_BACKFILL_BYTES
+        : resumeOffset;
       tracked = {
-        offset: resumeOffset,
+        offset: initialOffset,
         sessionId: "codex:" + sessionId,
         filePath,
         cwd: retired ? retired.cwd : "",
         sessionTitle: retired ? retired.sessionTitle : null,
+        subagentTitle: retired ? retired.subagentTitle : null,
         codexOriginator: retired ? retired.codexOriginator : null,
         codexSource: retired ? retired.codexSource : null,
         lastEventTime: Date.now(),
@@ -354,10 +386,7 @@ class CodexLogMonitor {
         // cwd/sessionTitle without emitting old transitions. Files written
         // inside the grace window are live sessions and emit normally.
         // Empty files have nothing to replay.
-        backfilling:
-          !retired &&
-          stat.size > 0 &&
-          stat.mtimeMs < this._startedAtMs - BACKFILL_GRACE_MS,
+        backfilling,
       };
       this._tracked.set(filePath, tracked);
     }
@@ -533,8 +562,13 @@ class CodexLogMonitor {
       ? payload.source.trim()
       : tracked.codexSource;
     const role = this._classifier.registerSession(tracked.sessionId, { sessionMeta: payload });
-    if (role === "subagent") tracked.isSubagent = true;
-    else if (role === "root") tracked.isSubagent = false;
+    if (role === "subagent") {
+      tracked.isSubagent = true;
+      tracked.codexSource = "subagent";
+      tracked.subagentTitle = buildSubagentSessionTitle(payload) || tracked.subagentTitle;
+    } else if (role === "root") {
+      tracked.isSubagent = false;
+    }
   }
 
   // Codex-authored session summary, extracted from turn_context.summary.
@@ -635,6 +669,7 @@ class CodexLogMonitor {
       offset: Number.isFinite(tracked.offset) ? tracked.offset : 0,
       cwd: tracked.cwd || "",
       sessionTitle: tracked.sessionTitle || null,
+      subagentTitle: tracked.subagentTitle || null,
       codexOriginator: tracked.codexOriginator || null,
       codexSource: tracked.codexSource || null,
       lastState: tracked.lastState || null,
@@ -713,7 +748,7 @@ class CodexLogMonitor {
       agentPid: extra && Object.prototype.hasOwnProperty.call(extra, "agentPid")
         ? extra.agentPid
         : agentPid,
-      sessionTitle: tracked.sessionTitle,
+      sessionTitle: tracked.subagentTitle || tracked.sessionTitle,
       codexOriginator: tracked.codexOriginator || null,
       codexSource: tracked.codexSource || null,
       ...this._withTrackedContextUsage(tracked, extra),

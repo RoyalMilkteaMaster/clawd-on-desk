@@ -1097,6 +1097,41 @@ describe("CodexLogMonitor", () => {
   });
 
   describe("session title extraction (turn_context.summary)", () => {
+    it("keeps the Codex subagent task, nickname, and project as its HUD title", (_, done) => {
+      const testFile = path.join(dateDir, TEST_FILENAME);
+      fs.writeFileSync(testFile, [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            cwd: "/projects/AIPE03_final_project",
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: "parent-1",
+                  agent_path: "/root/scene_bundle_validator",
+                  agent_nickname: "Linnaeus",
+                },
+              },
+            },
+            agent_path: "/root/scene_bundle_validator",
+            agent_nickname: "Linnaeus",
+          },
+        }),
+        JSON.stringify({ type: "turn_context", payload: { summary: "Generic summary" } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "task_started" } }),
+      ].join("\n") + "\n");
+
+      const config = makeConfig(tmpDir);
+      monitor = new CodexLogMonitor(config, (sid, state, event, extra) => {
+        if (state !== "thinking") return;
+        assert.strictEqual(extra.sessionTitle, "scene bundle validator · Linnaeus · AIPE03_final_project");
+        assert.strictEqual(extra.codexSource, "subagent");
+        assert.strictEqual(extra.headless, true);
+        done();
+      });
+      monitor.start();
+    });
+
     it("captures sessionTitle on next state emit after turn_context", (_, done) => {
       const testFile = path.join(dateDir, TEST_FILENAME);
       // turn_context carries the summary; session_meta (emitted after) triggers idle

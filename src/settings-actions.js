@@ -69,6 +69,14 @@ const {
 } = require("./session-alias");
 const { validateShortcutMapShape } = require("./shortcut-actions");
 const {
+  validateChannelAccessToken,
+  validateLineNotifications,
+} = require("./line-notification-settings");
+const {
+  validateBotToken: validateDiscordBotToken,
+  validateDiscordBot,
+} = require("./discord-bot-settings");
+const {
   requireBoolean,
   requireFiniteNumber,
   requireNonNegativeFiniteNumber,
@@ -311,6 +319,8 @@ const updateRegistry = {
   keepSizeAcrossDisplays: requireBoolean("keepSizeAcrossDisplays"),
   fullscreenOverlay: requireBoolean("fullscreenOverlay"),
   mobilePreviewEnabled: requireBoolean("mobilePreviewEnabled"),
+  lineNotifications: validateLineNotifications,
+  discordBot: validateDiscordBot,
 
   // ── System-backed prefs (object-form: validate + effect pre-commit gate) ──
   autoStartWithClaude,
@@ -1084,6 +1094,97 @@ async function telegramApprovalSetToken(payload, deps = {}) {
   return { status: "ok", tokenStored: true };
 }
 
+async function lineNotificationsSetToken(payload, deps = {}) {
+  const token = typeof payload === "string"
+    ? payload
+    : (payload && typeof payload === "object" ? payload.token : "");
+  const valid = validateChannelAccessToken(token);
+  if (valid.status !== "ok") return valid;
+  if (typeof deps.writeLineNotificationToken !== "function") {
+    return { status: "error", message: "lineNotifications.setToken requires writeLineNotificationToken dep" };
+  }
+  return deps.writeLineNotificationToken(valid.token);
+}
+
+function lineNotificationsTokenInfo(_payload, deps = {}) {
+  if (typeof deps.getLineNotificationTokenInfo !== "function") {
+    return { status: "error", message: "lineNotifications.tokenInfo requires getLineNotificationTokenInfo dep" };
+  }
+  const info = deps.getLineNotificationTokenInfo() || {};
+  return {
+    status: "ok",
+    configured: info.configured === true,
+    masked: typeof info.masked === "string" ? info.masked : "",
+  };
+}
+
+async function lineNotificationsSendTest(_payload, deps = {}) {
+  if (typeof deps.sendLineNotificationTest !== "function") {
+    return { status: "error", message: "lineNotifications.test requires sendLineNotificationTest dep" };
+  }
+  return deps.sendLineNotificationTest();
+}
+
+lineNotificationsSetToken.lockKey = "lineNotifications";
+lineNotificationsSendTest.lockKey = "lineNotifications";
+
+async function discordBotSetToken(payload, deps = {}) {
+  const token = typeof payload === "string"
+    ? payload
+    : (payload && typeof payload === "object" ? payload.token : "");
+  const valid = validateDiscordBotToken(token);
+  if (valid.status !== "ok") return valid;
+  if (typeof deps.writeDiscordBotToken !== "function") {
+    return { status: "error", message: "discordBot.setToken requires writeDiscordBotToken dep" };
+  }
+  return deps.writeDiscordBotToken(valid.token);
+}
+
+function discordBotTokenInfo(_payload, deps = {}) {
+  if (typeof deps.getDiscordBotTokenInfo !== "function") {
+    return { status: "error", message: "discordBot.tokenInfo requires getDiscordBotTokenInfo dep" };
+  }
+  const info = deps.getDiscordBotTokenInfo() || {};
+  return {
+    status: "ok",
+    configured: info.configured === true,
+    masked: typeof info.masked === "string" ? info.masked : "",
+  };
+}
+
+async function discordBotSendTest(_payload, deps = {}) {
+  if (typeof deps.sendDiscordBotTest !== "function") {
+    return { status: "error", message: "discordBot.test requires sendDiscordBotTest dep" };
+  }
+  return deps.sendDiscordBotTest();
+}
+
+function discordBotStyleGet(_payload, deps = {}) {
+  if (typeof deps.getNotificationStyle !== "function") {
+    return { status: "error", message: "discordBot.style.get requires getNotificationStyle dep" };
+  }
+  return { status: "ok", style: deps.getNotificationStyle() };
+}
+
+async function discordBotStyleSave(payload, deps = {}) {
+  if (typeof deps.writeNotificationStyle !== "function") {
+    return { status: "error", message: "discordBot.style.save requires writeNotificationStyle dep" };
+  }
+  return deps.writeNotificationStyle(payload);
+}
+
+async function discordBotStyleReset(_payload, deps = {}) {
+  if (typeof deps.resetNotificationStyle !== "function") {
+    return { status: "error", message: "discordBot.style.reset requires resetNotificationStyle dep" };
+  }
+  return deps.resetNotificationStyle();
+}
+
+discordBotSetToken.lockKey = "discordBot";
+discordBotSendTest.lockKey = "discordBot";
+discordBotStyleSave.lockKey = "notificationStyle";
+discordBotStyleReset.lockKey = "notificationStyle";
+
 function telegramApprovalStatus(_payload, deps = {}) {
   if (!deps || typeof deps.getTelegramApprovalStatus !== "function") {
     return { status: "error", message: "telegramApproval.status requires getTelegramApprovalStatus dep" };
@@ -1381,6 +1482,15 @@ const commandRegistry = {
   "telegramApproval.status": telegramApprovalStatus,
   "telegramApproval.tokenInfo": telegramApprovalTokenInfo,
   "telegramApproval.test": telegramApprovalSendTest,
+  "lineNotifications.setToken": lineNotificationsSetToken,
+  "lineNotifications.tokenInfo": lineNotificationsTokenInfo,
+  "lineNotifications.test": lineNotificationsSendTest,
+  "discordBot.setToken": discordBotSetToken,
+  "discordBot.tokenInfo": discordBotTokenInfo,
+  "discordBot.test": discordBotSendTest,
+  "discordBot.style.get": discordBotStyleGet,
+  "discordBot.style.save": discordBotStyleSave,
+  "discordBot.style.reset": discordBotStyleReset,
   "feishuApproval.setSecrets": feishuApprovalSetSecrets,
   "feishuApproval.status": feishuApprovalStatus,
   "feishuApproval.secretInfo": feishuApprovalSecretInfo,

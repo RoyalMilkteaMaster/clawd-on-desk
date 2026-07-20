@@ -19,6 +19,8 @@ const MENU_AFFECTING_KEYS = new Set([
   "size",
   "sessionAliases",
   "disableMiniMode",
+  "lineNotifications",
+  "discordBot",
 ]);
 
 function requiredDependency(value, name) {

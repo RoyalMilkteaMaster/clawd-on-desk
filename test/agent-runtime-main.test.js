@@ -133,6 +133,49 @@ describe("agent-runtime-main", () => {
     ]);
   });
 
+  it("lets suppressed JSONL session_meta attach Codex subagent HUD metadata", () => {
+    const instances = [];
+    const calls = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      isAgentEnabled: (agentId) => agentId === "codex",
+      updateSession: (...args) => calls.push(["update", ...args]),
+      clearCodexNotifyBubbles: (...args) => calls.push(["clear", ...args]),
+      codexSubagentClassifier: {},
+    });
+    const monitor = runtime.startCodexLogMonitor();
+
+    runtime.updateSessionFromServer("codex:sub", "working", "UserPromptSubmit", {
+      agentId: "codex",
+      hookSource: "codex-official",
+      headless: true,
+    });
+    monitor.emit("codex:sub", "idle", "session_meta", {
+      cwd: "D:\\AIPE03_final_project",
+      sessionTitle: "scene bundle validator · Linnaeus · AIPE03_final_project",
+      codexSource: "subagent",
+      headless: true,
+    });
+
+    assert.deepStrictEqual(calls, [
+      ["update", "codex:sub", "working", "UserPromptSubmit", {
+        agentId: "codex",
+        hookSource: "codex-official",
+        headless: true,
+      }],
+      ["update", "codex:sub", "idle", "session_meta", {
+        cwd: "D:\\AIPE03_final_project",
+        agentId: "codex",
+        sessionTitle: "scene bundle validator · Linnaeus · AIPE03_final_project",
+        codexSource: "subagent",
+        headless: true,
+        preserveState: true,
+      }],
+    ]);
+  });
+
   it("handles JSONL token_count as metadata without clearing bubbles or changing state", () => {
     const instances = [];
     const calls = [];

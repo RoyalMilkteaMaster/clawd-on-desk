@@ -31,6 +31,14 @@ const {
   normalizeDiscordPresence,
 } = require("./discord-presence-settings");
 const {
+  cloneDefaultLineNotifications,
+  normalizeLineNotifications,
+} = require("./line-notification-settings");
+const {
+  cloneDefaultDiscordBot,
+  normalizeDiscordBot,
+} = require("./discord-bot-settings");
+const {
   cloneDefaultFeishuApproval,
   normalizeFeishuApproval,
 } = require("./feishu-approval-settings");
@@ -337,6 +345,16 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => cloneDefaultDiscordPresence(),
     normalize: normalizeDiscordPresence,
+  },
+  lineNotifications: {
+    type: "object",
+    defaultFactory: () => cloneDefaultLineNotifications(),
+    normalize: normalizeLineNotifications,
+  },
+  discordBot: {
+    type: "object",
+    defaultFactory: () => cloneDefaultDiscordBot(),
+    normalize: normalizeDiscordBot,
   },
   feishuApproval: {
     type: "object",

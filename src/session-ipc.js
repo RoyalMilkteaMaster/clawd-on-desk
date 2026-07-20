@@ -14,6 +14,7 @@ function registerSessionIpc(options = {}) {
   const setSessionAlias = requiredDependency(options.setSessionAlias, "setSessionAlias");
   const showDashboard = requiredDependency(options.showDashboard, "showDashboard");
   const setSessionHudPinned = requiredDependency(options.setSessionHudPinned, "setSessionHudPinned");
+  const setSessionHudTooltipVisible = requiredDependency(options.setSessionHudTooltipVisible, "setSessionHudTooltipVisible");
   const ackSessionCompletion = requiredDependency(options.ackSessionCompletion, "ackSessionCompletion");
   const disposers = [];
 
@@ -41,6 +42,7 @@ function registerSessionIpc(options = {}) {
   );
   on("session-hud:open-dashboard", () => showDashboard({ source: "hud" }));
   on("session-hud:set-pinned", (_event, value) => setSessionHudPinned(!!value));
+  on("session-hud:set-tooltip-visible", (_event, value) => setSessionHudTooltipVisible(!!value));
 
   on("settings:open-dashboard", () => showDashboard({ source: "settings" }));
   on("show-dashboard", () => showDashboard());

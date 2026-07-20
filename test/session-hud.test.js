@@ -8,6 +8,7 @@ const {
   computeSessionHudBounds,
   computeHudLayout,
   computeHudHeight,
+  computeHudDisplayHeight,
   getHudWidth,
   getHudWidthScale,
   computeHudOuterWidth,
@@ -241,101 +242,59 @@ describe("session HUD geometry", () => {
 });
 
 describe("session HUD layout", () => {
-  it("expands sessions up to the cap without folding", () => {
-    const sessions = [
-      mkSession("a"),
-      mkSession("b"),
-      mkSession("c"),
-    ];
-    const snapshot = { sessions, orderedIds: ["a", "b", "c"] };
-    const { expanded, folded, rowCount } = computeHudLayout(snapshot);
-    assert.deepStrictEqual(expanded.map((s) => s.id), ["a", "b", "c"]);
-    assert.strictEqual(folded.length, 0);
-    assert.strictEqual(rowCount, 3);
-  });
-
-  it("folds sessions beyond the 5-row label cap", () => {
-    const sessions = [];
-    const orderedIds = [];
-    for (let i = 0; i < 7; i++) {
-      sessions.push(mkSession(`s${i}`));
-      orderedIds.push(`s${i}`);
-    }
-    const { expanded, folded, rowCount } = computeHudLayout({ sessions, orderedIds });
-    assert.strictEqual(expanded.length, constants.HUD_MAX_EXPANDED_ROWS_LABELS);
-    assert.strictEqual(folded.length, 7 - constants.HUD_MAX_EXPANDED_ROWS_LABELS);
-    assert.strictEqual(rowCount, constants.HUD_MAX_EXPANDED_ROWS_LABELS + 1);
-  });
-
-  it("folds sessions beyond the 3-row cap when state labels are hidden", () => {
-    const sessions = [];
-    const orderedIds = [];
-    for (let i = 0; i < 5; i++) {
-      sessions.push(mkSession(`s${i}`));
-      orderedIds.push(`s${i}`);
-    }
-    const { expanded, folded, rowCount } = computeHudLayout(
-      { sessions, orderedIds },
-      { showStateLabels: false }
-    );
-    assert.strictEqual(expanded.length, constants.HUD_MAX_EXPANDED_ROWS);
-    assert.strictEqual(folded.length, 5 - constants.HUD_MAX_EXPANDED_ROWS);
-    assert.strictEqual(rowCount, constants.HUD_MAX_EXPANDED_ROWS + 1);
-  });
-
-  it("respects orderedIds for picking the expanded set (most recent first)", () => {
-    const sessions = [
-      mkSession("old"),
-      mkSession("newest"),
-      mkSession("middle"),
-      mkSession("oldest"),
-    ];
-    const orderedIds = ["newest", "middle", "old", "oldest"];
-    const { expanded, folded } = computeHudLayout({ sessions, orderedIds }, { showStateLabels: false });
-    assert.deepStrictEqual(expanded.map((s) => s.id), ["newest", "middle", "old"]);
-    assert.deepStrictEqual(folded.map((s) => s.id), ["oldest"]);
-  });
-
-  it("excludes headless sessions from both expanded and folded counts", () => {
-    const sessions = [
-      mkSession("visible"),
-      mkSession("hidden", { headless: true }),
-    ];
+  it("shows up to five ordered sessions when state labels are enabled", () => {
+    const sessions = Array.from({ length: 7 }, (_, i) => mkSession(`s${i}`));
     const { expanded, folded, rowCount } = computeHudLayout({
       sessions,
-      orderedIds: ["visible", "hidden"],
+      orderedIds: ["s3", "s1", "s0", "s2", "s4", "s5", "s6"],
     });
-    assert.deepStrictEqual(expanded.map((s) => s.id), ["visible"]);
+    assert.deepStrictEqual(expanded.map((session) => session.id), ["s3", "s1", "s0", "s2", "s4"]);
+    assert.deepStrictEqual(folded.map((session) => session.id), ["s5", "s6"]);
+    assert.strictEqual(rowCount, 6);
+  });
+
+  it("shows up to three ordered sessions when state labels are disabled", () => {
+    const sessions = Array.from({ length: 5 }, (_, i) => mkSession(`s${i}`));
+    const { expanded, folded, rowCount } = computeHudLayout(
+      { sessions },
+      { showStateLabels: false }
+    );
+    assert.deepStrictEqual(expanded.map((session) => session.id), ["s0", "s1", "s2"]);
+    assert.deepStrictEqual(folded.map((session) => session.id), ["s3", "s4"]);
+    assert.strictEqual(rowCount, 4);
+  });
+
+  it("excludes all headless sessions, including Codex subagents", () => {
+    const sessions = [
+      mkSession("visible"),
+      mkSession("subagent", { headless: true, codexSource: "subagent" }),
+      mkSession("other-headless", { headless: true }),
+    ];
+    const { expanded, folded, rowCount } = computeHudLayout({ sessions });
+    assert.deepStrictEqual(expanded.map((session) => session.id), ["visible"]);
     assert.strictEqual(folded.length, 0);
     assert.strictEqual(rowCount, 1);
   });
 
-  it("excludes hidden sessions from both expanded and folded counts", () => {
+  it("excludes hidden and sleeping sessions", () => {
     const sessions = [
       mkSession("visible"),
       mkSession("hidden", { hiddenFromHud: true }),
+      mkSession("sleeping", { state: "sleeping" }),
     ];
-    const { expanded, folded, rowCount } = computeHudLayout({
-      sessions,
-      orderedIds: ["visible", "hidden"],
-    });
-    assert.deepStrictEqual(expanded.map((s) => s.id), ["visible"]);
+    const { expanded, folded, rowCount } = computeHudLayout({ sessions });
+    assert.deepStrictEqual(expanded.map((session) => session.id), ["visible"]);
     assert.strictEqual(folded.length, 0);
     assert.strictEqual(rowCount, 1);
   });
 
-  it("includes done idle sessions but excludes sleeping sessions", () => {
+  it("includes completed idle sessions", () => {
     const sessions = [
       mkSession("working", { state: "working" }),
       mkSession("done", { state: "idle", badge: "done" }),
-      mkSession("sleeping", { state: "sleeping" }),
     ];
-    const { expanded, folded, rowCount } = computeHudLayout({
-      sessions,
-      orderedIds: ["done", "working", "sleeping"],
-    });
-    assert.deepStrictEqual(expanded.map((s) => s.id), ["done", "working"]);
-    assert.strictEqual(folded.length, 0);
+    const { expanded, rowCount } = computeHudLayout({ sessions, orderedIds: ["done", "working"] });
+    assert.deepStrictEqual(expanded.map((session) => session.id), ["done", "working"]);
     assert.strictEqual(rowCount, 2);
   });
 
@@ -349,11 +308,19 @@ describe("session HUD layout", () => {
   it("computeHudHeight multiplies row count by row height", () => {
     assert.strictEqual(
       computeHudHeight(3),
-      constants.HUD_ROW_HEIGHT * 3
-        + constants.HUD_BORDER_Y
+      constants.HUD_ROW_HEIGHT * 3 + constants.HUD_BORDER_Y
     );
     assert.strictEqual(computeHudHeight(0), constants.HUD_ROW_HEIGHT);
     assert.strictEqual(computeHudHeight(-1), constants.HUD_ROW_HEIGHT);
+  });
+
+  it("adds tooltip space without changing the base HUD height", () => {
+    const base = computeHudDisplayHeight(3, false);
+    assert.strictEqual(base, computeHudHeight(3));
+    assert.strictEqual(
+      computeHudDisplayHeight(3, true),
+      base + constants.HUD_TOOLTIP_HEIGHT
+    );
   });
 });
 

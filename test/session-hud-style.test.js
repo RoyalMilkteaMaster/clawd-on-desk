@@ -55,7 +55,34 @@ describe("session HUD visual shell", () => {
     assert.match(sessionHudRenderer, /HUD_TITLE_MAX_UNITS\s*=\s*15/);
     assert.match(sessionHudRenderer, /function shortenHudTitle\(value\)/);
     assert.match(sessionHudRenderer, /title\.textContent = shortTitle/);
-    assert.match(sessionHudRenderer, /title\.title = fullTitle/);
+    assert.doesNotMatch(sessionHudRenderer, /title\.title = fullTitle/);
+  });
+
+  it("uses the cwd project name instead of a generic Codex label", () => {
+    assert.match(sessionHudRenderer, /String\(title\)\.trim\(\)\.toLowerCase\(\) === "codex"/);
+    assert.match(sessionHudRenderer, /String\(session\.cwd \|\| ""\)/);
+    assert.match(sessionHudRenderer, /return parts\[parts\.length - 1\]/);
+  });
+
+  it("restores the original HUD rule that excludes every headless session", () => {
+    assert.match(sessionHudRenderer, /!!session && !session\.headless/);
+    assert.doesNotMatch(sessionHudRenderer, /codexSource === "subagent"/);
+  });
+
+  it("renders the original ordered session rows without project grouping", () => {
+    assert.match(sessionHudRenderer, /const sessions = orderedHudSessions\(snapshot\)/);
+    assert.match(sessionHudRenderer, /createRowForSession\(session, now\)/);
+    assert.doesNotMatch(sessionHudRenderer, /primarySession|project\.children|openProjectMenu/);
+  });
+
+  it("keeps a custom full-title and cwd card visible for the whole hover", () => {
+    assert.match(sessionHudHtml, /\.row-tooltip\s*\{/);
+    assert.match(sessionHudHtml, /\.row\.tooltip-active > \.row-tooltip/);
+    assert.match(sessionHudRenderer, /path\.textContent = cwd/);
+    assert.match(sessionHudRenderer, /row\.addEventListener\("mouseenter"/);
+    assert.match(sessionHudRenderer, /row\.addEventListener\("mouseleave"/);
+    assert.match(sessionHudRenderer, /if \(hoveredSessionId\) return/);
+    assert.match(sessionHudRenderer, /sessionHudAPI\.setTooltipVisible\(true\)/);
   });
 
   it("updates elapsed labels without rebuilding animated rows every second", () => {

@@ -13,6 +13,9 @@ const SIDEBAR_TABS = [
   { id: "shortcuts", labelKey: "sidebarShortcuts", available: true },
   { id: "telegram-approval", labelKey: "sidebarTelegramApproval", available: true },
   { id: "discord-presence", labelKey: "sidebarDiscordPresence", available: true },
+  { id: "discord-bot", labelKey: "sidebarDiscordBot", available: true },
+  { id: "notification-replies", labelKey: "notificationRepliesTitle", available: true },
+  { id: "line-notifications", labelKey: "sidebarLineNotifications", available: true },
   { id: "remote-ssh", labelKey: "sidebarRemoteSsh", available: true },
   { id: "about", labelKey: "sidebarAbout", available: true },
 ];
@@ -91,6 +94,8 @@ globalThis.ClawdSettingsTabAnimOverrides.init(core);
 globalThis.ClawdSettingsTabShortcuts.init(core);
 if (globalThis.ClawdSettingsTabTelegramApproval) globalThis.ClawdSettingsTabTelegramApproval.init(core);
 if (globalThis.ClawdSettingsTabDiscordPresence) globalThis.ClawdSettingsTabDiscordPresence.init(core);
+if (globalThis.ClawdSettingsTabDiscordBot) globalThis.ClawdSettingsTabDiscordBot.init(core);
+if (globalThis.ClawdSettingsTabLineNotifications) globalThis.ClawdSettingsTabLineNotifications.init(core);
 globalThis.ClawdSettingsTabAbout.init(core);
 if (globalThis.ClawdSettingsTabRemoteSsh) globalThis.ClawdSettingsTabRemoteSsh.init(core);
 if (globalThis.ClawdSettingsTabMobile) globalThis.ClawdSettingsTabMobile.init(core);

@@ -7,6 +7,7 @@ const RECENT_DONE_UNREAD_MS = 60 * 1000;
 
 let snapshot = { sessions: [], orderedIds: [], hudTotalNonIdle: 0, hudLastTitle: null, hudShowStateLabels: true, hudShowElapsed: true, hudShowContextUsage: true, hudPinned: false };
 let i18nPayload = { lang: "en", translations: {} };
+let hoveredSessionId = null;
 
 const unreadSessions = new Set();
 const prevBadges = new Map();
@@ -53,7 +54,12 @@ function formatTokenCount(value) {
 }
 
 function titleFor(session) {
-  return session.displayTitle || session.sessionTitle || session.id || "";
+  const title = session.displayTitle || session.sessionTitle || "";
+  if (String(title).trim().toLowerCase() === "codex") {
+    const parts = String(session.cwd || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return title || session.id || "";
 }
 
 function titleUnits(value) {
@@ -210,13 +216,34 @@ function focusUnavailableTooltip(session) {
     : t("sessionHudFocusUnavailableTooltip");
 }
 
+function createRowTooltip(session) {
+  const fullTitle = String(titleFor(session) || "").trim();
+  const cwd = String(session && session.cwd || "").trim();
+  if (!fullTitle && !cwd) return null;
+  const tooltip = document.createElement("div");
+  tooltip.className = "row-tooltip";
+  tooltip.setAttribute("aria-hidden", "true");
+  if (fullTitle) {
+    const title = document.createElement("div");
+    title.className = "row-tooltip-title";
+    title.textContent = fullTitle;
+    tooltip.appendChild(title);
+  }
+  if (cwd) {
+    const path = document.createElement("div");
+    path.className = "row-tooltip-path";
+    path.textContent = cwd;
+    tooltip.appendChild(path);
+  }
+  return tooltip;
+}
+
 function createRowForSession(session, now) {
   const row = document.createElement("div");
   row.className = "row";
   const canFocus = session.canFocus === true;
   if (!canFocus) {
     row.classList.add("row-unfocusable");
-    row.title = focusUnavailableTooltip(session);
   }
 
   const left = document.createElement("div");
@@ -248,7 +275,6 @@ function createRowForSession(session, now) {
   const shortTitle = shortenHudTitle(fullTitle);
   title.className = "title";
   title.textContent = shortTitle;
-  if (shortTitle && shortTitle !== fullTitle) title.title = fullTitle;
   left.appendChild(title);
 
   const showElapsed = snapshot.hudShowElapsed !== false;
@@ -305,8 +331,25 @@ function createRowForSession(session, now) {
 
   row.appendChild(left);
   if (hasRightContent) row.appendChild(right);
+  const tooltip = createRowTooltip(session);
+  if (tooltip) {
+    row.appendChild(tooltip);
+    row.addEventListener("mouseenter", () => {
+      hoveredSessionId = session.id;
+      row.classList.add("tooltip-active");
+      window.sessionHudAPI.setTooltipVisible(true);
+    });
+    row.addEventListener("mouseleave", () => {
+      hoveredSessionId = null;
+      row.classList.remove("tooltip-active");
+      window.sessionHudAPI.setTooltipVisible(false);
+      render();
+    });
+  }
 
   row.addEventListener("click", () => {
+    hoveredSessionId = null;
+    window.sessionHudAPI.setTooltipVisible(false);
     unreadSessions.delete(session.id);
     render();
     if (canFocus) window.sessionHudAPI.focusSession(session.id);
@@ -319,7 +362,6 @@ function createRowForSession(session, now) {
       });
     }
   });
-
   return row;
 }
 
@@ -364,15 +406,16 @@ function createPinButton(pinned) {
 }
 
 function render() {
+  if (hoveredSessionId) return;
   const sessions = orderedHudSessions(snapshot);
   updateUnread(sessions);
   hudEl.replaceChildren();
   hudEl.classList.add("has-pin");
+  hudEl.classList.toggle("tooltip-above", snapshot.hudFlippedAbove === true);
   if (!sessions.length) return;
 
   const now = Date.now();
   const { expanded, folded } = splitHudLayout(sessions);
-
   for (const session of expanded) {
     hudEl.appendChild(createRowForSession(session, now));
   }

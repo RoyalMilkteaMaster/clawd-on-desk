@@ -311,7 +311,9 @@ function buildSessionSnapshot(sessions, options = {}) {
   const orderedIds = dashboardEntries.map((entry) => entry.id);
   const menuOrderedIds = menuEntries.map((entry) => entry.id);
   const hudEntries = dashboardEntries.filter((entry) =>
-    !entry.headless && entry.state !== "sleeping" && !entry.hiddenFromHud
+    (!entry.headless || entry.codexSource === "subagent")
+      && entry.state !== "sleeping"
+      && !entry.hiddenFromHud
   );
 
   const groupMap = new Map();

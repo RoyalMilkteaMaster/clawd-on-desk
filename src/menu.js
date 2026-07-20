@@ -192,6 +192,12 @@ module.exports = function initMenu(ctx) {
         checked: !ctx.soundMuted,
         click: (menuItem) => { ctx.soundMuted = !menuItem.checked; },
       },
+      {
+        label: t("lineMobileNotifications"),
+        type: "checkbox",
+        checked: !!ctx.lineNotificationsEnabled,
+        click: (menuItem) => { ctx.lineNotificationsEnabled = menuItem.checked; },
+      },
     ];
 
     // Dashboard + the danger auto-approve toggle (danger last, as in the

@@ -66,6 +66,9 @@ function createHarness(overrides = {}) {
     setSessionHudPinned: overrides.setSessionHudPinned || ((value) => {
       calls.push(["setSessionHudPinned", value]);
     }),
+    setSessionHudTooltipVisible: overrides.setSessionHudTooltipVisible || ((value) => {
+      calls.push(["setSessionHudTooltipVisible", value]);
+    }),
     ackSessionCompletion: overrides.ackSessionCompletion || ((sessionId) => {
       calls.push(["ackSessionCompletion", sessionId]);
       return true;
@@ -90,6 +93,7 @@ test("session IPC registers owned channels and disposes them", () => {
     "session-hud:focus-session",
     "session-hud:open-dashboard",
     "session-hud:set-pinned",
+    "session-hud:set-tooltip-visible",
     "settings:open-dashboard",
     "show-dashboard",
   ]);
@@ -118,6 +122,8 @@ test("session IPC delegates dashboard and HUD behavior", async () => {
   ipcMain.send("session-hud:focus-session", "hud-session");
   ipcMain.send("session-hud:set-pinned", true);
   ipcMain.send("session-hud:set-pinned", 0);
+  ipcMain.send("session-hud:set-tooltip-visible", true);
+  ipcMain.send("session-hud:set-tooltip-visible", 0);
   assert.deepStrictEqual(await ipcMain.invoke("dashboard:hide-session", "hidden-session"), {
     status: "ok",
     hidden: "hidden-session",
@@ -132,6 +138,8 @@ test("session IPC delegates dashboard and HUD behavior", async () => {
     ["focusSession", "hud-session", { requestSource: "hud" }],
     ["setSessionHudPinned", true],
     ["setSessionHudPinned", false],
+    ["setSessionHudTooltipVisible", true],
+    ["setSessionHudTooltipVisible", false],
     ["hideSession", "hidden-session"],
     ["setSessionAlias", { sessionId: "s1", alias: "Frontend" }],
   ]);
@@ -199,6 +207,7 @@ test("registerSessionIpc requires ackSessionCompletion dep", () => {
       setSessionAlias: () => {},
       showDashboard: () => {},
       setSessionHudPinned: () => {},
+      setSessionHudTooltipVisible: () => {},
       // ackSessionCompletion intentionally absent
     }),
     /ackSessionCompletion/

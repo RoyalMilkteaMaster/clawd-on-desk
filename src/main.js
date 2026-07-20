@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, powerMonitor, clipboard } = require("electron");
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, powerMonitor, clipboard, net } = require("electron");
 // ── Linux/Wayland: relaunch under XWayland so the pet is draggable (issue #441) ──
 // Native Wayland ignores client-side window positioning and blocks global cursor
 // queries, so the pet spawns centered, can't be dragged, and has no tracking;
@@ -93,6 +93,13 @@ const { createTelegramApprovalSidecar } = require("./telegram-approval-sidecar")
 const telegramApprovalSettings = require("./telegram-approval-settings");
 const discordPresenceSettings = require("./discord-presence-settings");
 const { createDiscordPresenceBridge } = require("./discord-presence-rpc");
+const lineNotificationSettings = require("./line-notification-settings");
+const lineNotificationStyle = require("./line-notification-style");
+const { createLineNotificationClient } = require("./line-notification-client");
+const { createLineCompanion, createNotificationCompanion } = require("./line-companion");
+const discordBotSettings = require("./discord-bot-settings");
+const { createDiscordBotClient } = require("./discord-bot-client");
+const { extractLastUserPromptTitleFromTranscript } = require("../hooks/codex-assistant-output");
 const { FeishuApprovalClient } = require("./feishu-approval-client");
 const feishuApprovalSettings = require("./feishu-approval-settings");
 const {
@@ -251,6 +258,9 @@ const {
 } = require("./bubble-policy");
 const loginItemHelpers = require("./login-item");
 const PREFS_PATH = path.join(app.getPath("userData"), "clawd-prefs.json");
+const LINE_TOKEN_PATH = lineNotificationSettings.tokenFilePath(app.getPath("userData"));
+const DISCORD_BOT_TOKEN_PATH = discordBotSettings.tokenFilePath(app.getPath("userData"));
+const NOTIFICATION_STYLE_PATH = lineNotificationStyle.styleFilePath(app.getPath("userData"));
 const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
 
 // Lazy helpers — these run inside the action `effect` callbacks at click time,
@@ -339,6 +349,10 @@ let telegramNativeRunner = null;
 let telegramCompanion = null;
 let telegramDirectSend = null;
 let discordPresenceBridge = null;
+let lineNotificationClient = null;
+let lineCompanion = null;
+let discordBotClient = null;
+let discordBotCompanion = null;
 let suppressTelegramApprovalSidecarSync = 0;
 let feishuApprovalClient = null;
 let feishuApprovalSyncPromise = Promise.resolve();
@@ -398,6 +412,15 @@ const _settingsController = createSettingsController({
     getTelegramApprovalStatus: () => getTelegramApprovalStatus(),
     getTelegramApprovalTokenInfo: () => getTelegramApprovalTokenInfo(),
     sendTelegramApprovalTest: () => sendTelegramApprovalTest(),
+    writeLineNotificationToken: (token) => writeLineNotificationToken(token),
+    getLineNotificationTokenInfo: () => getLineNotificationTokenInfo(),
+    sendLineNotificationTest: () => sendLineNotificationTest(),
+    writeDiscordBotToken: (token) => writeDiscordBotToken(token),
+    getDiscordBotTokenInfo: () => getDiscordBotTokenInfo(),
+    sendDiscordBotTest: () => sendDiscordBotTest(),
+    getNotificationStyle: () => lineNotificationStyle.readStyle(NOTIFICATION_STYLE_PATH),
+    writeNotificationStyle: (style) => lineNotificationStyle.writeStyle(NOTIFICATION_STYLE_PATH, style),
+    resetNotificationStyle: () => lineNotificationStyle.resetStyle(NOTIFICATION_STYLE_PATH),
     writeFeishuApprovalSecrets: (secrets) => writeFeishuApprovalSecrets(secrets),
     getFeishuApprovalStatus: () => getFeishuApprovalStatus(),
     getFeishuApprovalSecretInfo: () => getFeishuApprovalSecretInfo(),
@@ -1399,7 +1422,11 @@ const _permCtx = {
       ? [{ name: "feishu", client }]
       : [];
   },
+  onPermissionAdded: (permEntry) => {
+    if (lineCompanion) lineCompanion.onPermissionAdded(permEntry);
+  },
   onPermissionResolved: (permEntry, options = {}) => {
+    if (lineCompanion) lineCompanion.onPermissionResolved(permEntry);
     if (!_state || typeof _state.clearPermissionNotification !== "function") return;
     _state.clearPermissionNotification(permEntry && permEntry.sessionId, options);
   },
@@ -1551,6 +1578,12 @@ const _stateCtx = {
     if (telegramCompanion) {
       try { telegramCompanion.onSnapshot(snapshot); } catch {}
     }
+    if (lineCompanion) {
+      try { lineCompanion.onSnapshot(snapshot); } catch {}
+    }
+    if (discordBotCompanion) {
+      try { discordBotCompanion.onSnapshot(snapshot); } catch {}
+    }
     if (discordPresenceBridge) {
       try { discordPresenceBridge.onSnapshot(snapshot); } catch {}
     }
@@ -1598,6 +1631,8 @@ const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride
         startWakePoll, stopWakePoll, detectRunningAgentProcesses,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
+initLineNotifications();
+initDiscordBotNotifications();
 
 // ── Keep-awake: block OS sleep while any agent task is in progress ──
 // State→in-progress mapping lives in state-session-snapshot.isSessionInProgress
@@ -2085,6 +2120,159 @@ function feishuApprovalLog(level, message, meta = {}) {
     }
   }
   permLog(parts.filter(Boolean).join(" | "));
+}
+
+function getLineNotificationPrefs() {
+  return lineNotificationSettings.normalizeLineNotifications(
+    _settingsController.get("lineNotifications")
+  );
+}
+
+function getLineNotificationToken() {
+  return lineNotificationSettings.readTokenFile(LINE_TOKEN_PATH);
+}
+
+function writeLineNotificationToken(token) {
+  return lineNotificationSettings.writeTokenFile(LINE_TOKEN_PATH, token);
+}
+
+function getLineNotificationTokenInfo() {
+  const token = getLineNotificationToken();
+  return {
+    configured: !!token,
+    masked: lineNotificationSettings.maskToken(token),
+  };
+}
+
+function lineNotificationLog(level, message, meta = {}) {
+  const parts = [`LINE notification ${level}: ${message}`];
+  for (const key of ["kind", "sessionId", "errorClass"]) {
+    const value = meta && meta[key];
+    if (value !== undefined && value !== null && value !== "") parts.push(`${key}=${value}`);
+  }
+  permLog(parts.join(" | "));
+}
+
+function getNotificationTaskTitle(entry) {
+  if (!entry || entry.agentId !== "codex") return "";
+  const session = sessions.get(entry.id);
+  return extractLastUserPromptTitleFromTranscript(session && session.transcriptPath);
+}
+
+function initLineNotifications() {
+  if (!lineNotificationClient) {
+    lineNotificationClient = createLineNotificationClient({
+      getToken: () => getLineNotificationToken(),
+      getUserId: () => getLineNotificationPrefs().userId,
+      fetchImpl: (...args) => net.fetch(...args),
+    });
+  }
+  if (!lineCompanion) {
+    lineCompanion = createLineCompanion({
+      getClient: () => lineNotificationClient,
+      getConfig: () => getLineNotificationPrefs(),
+      getLang: () => _settingsController.get("lang") || lang || "en",
+      getStyle: () => lineNotificationStyle.readStyle(NOTIFICATION_STYLE_PATH),
+      getTaskTitle: getNotificationTaskTitle,
+      log: lineNotificationLog,
+    });
+  }
+  return lineCompanion;
+}
+
+async function sendLineNotificationTest() {
+  initLineNotifications();
+  const config = getLineNotificationPrefs();
+  if (!lineNotificationSettings.LINE_USER_ID_RE.test(config.userId)) {
+    return { status: "error", message: "Save a valid LINE user ID first" };
+  }
+  if (!getLineNotificationToken()) {
+    return { status: "error", message: "Save a LINE channel access token first" };
+  }
+  const message = (_settingsController.get("lang") === "zh-TW")
+    ? "Clawd LINE 通知測試成功"
+    : "Clawd LINE notification test succeeded";
+  const result = await lineNotificationClient.sendNotification(message);
+  if (result && result.ok === true) return { status: "ok" };
+  const errorClass = result && result.errorClass ? result.errorClass : "unknown";
+  const detail = errorClass === "401" ? "Channel access token was rejected"
+    : (errorClass === "429" ? "LINE message limit or API rate limit reached"
+      : (errorClass === "timeout" ? "LINE request timed out" : `LINE delivery failed (${errorClass})`));
+  return { status: "error", message: detail };
+}
+
+function getDiscordBotPrefs() {
+  return discordBotSettings.normalizeDiscordBot(_settingsController.get("discordBot"));
+}
+
+function getDiscordBotToken() {
+  return discordBotSettings.readTokenFile(DISCORD_BOT_TOKEN_PATH);
+}
+
+function writeDiscordBotToken(token) {
+  return discordBotSettings.writeTokenFile(DISCORD_BOT_TOKEN_PATH, token);
+}
+
+function getDiscordBotTokenInfo() {
+  const token = getDiscordBotToken();
+  return {
+    configured: !!token,
+    masked: discordBotSettings.maskToken(token),
+  };
+}
+
+function discordBotLog(level, message, meta = {}) {
+  const parts = [`Discord bot ${level}: ${message}`];
+  for (const key of ["kind", "sessionId", "errorClass"]) {
+    const value = meta && meta[key];
+    if (value !== undefined && value !== null && value !== "") parts.push(`${key}=${value}`);
+  }
+  permLog(parts.join(" | "));
+}
+
+function initDiscordBotNotifications() {
+  if (!discordBotClient) {
+    discordBotClient = createDiscordBotClient({
+      getToken: () => getDiscordBotToken(),
+      getChannelId: () => getDiscordBotPrefs().channelId,
+      fetchImpl: (...args) => net.fetch(...args),
+    });
+  }
+  if (!discordBotCompanion) {
+    discordBotCompanion = createNotificationCompanion({
+      getClient: () => discordBotClient,
+      getConfig: () => getDiscordBotPrefs(),
+      getLang: () => _settingsController.get("lang") || lang || "en",
+      getStyle: () => lineNotificationStyle.readStyle(NOTIFICATION_STYLE_PATH),
+      getTaskTitle: getNotificationTaskTitle,
+      transportName: "Discord",
+      log: discordBotLog,
+    });
+  }
+  return discordBotCompanion;
+}
+
+async function sendDiscordBotTest() {
+  initDiscordBotNotifications();
+  const config = getDiscordBotPrefs();
+  if (!discordBotSettings.DISCORD_SNOWFLAKE_RE.test(config.channelId)) {
+    return { status: "error", message: "Save a valid Discord channel ID first" };
+  }
+  if (!getDiscordBotToken()) {
+    return { status: "error", message: "Save a Discord bot token first" };
+  }
+  const message = (_settingsController.get("lang") === "zh-TW")
+    ? "Clawd Discord 通知測試成功"
+    : "Clawd Discord notification test succeeded";
+  const result = await discordBotClient.sendNotification(message);
+  if (result && result.ok === true) return { status: "ok" };
+  const errorClass = result && result.errorClass ? result.errorClass : "unknown";
+  const detail = errorClass === "401" ? "Discord bot token was rejected"
+    : (errorClass === "403" ? "Discord bot cannot send messages to this channel"
+      : (errorClass === "404" ? "Discord channel was not found"
+        : (errorClass === "429" ? "Discord API rate limit reached"
+          : (errorClass === "timeout" ? "Discord request timed out" : `Discord delivery failed (${errorClass})`))));
+  return { status: "error", message: detail };
 }
 
 function getTelegramApprovalPrefs() {
@@ -3025,6 +3213,13 @@ const _menuCtx = {
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
   get soundVolume() { return soundVolume; },
+  get lineNotificationsEnabled() { return getLineNotificationPrefs().enabled; },
+  set lineNotificationsEnabled(v) {
+    _settingsController.applyUpdate("lineNotifications", {
+      ...getLineNotificationPrefs(),
+      enabled: !!v,
+    });
+  },
   get pendingPermissions() { return pendingPermissions; },
   repositionBubbles: () => repositionFloatingBubbles(),
   get petHidden() { return petWindowRuntime.isPetHidden(); },
@@ -3453,6 +3648,7 @@ registerSessionIpc({
       console.warn("Clawd: failed to pin Session HUD:", result.message);
     }
   },
+  setSessionHudTooltipVisible: (value) => _sessionHud.setTooltipVisible(value),
   getLanWsServer: () => _lanWss,
 });
 
@@ -3976,6 +4172,11 @@ if (!gotTheLock) {
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
     sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
     focusDebugLog = path.join(app.getPath("userData"), "focus-debug.log");
+    try {
+      lineNotificationStyle.ensureStyleFile(NOTIFICATION_STYLE_PATH);
+    } catch (err) {
+      lineNotificationLog("warn", "Could not create style file", { errorClass: err && err.code });
+    }
     initTelegramMigrationController().catch((err) => {
       console.warn("Clawd: migration controller init failed:", err && err.message);
     });

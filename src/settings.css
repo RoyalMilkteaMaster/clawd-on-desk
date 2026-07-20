@@ -3356,8 +3356,93 @@ html, body {
   outline-offset: 1px;
   border-color: var(--accent);
 }
+
+.discord-style-editor-row {
+  display: grid;
+  gap: 18px;
+  align-items: stretch;
+}
+.discord-style-reply-block {
+  display: grid;
+  gap: 8px;
+}
+.discord-style-textarea {
+  width: 100%;
+  min-height: 108px;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  font: 13px/1.5 inherit;
+}
+.discord-style-textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+.discord-style-complete-list {
+  display: grid;
+  gap: 10px;
+}
+.discord-style-complete-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--panel-bg) 92%, var(--accent) 8%);
+}
+.discord-style-card-header,
+.discord-style-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.discord-style-card-number,
+.discord-style-variable-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.discord-style-variable-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.discord-style-variable {
+  padding: 4px 7px;
+  font-size: 11px;
+}
+.discord-style-preview-block {
+  display: grid;
+  gap: 6px;
+}
+.discord-style-preview {
+  min-height: 80px;
+  margin: 0;
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  font: 12px/1.5 inherit;
+}
+.discord-style-actions {
+  justify-content: flex-end;
+}
 .tg-approval-output-select {
   min-width: 180px;
+}
+
+.session-hud-project-select {
+  width: 280px;
+  max-width: 100%;
 }
 
 .feishu-approval-secrets-grid {
