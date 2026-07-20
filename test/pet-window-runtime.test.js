@@ -91,6 +91,8 @@ function createRuntime(overrides = {}) {
     getCurrentHitBox: () => overrides.hitBox || null,
     getMiniMode: () => overrides.miniMode || false,
     getMiniTransitioning: () => overrides.miniTransitioning || false,
+    moveMiniWindowForDrag: (snapshot, cursor) =>
+      calls.push(["moveMiniWindowForDrag", snapshot, cursor]),
     getMiniContainedSeam: () => overrides.miniContainedSeam || null,
     getMiniPeekOffset: () => 0,
     getCurrentPixelSize: () => overrides.currentPixelSize || { width: 100, height: 100 },
@@ -458,6 +460,19 @@ describe("pet-window-runtime", () => {
     ]);
     assert.ok(harness.calls.some((call) => call[0] === "reassertWinTopmost"));
     assert.ok(harness.calls.some((call) => call[0] === "repositionAnchoredSurfaces"));
+  });
+
+  it("routes mini drag movement through the mini runtime", () => {
+    let cursor = { x: 100, y: 100 };
+    const harness = createRuntime({ miniMode: true, cursor: () => cursor });
+
+    harness.runtime.setDragLocked(true);
+    harness.runtime.beginDragSnapshot();
+    cursor = { x: 120, y: 135 };
+    harness.runtime.moveWindowForDrag();
+
+    assert.equal(harness.calls.filter((call) => call[0] === "moveMiniWindowForDrag").length, 1);
+    assert.deepStrictEqual(harness.renderWin.calls, []);
   });
 
   it("preserves mini transition guards for drag and display changes", () => {

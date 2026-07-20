@@ -42,6 +42,8 @@ function registerPetInteractionIpc(options = {}) {
     "repositionFloatingBubbles"
   );
   const exitMiniMode = requiredDependency(options.exitMiniMode, "exitMiniMode");
+  const exitMiniModeForDrag = requiredDependency(options.exitMiniModeForDrag, "exitMiniModeForDrag");
+  const prepareMiniDrag = requiredDependency(options.prepareMiniDrag, "prepareMiniDrag");
   const getDisableMiniMode = options.getDisableMiniMode || (() => false);
   const getFocusableLocalHudSessionIds = requiredDependency(
     options.getFocusableLocalHudSessionIds,
@@ -91,6 +93,7 @@ function registerPetInteractionIpc(options = {}) {
     setDragLocked(!!locked);
     if (locked) {
       setMouseOverPet(true);
+      if (isMiniMode() && !isMiniTransitioning()) prepareMiniDrag();
       beginDragSnapshot();
     } else {
       clearDragSnapshot();
@@ -109,7 +112,15 @@ function registerPetInteractionIpc(options = {}) {
 
   on("drag-end", () => {
     try {
-      if (!isMiniMode() && !isMiniTransitioning()) {
+      if (isMiniMode() && !isMiniTransitioning()) {
+        if (hasPetWindow()) {
+          flushRuntimeStateToPrefs();
+          reassertWinTopmost();
+          scheduleHwndRecovery();
+          syncHitWin();
+          repositionFloatingBubbles();
+        }
+      } else if (!isMiniTransitioning()) {
         if (!getDisableMiniMode()) checkMiniModeSnap();
         if (isMiniMode() || isMiniTransitioning()) return;
         if (hasPetWindow()) {
@@ -139,6 +150,11 @@ function registerPetInteractionIpc(options = {}) {
 
   on("exit-mini-mode", () => {
     if (isMiniMode()) exitMiniMode();
+  });
+
+  on("detach-mini-for-drag", () => {
+    if (!isMiniMode()) return;
+    exitMiniModeForDrag();
   });
 
   on("pet-interaction:reveal-session-hud", () => {

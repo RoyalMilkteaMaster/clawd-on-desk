@@ -225,6 +225,32 @@ function miniPeekOut() {
   animateWindowX(currentMiniX, 200);
 }
 
+function prepareForDrag() {
+  if (!miniMode || miniTransitioning) return false;
+  if (!ctx.win || ctx.win.isDestroyed()) return false;
+
+  if (peekAnimTimer) {
+    clearTimeout(peekAnimTimer);
+    peekAnimTimer = null;
+  }
+  isAnimating = false;
+
+  const size = _getSize();
+  const bounds = ctx.win.getBounds();
+  const wa = lastMiniWorkArea
+    || ctx.getNearestWorkArea(currentMiniX + size.width / 2, bounds.y + size.height / 2);
+  const y = Math.max(wa.y, Math.min(bounds.y, wa.y + wa.height - size.height));
+  currentMiniX = calcMiniX(wa, size);
+  miniSnap = { y: Math.round(y), width: size.width, height: size.height };
+  ctx.win.setBounds({ x: currentMiniX, ...miniSnap });
+  refreshContainedBoundary(wa, miniSnap.y + size.height / 2);
+  syncContainedClip();
+  syncSessionHudVisibility();
+  ctx.syncHitWin();
+  if (typeof ctx.repositionBubbles === "function") ctx.repositionBubbles();
+  return true;
+}
+
 function getMiniStateFile(state) {
   const miniStates = ctx.theme && ctx.theme.miniMode && ctx.theme.miniMode.states;
   if (!miniStates) return null;
@@ -391,6 +417,46 @@ function enterMiniMode(wa, viaMenu, edge) {
   }
 }
 
+function finishMiniExit({ fromDrag = false } = {}) {
+  miniMode = false;
+  miniTransitioning = false;
+  containedBoundary = null;
+  ctx.sendToRenderer("mini-clip", null);
+  ctx.sendToRenderer("mini-mode-change", false);
+  ctx.sendToHitWin("hit-state-sync", { miniMode: false, miniEdge });
+  ctx.buildContextMenu();
+  ctx.buildTrayMenu();
+  syncSessionHudVisibility();
+  ctx.syncHitWin();
+
+  if (ctx.doNotDisturb) {
+    ctx.doNotDisturb = false;
+    ctx.sendToRenderer("dnd-change", false);
+    ctx.sendToHitWin("hit-state-sync", { dndEnabled: false });
+    ctx.buildContextMenu();
+    ctx.buildTrayMenu();
+    ctx.applyState(fromDrag ? ctx.resolveDisplayState() : "waking");
+  } else {
+    const resolved = ctx.resolveDisplayState();
+    ctx.applyState(resolved, ctx.getSvgOverride(resolved));
+  }
+
+  // #329: a deferred update bubble may be waiting on mini exit.
+  if (typeof ctx.notifyUpdaterSilentExit === "function") {
+    try { ctx.notifyUpdaterSilentExit(); } catch {}
+  }
+  return true;
+}
+
+function exitMiniModeForDrag() {
+  if (!miniMode) return false;
+  cancelMiniTransition();
+  miniSnap = null;
+  miniSleepPeeked = false;
+  miniPeeked = false;
+  return finishMiniExit({ fromDrag: true });
+}
+
 function exitMiniMode() {
   if (!miniMode) return;
   cancelMiniTransition();
@@ -423,32 +489,7 @@ function exitMiniMode() {
     clamped.x = wa.x - mEdge + SNAP_TOLERANCE + 100;
   }
 
-  animateWindowParabola(clamped.x, clamped.y, JUMP_DURATION, () => {
-    miniMode = false;
-    miniTransitioning = false;
-    containedBoundary = null;
-    ctx.sendToRenderer("mini-clip", null);
-    ctx.sendToRenderer("mini-mode-change", false);
-    ctx.sendToHitWin("hit-state-sync", { miniMode: false });
-    ctx.buildContextMenu();
-    ctx.buildTrayMenu();
-    syncSessionHudVisibility();
-    if (ctx.doNotDisturb) {
-      ctx.doNotDisturb = false;
-      ctx.sendToRenderer("dnd-change", false);
-      ctx.sendToHitWin("hit-state-sync", { dndEnabled: false });
-      ctx.buildContextMenu();
-      ctx.buildTrayMenu();
-      ctx.applyState("waking");
-    } else {
-      const resolved = ctx.resolveDisplayState();
-      ctx.applyState(resolved, ctx.getSvgOverride(resolved));
-    }
-    // #329: a deferred update bubble may be waiting on mini exit.
-    if (typeof ctx.notifyUpdaterSilentExit === "function") {
-      try { ctx.notifyUpdaterSilentExit(); } catch {}
-    }
-  });
+  animateWindowParabola(clamped.x, clamped.y, JUMP_DURATION, () => finishMiniExit());
 }
 
 function enterMiniViaMenu() {
@@ -542,6 +583,32 @@ function getContainedSeam() {
   return { boundary: containedBoundary, edge: miniEdge };
 }
 
+function moveWindowForDrag(dragSnapshot, cursor) {
+  if (!miniMode || miniTransitioning || isAnimating) return false;
+  if (!ctx.win || ctx.win.isDestroyed()) return false;
+  if (!dragSnapshot || !cursor) return false;
+
+  const width = miniSnap ? miniSnap.width : dragSnapshot.size.width;
+  const height = miniSnap ? miniSnap.height : dragSnapshot.size.height;
+  const targetY = dragSnapshot.bounds.y + (cursor.y - dragSnapshot.cursor.y);
+  const wa = lastMiniWorkArea
+    || ctx.getNearestWorkArea(currentMiniX + width / 2, targetY + height / 2);
+  const clampedY = Math.max(wa.y, Math.min(targetY, wa.y + wa.height - height));
+
+  miniSnap = { y: Math.round(clampedY), width, height };
+  ctx.win.setBounds({
+    x: currentMiniX,
+    y: miniSnap.y,
+    width: miniSnap.width,
+    height: miniSnap.height,
+  });
+  refreshContainedBoundary(wa, miniSnap.y + height / 2);
+  syncContainedClip();
+  syncSessionHudVisibility();
+  if (typeof ctx.repositionBubbles === "function") ctx.repositionBubbles();
+  return true;
+}
+
 function handleDisplayChange() {
   if (!ctx.win || ctx.win.isDestroyed()) return;
   if (!miniMode) return;
@@ -618,12 +685,12 @@ function cleanup() {
 }
 
 return {
-  enterMiniMode, exitMiniMode, enterMiniViaMenu,
-  miniPeekIn, miniPeekOut, checkMiniModeSnap, cancelMiniTransition,
+  enterMiniMode, exitMiniMode, exitMiniModeForDrag, enterMiniViaMenu,
+  miniPeekIn, miniPeekOut, prepareForDrag, checkMiniModeSnap, cancelMiniTransition,
   animateWindowX, animateWindowParabola,
   refreshTheme,
   syncContainedClip, getContainedSeam,
-  handleDisplayChange, handleResize, restoreFromPrefs,
+  moveWindowForDrag, handleDisplayChange, handleResize, restoreFromPrefs,
   getMiniMode, getMiniEdge, getMiniTransitioning, getMiniSleepPeeked, setMiniSleepPeeked, getMiniPeeked, setMiniPeeked,
   getIsAnimating, getPreMiniX, getPreMiniY, getCurrentMiniX, getMiniSnap,
   get MINI_OFFSET_RATIO() { return MINI_OFFSET_RATIO; },

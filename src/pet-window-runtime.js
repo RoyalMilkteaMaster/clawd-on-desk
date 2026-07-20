@@ -109,6 +109,7 @@ function createPetWindowRuntime(options = {}) {
   const getCurrentHitBox = options.getCurrentHitBox || (() => null);
   const getMiniMode = options.getMiniMode || (() => false);
   const getMiniTransitioning = options.getMiniTransitioning || (() => false);
+  const moveMiniWindowForDrag = options.moveMiniWindowForDrag || (() => false);
   const getMiniContainedSeam = options.getMiniContainedSeam || (() => null);
   const getMiniPeekOffset = options.getMiniPeekOffset || (() => 0);
   const getCurrentPixelSize = options.getCurrentPixelSize || (() => null);
@@ -797,13 +798,19 @@ function createPetWindowRuntime(options = {}) {
 
   function moveWindowForDrag() {
     if (!dragLocked) return;
-    if (getMiniMode() || getMiniTransitioning()) return;
+    if (getMiniTransitioning()) return;
     if (!isLiveWindow(getRenderWindow())) return;
     if (!dragSnapshot) return;
 
+    const cursor = getCursorScreenPoint();
+    if (getMiniMode()) {
+      moveMiniWindowForDrag(dragSnapshot, cursor);
+      return;
+    }
+
     const bounds = computeAnchoredDragBounds(
       dragSnapshot,
-      getCursorScreenPoint(),
+      cursor,
       looseClampPetToDisplays
     );
     if (!bounds) return;
