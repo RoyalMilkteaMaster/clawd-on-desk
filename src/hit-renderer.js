@@ -30,7 +30,7 @@ window.hitAPI.onStateSync((data) => {
   if (data.currentState !== undefined) currentState = data.currentState;
   if (data.miniMode !== undefined) {
     miniMode = data.miniMode;
-    area.style.cursor = miniMode ? "default" : "";
+    area.style.cursor = "";
   }
   if (data.dndEnabled !== undefined) dndEnabled = data.dndEnabled;
 });
@@ -38,11 +38,20 @@ window.hitAPI.onStateSync((data) => {
 // --- Drag state ---
 let isDragging = false;
 let didDrag = false;
-let mouseDownX, mouseDownY;
-let lastDragClientX;
+let dragStartedInMini = false;
+let mouseDownScreenX, mouseDownScreenY;
+let lastDragScreenX;
 let dragReactionDirection = null;
 let dragMoveRAF = null;
 const DRAG_THRESHOLD = 3;
+
+function getPointerScreenX(event) {
+  return Number.isFinite(event.screenX) ? event.screenX : event.clientX;
+}
+
+function getPointerScreenY(event) {
+  return Number.isFinite(event.screenY) ? event.screenY : event.clientY;
+}
 
 // --- Reaction state (tracked here to gate input) ---
 let isReacting = false;
@@ -74,13 +83,13 @@ function clearQueuedDragMove() {
 // --- Pointer handlers ---
 area.addEventListener("pointerdown", (e) => {
   if (e.button === 0) {
-    if (miniMode) { didDrag = false; return; }
     area.setPointerCapture(e.pointerId);
     isDragging = true;
     didDrag = false;
-    mouseDownX = e.clientX;
-    mouseDownY = e.clientY;
-    lastDragClientX = e.clientX;
+    dragStartedInMini = miniMode;
+    mouseDownScreenX = getPointerScreenX(e);
+    mouseDownScreenY = getPointerScreenY(e);
+    lastDragScreenX = mouseDownScreenX;
     dragReactionDirection = null;
     window.hitAPI.dragLock(true);
     area.classList.add("dragging");
@@ -89,18 +98,25 @@ area.addEventListener("pointerdown", (e) => {
 
 document.addEventListener("pointermove", (e) => {
   if (isDragging) {
+    const screenX = getPointerScreenX(e);
+    const screenY = getPointerScreenY(e);
+    const totalDx = screenX - mouseDownScreenX;
+    const totalDy = screenY - mouseDownScreenY;
     if (!didDrag) {
-      const totalDx = e.clientX - mouseDownX;
-      const totalDy = e.clientY - mouseDownY;
       if (Math.abs(totalDx) > DRAG_THRESHOLD || Math.abs(totalDy) > DRAG_THRESHOLD) {
         didDrag = true;
-        startDragReaction(totalDx < 0 ? "left" : (totalDx > 0 ? "right" : null));
+        const direction = totalDx < 0 ? "left" : (totalDx > 0 ? "right" : null);
+        if (dragStartedInMini) {
+          dragStartedInMini = false;
+          window.hitAPI.detachMiniForDrag();
+        }
+        startDragReaction(direction);
       }
-    } else {
-      const stepDx = e.clientX - lastDragClientX;
+    } else if (!dragStartedInMini) {
+      const stepDx = screenX - lastDragScreenX;
       if (stepDx !== 0) startDragReaction(stepDx < 0 ? "left" : "right");
     }
-    lastDragClientX = e.clientX;
+    lastDragScreenX = screenX;
     queueDragMove();
   }
 });
@@ -114,7 +130,8 @@ function stopDrag() {
   if (didDrag) {
     window.hitAPI.dragEnd();
   }
-  endDragReaction();
+  if (!dragStartedInMini) endDragReaction();
+  dragStartedInMini = false;
 }
 
 document.addEventListener("pointerup", (e) => {

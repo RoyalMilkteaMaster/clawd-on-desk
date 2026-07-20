@@ -189,7 +189,7 @@ function createAgentRuntimeMain(options = {}) {
           const metadataOptions = buildCodexMonitorUpdateOptions(extra, {
             includeHeadless: true,
           });
-          if (metadataOptions.contextUsage) {
+          if (metadataOptions.contextUsage || metadataOptions.codexSource === "subagent") {
             updateSession(sid, state, event, {
               ...metadataOptions,
               preserveState: true,

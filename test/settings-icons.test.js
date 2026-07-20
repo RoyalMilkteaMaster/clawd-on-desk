@@ -28,6 +28,9 @@ const SIDEBAR_TAB_IDS = [
   "shortcuts",
   "telegram-approval",
   "discord-presence",
+  "discord-bot",
+  "notification-replies",
+  "line-notifications",
   "remote-ssh",
   "about",
 ];

@@ -213,6 +213,49 @@ describe("mini mode entry timing", () => {
   });
 });
 
+describe("mini mode drag handoff", () => {
+  let loader;
+
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  });
+
+  afterEach(() => {
+    if (loader) loader.restore();
+    mock.timers.reset();
+    loader = null;
+  });
+
+  it("prepares a stable edge position and allows vertical movement before detach", () => {
+    loader = loadMiniWithElectron({
+      getAllDisplays() {
+        return [{ bounds: { x: 0, y: 0, width: 800, height: 600 }, workArea: { x: 0, y: 0, width: 800, height: 600 } }];
+      },
+    });
+    const ctx = makeCtx(cloneTheme(_defaultTheme), [], 600);
+    const mini = loader.initMini(ctx);
+
+    mini.enterMiniMode({ x: 0, y: 0, width: 800, height: 600 }, false, "right");
+    mock.timers.tick(120);
+    mock.timers.tick(1020);
+
+    assert.equal(mini.prepareForDrag(), true);
+    const start = ctx.getBoundsSnapshot();
+    const snapshot = {
+      cursor: { x: 700, y: 200 },
+      bounds: { x: start.x, y: start.y },
+      size: { width: start.width, height: start.height },
+    };
+
+    assert.equal(mini.moveWindowForDrag(snapshot, { x: 500, y: 340 }), true);
+    assert.equal(ctx.getBoundsSnapshot().x, mini.getCurrentMiniX());
+    assert.equal(ctx.getBoundsSnapshot().y, 320);
+    assert.equal(mini.exitMiniModeForDrag(), true);
+    assert.equal(mini.getMiniMode(), false);
+    assert.equal(mini.getMiniTransitioning(), false);
+  });
+});
+
 // Two displays tiled side by side: D1 [0,800) and D2 [800,1600), same height.
 const SIDE_BY_SIDE = [
   { bounds: { x: 0, y: 0, width: 800, height: 600 }, workArea: { x: 0, y: 0, width: 800, height: 600 } },

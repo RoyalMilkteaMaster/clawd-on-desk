@@ -2324,6 +2324,25 @@ describe("buildSessionSnapshot", () => {
     assert.strictEqual(snapshot.hudLastTitle, "interactive");
   });
 
+  it("includes identified Codex subagents in HUD aggregates while keeping them headless", () => {
+    api.sessions.set("codex:sub", rawSession("working", {
+      updatedAt: 3000,
+      cwd: "/tmp/AIPE03_final_project",
+      agentId: "codex",
+      headless: true,
+      codexSource: "subagent",
+      sessionTitle: "scene bundle validator · Linnaeus · AIPE03_final_project",
+    }));
+
+    const snapshot = api.buildSessionSnapshot();
+    const subagent = snapshot.sessions.find((session) => session.id === "codex:sub");
+
+    assert.strictEqual(subagent.headless, true);
+    assert.strictEqual(snapshot.hudTotalNonIdle, 1);
+    assert.strictEqual(snapshot.hudLastSessionId, "codex:sub");
+    assert.strictEqual(snapshot.hudLastTitle, "scene bundle validator · Linnaeus · AIPE03_final_project");
+  });
+
   it("keeps done idle interactive sessions in HUD aggregates", () => {
     api.sessions.set("done-local", rawSession("idle", {
       updatedAt: 3000,

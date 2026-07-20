@@ -872,6 +872,10 @@ function notifyPermissionResolved(permEntry, reason) {
 function addPendingPermission(permEntry, reason = "added") {
   pendingPermissions.push(permEntry);
   notifyPermissionsChanged(reason);
+  if (typeof ctx.onPermissionAdded === "function") {
+    try { ctx.onPermissionAdded(permEntry, reason); }
+    catch (err) { permLog(`onPermissionAdded failed: ${err && err.message ? err.message : err}`); }
+  }
   return permEntry;
 }
 

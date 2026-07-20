@@ -20,6 +20,7 @@ const HUD_ROW_HEIGHT = 28;
 const HUD_MAX_EXPANDED_ROWS = 3;
 const HUD_MAX_EXPANDED_ROWS_LABELS = 5;
 const HUD_HEIGHT = HUD_ROW_HEIGHT + HUD_BORDER_Y;
+const HUD_TOOLTIP_HEIGHT = 70;
 const HUD_WINDOW_SHELL = Object.freeze({
   top: 2,
   right: 3,
@@ -174,6 +175,10 @@ function computeHudHeight(rowCount) {
   return rowCount * HUD_ROW_HEIGHT + HUD_BORDER_Y;
 }
 
+function computeHudDisplayHeight(rowCount, tooltipVisible = false) {
+  return computeHudHeight(rowCount) + (tooltipVisible ? HUD_TOOLTIP_HEIGHT : 0);
+}
+
 function computeHudReservedOffset(cardHeight) {
   const h = Number.isFinite(cardHeight) && cardHeight > 0 ? cardHeight : HUD_ROW_HEIGHT;
   return HUD_PET_GAP + h + HUD_WINDOW_SHELL.bottom + BUBBLE_GAP;
@@ -298,6 +303,7 @@ module.exports = function initSessionHud(ctx) {
   let pollTimer = null;
   let clickRevealed = false;
   let visibleHoldUntil = 0;
+  let tooltipVisible = false;
 
   function getCurrentSnapshot() {
     return typeof ctx.getSessionSnapshot === "function"
@@ -351,7 +357,7 @@ module.exports = function initSessionHud(ctx) {
       ? ctx.getNearestWorkArea(cx, cy)
       : { x: 0, y: 0, width: 1280, height: 800 };
     const layout = computeHudLayout(snapshot, { showStateLabels: ctx.sessionHudShowStateLabels !== false });
-    const height = computeHudHeight(layout.rowCount);
+    const height = computeHudDisplayHeight(layout.rowCount, tooltipVisible);
     const width = getHudWidth(
       ctx.sessionHudShowElapsed !== false,
       ctx.sessionHudShowStateLabels !== false,
@@ -538,6 +544,7 @@ module.exports = function initSessionHud(ctx) {
       hudShowElapsed: ctx.sessionHudShowElapsed !== false,
       hudShowContextUsage: ctx.sessionHudShowContextUsage !== false,
       hudPinned: ctx.sessionHudPinned === true,
+      hudFlippedAbove,
     });
   }
 
@@ -615,6 +622,7 @@ module.exports = function initSessionHud(ctx) {
 
   function hideSessionHud() {
     hudFlippedAbove = false;
+    tooltipVisible = false;
     if (hudWindow && !hudWindow.isDestroyed()) hudWindow.hide();
     notifyReservedOffsetIfChanged();
     scheduleHiddenDestroy();
@@ -636,15 +644,23 @@ module.exports = function initSessionHud(ctx) {
       ? ctx.getNearestWorkArea(cx, cy)
       : { x: 0, y: 0, width: 1280, height: 800 };
     const layout = computeHudLayout(snapshot, { showStateLabels: ctx.sessionHudShowStateLabels !== false });
-    const height = computeHudHeight(layout.rowCount);
+    const baseHeight = computeHudHeight(layout.rowCount);
+    const height = computeHudDisplayHeight(layout.rowCount, tooltipVisible);
     const width = getHudWidth(
       ctx.sessionHudShowElapsed !== false,
       ctx.sessionHudShowStateLabels !== false,
       ctx.sessionHudShowContextUsage !== false
     );
     const widthScale = getHudWidthScale(scale);
-    lastHudHeight = height;
+    lastHudHeight = baseHeight;
     return computeSessionHudBounds({ hitRect, anchorRect, workArea, width, height, scale, widthScale });
+  }
+
+  function setTooltipVisible(nextVisible) {
+    const next = nextVisible === true;
+    if (tooltipVisible === next) return;
+    tooltipVisible = next;
+    syncSessionHud(latestSnapshot || getCurrentSnapshot(), { sendSnapshot: false });
   }
 
   function showSessionHud(win) {
@@ -727,6 +743,7 @@ module.exports = function initSessionHud(ctx) {
     hudWindow = null;
     didFinishLoad = false;
     hudFlippedAbove = false;
+    tooltipVisible = false;
     lastHudHeight = HUD_ROW_HEIGHT;
     notifyReservedOffsetIfChanged();
   }
@@ -744,6 +761,7 @@ module.exports = function initSessionHud(ctx) {
     revealFromPet,
     handlePinnedChanged,
     clearReveal,
+    setTooltipVisible,
   };
 };
 
@@ -752,6 +770,7 @@ module.exports.__test = {
   computeHudLayout,
   getHudMaxExpandedRows,
   computeHudHeight,
+  computeHudDisplayHeight,
   computeHudReservedOffset,
   isHudSession,
   getHudWidth,
@@ -770,6 +789,7 @@ module.exports.__test = {
     HUD_CONTEXT_USAGE_WIDTH_BUMP,
     HUD_LABELS_ONLY_WIDTH_TRIM,
     HUD_HEIGHT,
+    HUD_TOOLTIP_HEIGHT,
     HUD_ROW_HEIGHT,
     HUD_MAX_EXPANDED_ROWS,
     HUD_MAX_EXPANDED_ROWS_LABELS,

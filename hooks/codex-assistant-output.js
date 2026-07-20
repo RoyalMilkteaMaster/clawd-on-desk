@@ -5,6 +5,7 @@ const { StringDecoder } = require("string_decoder");
 
 const TRANSCRIPT_TAIL_BYTES = 262144;
 const ASSISTANT_OUTPUT_MAX = 2200;
+const USER_PROMPT_TITLE_MAX = 160;
 const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001F\u007F-\u009F]+/g;
 
 const SKIP_RESPONSE_ITEM_TYPES = new Set([
@@ -185,12 +186,34 @@ function extractLastAssistantTextFromTranscript(transcriptPath, options = {}) {
   );
 }
 
+function extractLastUserPromptTitleFromRecords(records, maxLen = USER_PROMPT_TITLE_MAX) {
+  if (!Array.isArray(records)) return "";
+  for (let i = records.length - 1; i >= 0; i--) {
+    const record = records[i];
+    const payload = record && record.type === "event_msg" && record.payload;
+    if (!payload || payload.type !== "user_message" || typeof payload.message !== "string") continue;
+    const firstLine = payload.message.split(/\r?\n/).find((line) => line.trim());
+    if (!firstLine) return "";
+    return firstLine.replace(CONTROL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxLen);
+  }
+  return "";
+}
+
+function extractLastUserPromptTitleFromTranscript(transcriptPath, options = {}) {
+  return extractLastUserPromptTitleFromRecords(
+    readCodexTranscriptTailRecords(transcriptPath, options.maxBytes),
+    options.maxLen
+  );
+}
+
 module.exports = {
   ASSISTANT_OUTPUT_MAX,
   clampAssistantOutputText,
   extractAssistantTextFromRecord,
   extractLastAssistantTextFromRecords,
   extractLastAssistantTextFromTranscript,
+  extractLastUserPromptTitleFromRecords,
+  extractLastUserPromptTitleFromTranscript,
   isTurnBoundaryRecord,
   readCodexTranscriptTailRecords,
 };

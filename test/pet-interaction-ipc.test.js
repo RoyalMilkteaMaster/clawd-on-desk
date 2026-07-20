@@ -81,6 +81,13 @@ function createHarness(overrides = {}) {
     scheduleHwndRecovery: () => calls.push(["scheduleHwndRecovery"]),
     repositionFloatingBubbles: () => calls.push(["repositionFloatingBubbles"]),
     exitMiniMode: () => calls.push(["exitMiniMode"]),
+    exitMiniModeForDrag: () => {
+      calls.push(["exitMiniModeForDrag"]);
+      state.miniMode = false;
+      state.miniTransitioning = false;
+      return true;
+    },
+    prepareMiniDrag: () => calls.push(["prepareMiniDrag"]),
     getDisableMiniMode: () => state.disableMiniMode,
     getFocusableLocalHudSessionIds: () => state.focusableIds,
     focusLog: (message) => calls.push(["focusLog", message]),
@@ -120,6 +127,7 @@ test("pet interaction IPC registers owned channels and disposes them", () => {
   const { ipcMain, runtime } = createHarness();
 
   assert.deepStrictEqual([...ipcMain.listeners.keys()].sort(), [
+    "detach-mini-for-drag",
     "drag-end",
     "drag-lock",
     "drag-move",
@@ -208,6 +216,42 @@ test("pet interaction IPC preserves drag lock lifecycle", () => {
     ["syncHitWin"],
     // #640: the dodge defers its hit-window click-through write while a drag
     // is in flight — releasing the lock must re-run the sync.
+    ["syncImeEditingPetDodge"],
+  ]);
+});
+
+test("pet interaction IPC settles mini state before taking a drag snapshot", () => {
+  const { ipcMain, calls } = createHarness({ state: { miniMode: true } });
+
+  ipcMain.send("drag-lock", true);
+
+  assert.deepStrictEqual(calls, [
+    ["setDragLocked", true],
+    ["setMouseOverPet", true],
+    ["prepareMiniDrag"],
+    ["beginDragSnapshot"],
+  ]);
+});
+
+test("pet interaction IPC detaches mini drag and reevaluates edge snap on release", () => {
+  const { ipcMain, calls, state } = createHarness({ state: { miniMode: true } });
+
+  ipcMain.send("detach-mini-for-drag");
+  ipcMain.send("drag-end");
+
+  assert.strictEqual(state.miniMode, false);
+  assert.deepStrictEqual(calls, [
+    ["exitMiniModeForDrag"],
+    ["checkMiniModeSnap"],
+    ["computeDragEndBounds", state.petWindowBounds, state.currentPixelSize],
+    ["applyPetWindowBounds", state.clampedBounds],
+    ["flushRuntimeStateToPrefs"],
+    ["reassertWinTopmost"],
+    ["scheduleHwndRecovery"],
+    ["syncHitWin"],
+    ["repositionFloatingBubbles"],
+    ["setDragLocked", false],
+    ["clearDragSnapshot"],
     ["syncImeEditingPetDodge"],
   ]);
 });

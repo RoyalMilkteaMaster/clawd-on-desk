@@ -61,6 +61,7 @@ function createHarness({ isMac = false, sendState = {} } = {}) {
         showContextMenu: () => apiCalls.push(["showContextMenu"]),
         focusTerminal: () => apiCalls.push(["focusTerminal"]),
         exitMiniMode: () => apiCalls.push(["exitMiniMode"]),
+        detachMiniForDrag: () => apiCalls.push(["detachMiniForDrag"]),
         showDashboard: () => apiCalls.push(["showDashboard"]),
         revealSessionHud: () => apiCalls.push(["revealSessionHud"]),
         startDragReaction: (direction) => apiCalls.push(["startDragReaction", direction]),
@@ -102,13 +103,13 @@ function createHarness({ isMac = false, sendState = {} } = {}) {
     fakeDocument._dispatch("pointerup", { button, ctrlKey, metaKey, clientX });
   }
 
-  function pointerdown({ button = 0, pointerId = 1, clientX = 100, clientY = 100 } = {}) {
+  function pointerdown({ button = 0, pointerId = 1, clientX = 100, clientY = 100, screenX = clientX, screenY = clientY } = {}) {
     const cb = area.listeners.get("pointerdown");
-    if (cb) cb({ button, pointerId, clientX, clientY });
+    if (cb) cb({ button, pointerId, clientX, clientY, screenX, screenY });
   }
 
-  function pointermove({ clientX = 100, clientY = 100 } = {}) {
-    fakeDocument._dispatch("pointermove", { clientX, clientY });
+  function pointermove({ clientX = 100, clientY = 100, screenX = clientX, screenY = clientY } = {}) {
+    fakeDocument._dispatch("pointermove", { clientX, clientY, screenX, screenY });
   }
 
   function fireTimer(predicate) {
@@ -233,6 +234,51 @@ describe("hit-renderer input layer", () => {
         ["startDragReaction", "right"],
       ]
     );
+  });
+
+  it("starts a free drag when moving vertically from mini mode", () => {
+    const h = createHarness({ sendState: { currentState: "working", miniMode: true, dndEnabled: false } });
+    h.pointerdown({ clientX: 100, clientY: 100 });
+    h.pointermove({ clientX: 102, clientY: 135 });
+    h.fireTimer((t) => t.ms === 16);
+    h.pointerup({ clientX: 102 });
+
+    assert.strictEqual(h.area.style.cursor, "");
+    assert.deepStrictEqual(
+      h.apiCalls.filter((call) => ["dragLock", "dragMove", "dragEnd"].includes(call[0])),
+      [["dragLock", true], ["dragMove"], ["dragLock", false], ["dragEnd"]],
+    );
+    assert.deepStrictEqual(h.apiCalls.filter((call) => call[0] === "detachMiniForDrag"), [["detachMiniForDrag"]]);
+    assert.deepStrictEqual(h.apiCalls.filter((call) => call[0] === "startDragReaction"), [["startDragReaction", "right"]]);
+    assert.deepStrictEqual(h.apiCalls.filter((call) => call[0] === "exitMiniMode"), []);
+  });
+
+  it("continues horizontally after a mini drag starts vertically", () => {
+    const h = createHarness({ sendState: {
+      currentState: "idle", miniMode: true, miniEdge: "right", dndEnabled: false,
+    } });
+    h.pointerdown({ clientX: 100, clientY: 100 });
+    h.pointermove({ clientX: 100, clientY: 130 });
+    h.pointermove({ clientX: 125, clientY: 130 });
+
+    assert.deepStrictEqual(
+      h.apiCalls.filter((call) => call[0] === "detachMiniForDrag"),
+      [["detachMiniForDrag"]],
+    );
+    assert.deepStrictEqual(
+      h.apiCalls.filter((call) => call[0] === "startDragReaction"),
+      [["startDragReaction", null], ["startDragReaction", "right"]],
+    );
+  });
+
+  it("uses stable screen coordinates when the hit window client coordinates shift", () => {
+    const h = createHarness({ sendState: {
+      currentState: "idle", miniMode: true, miniEdge: "right", dndEnabled: false,
+    } });
+    h.pointerdown({ clientX: 100, clientY: 100, screenX: 500, screenY: 300 });
+    h.pointermove({ clientX: 70, clientY: 100, screenX: 500, screenY: 302 });
+
+    assert.deepStrictEqual(h.apiCalls.filter((call) => call[0] === "detachMiniForDrag"), []);
   });
 });
 

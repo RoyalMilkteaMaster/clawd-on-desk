@@ -29,6 +29,7 @@ const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-anim-overrides.js"),
   path.join(SRC_DIR, "settings-tab-shortcuts.js"),
   path.join(SRC_DIR, "settings-tab-telegram-approval.js"),
+  path.join(SRC_DIR, "settings-tab-discord-bot.js"),
   path.join(SRC_DIR, "settings-tab-about.js"),
 ];
 const VERIFIED_GITHUB_CONTRIBUTORS = [
@@ -203,6 +204,10 @@ class FakeElement {
     child.parentNode = this;
     this.children.push(child);
     return child;
+  }
+
+  append(...children) {
+    for (const child of children) this.appendChild(child);
   }
 
   insertBefore(child, reference) {
@@ -1118,6 +1123,84 @@ function loadTelegramApprovalTabForTest({
   return { core, content, updates, commands, render, renderRequests, timers };
 }
 
+function loadDiscordBotTabForTest({ style, confirm = () => true } = {}) {
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  body.appendChild(content);
+  const commands = [];
+  const toasts = [];
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById: () => null,
+  };
+  const settingsAPI = {
+    update: () => Promise.resolve({ status: "ok" }),
+    command(name, payload) {
+      commands.push({ name, payload });
+      if (name === "discordBot.tokenInfo") {
+        return Promise.resolve({ status: "ok", configured: true, masked: "disc...6789" });
+      }
+      if (name === "discordBot.style.get") {
+        return Promise.resolve({ status: "ok", style });
+      }
+      if (name === "discordBot.style.save") {
+        return Promise.resolve({ status: "ok", style: payload });
+      }
+      if (name === "discordBot.style.reset") {
+        return Promise.resolve({ status: "ok", style });
+      }
+      return Promise.resolve({ status: "ok" });
+    },
+  };
+  const context = {
+    console,
+    document,
+    Event: class FakeEvent {
+      constructor(type, options = {}) { this.type = type; this.bubbles = options.bubbles; }
+    },
+    window: null,
+    globalThis: null,
+    settingsAPI,
+    confirm,
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-discord-bot.js"), "utf8"), context);
+
+  const core = {
+    state: {
+      snapshot: { discordBot: { enabled: true, channelId: "123456789012345678", notifyOnComplete: true } },
+    },
+    helpers: {
+      t: (key) => key,
+      buildSection: (_title, rows) => {
+        const section = document.createElement("section");
+        for (const row of rows) section.appendChild(row);
+        return section;
+      },
+      setSwitchVisual: () => {},
+    },
+    ops: {
+      requestRender: () => {},
+      showToast: (message, options) => toasts.push({ message, options }),
+    },
+    tabs: {},
+  };
+  context.ClawdSettingsTabDiscordBot.init(core);
+  function render() {
+    content.innerHTML = "";
+    core.tabs["notification-replies"].render(content);
+  }
+  function renderDiscordBot() {
+    content.innerHTML = "";
+    core.tabs["discord-bot"].render(content);
+  }
+  render();
+  return { content, commands, render, renderDiscordBot, toasts };
+}
+
 function loadAnimOverridesTabForTest({
   runtime,
   modalRoot,
@@ -1269,6 +1352,9 @@ describe("settings renderer browser environment", () => {
       "settings-tab-anim-overrides.js",
       "settings-tab-shortcuts.js",
       "settings-tab-telegram-approval.js",
+      "settings-tab-discord-presence.js",
+      "settings-tab-discord-bot.js",
+      "settings-tab-line-notifications.js",
       "settings-tab-about.js",
       "settings-tab-remote-ssh.js",
       "settings-doctor-modal.js",
@@ -1326,6 +1412,67 @@ describe("settings renderer browser environment", () => {
       assert.ok(!source.includes("settingsAPI.onShortcutFailuresChanged"), `${path.basename(file)} must not subscribe to settingsAPI.onShortcutFailuresChanged`);
       assert.ok(!source.includes("settingsAPI.onRemoteApprovalStatusChanged"), `${path.basename(file)} must not subscribe to remote approval status directly`);
     }
+  });
+
+  it("lets non-technical users edit nicknames and every notification reply without seeing JSON", async () => {
+    const style = {
+      nickname: "Milktea",
+      accountName: "Clawd",
+      templates: {
+        complete: ["Done {task}", "Finished {project}"],
+        interrupted: "Stopped {task}",
+        permission: "Approve {task}",
+        choice: "Choose for {task}",
+      },
+    };
+    const harness = loadDiscordBotTabForTest({ style });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const nickname = harness.content.querySelector(".discord-style-nickname-input");
+    const completionReplies = harness.content.querySelectorAll(".discord-style-complete-textarea");
+    assert.ok(nickname);
+    assert.strictEqual(nickname.value, "Milktea");
+    assert.strictEqual(completionReplies.length, 2);
+    assert.ok(harness.content.querySelector(".discord-style-interrupted-textarea"));
+    assert.ok(harness.content.querySelector(".discord-style-permission-textarea"));
+    assert.ok(harness.content.querySelector(".discord-style-choice-textarea"));
+    assert.strictEqual(harness.content.querySelectorAll("textarea").length, 5);
+
+    nickname.value = "Tea";
+    nickname.dispatchEvent({ type: "input", bubbles: false });
+    const firstReply = completionReplies[0];
+    firstReply.value = "Ready ";
+    firstReply.dispatchEvent({ type: "input", bubbles: false });
+    const taskButton = harness.content.querySelectorAll(".discord-style-variable")
+      .find((button) => button.dataset.templateVariable === "{task}");
+    taskButton.dispatchEvent({ type: "click", bubbles: false });
+    assert.strictEqual(firstReply.value, "Ready {task}");
+    assert.ok(harness.content.querySelector(".discord-style-preview").textContent.includes("discordBotPreviewTask"));
+
+    harness.content.querySelector(".discord-style-save").dispatchEvent({ type: "click", bubbles: false });
+    await Promise.resolve();
+    const save = harness.commands.findLast((entry) => entry.name === "discordBot.style.save");
+    assert.ok(save);
+    assert.strictEqual(save.payload.nickname, "Tea");
+    assert.strictEqual(save.payload.templates.complete[0], "Ready {task}");
+    const visibleLabels = harness.content.querySelectorAll("span").map((element) => element.textContent).join(" ");
+    assert.ok(!visibleLabels.includes("line-notification-style.json"));
+  });
+
+  it("keeps reply editing out of the Discord Bot page", async () => {
+    const harness = loadDiscordBotTabForTest({
+      style: {
+        nickname: "Milktea",
+        accountName: "Clawd",
+        templates: { complete: ["Done"], interrupted: "Stopped", permission: "Approve", choice: "Choose" },
+      },
+    });
+    await Promise.resolve();
+    harness.renderDiscordBot();
+    assert.strictEqual(harness.content.querySelector(".discord-style-editor-row"), null);
+    assert.ok(harness.content.querySelector(".discord-style-nickname-input") === null);
   });
 
   it("keeps About contributors visible and includes verified GitHub contributors", () => {

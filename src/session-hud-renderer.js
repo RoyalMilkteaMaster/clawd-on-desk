@@ -10,6 +10,7 @@ const SESSION_ACTION_FEEDBACK_MS = 4000;
 
 let snapshot = { sessions: [], orderedIds: [], hudTotalNonIdle: 0, hudLastTitle: null, hudShowStateLabels: true, hudShowElapsed: true, hudShowContextUsage: true, hudPinned: false };
 let i18nPayload = { lang: "en", translations: {} };
+let hoveredSessionId = null;
 
 const unreadSessions = new Set();
 const prevBadges = new Map();
@@ -59,7 +60,12 @@ function formatTokenCount(value) {
 }
 
 function titleFor(session) {
-  return session.displayTitle || session.sessionTitle || session.id || "";
+  const title = session.displayTitle || session.sessionTitle || "";
+  if (String(title).trim().toLowerCase() === "codex") {
+    const parts = String(session.cwd || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return title || session.id || "";
 }
 
 function titleUnits(value) {
@@ -242,6 +248,28 @@ function openFolderFailureText(result) {
   return t("sessionOpenFolderUnavailable");
 }
 
+function createRowTooltip(session) {
+  const fullTitle = String(titleFor(session) || "").trim();
+  const cwd = String(session && session.cwd || "").trim();
+  if (!fullTitle && !cwd) return null;
+  const tooltip = document.createElement("div");
+  tooltip.className = "row-tooltip";
+  tooltip.setAttribute("aria-hidden", "true");
+  if (fullTitle) {
+    const title = document.createElement("div");
+    title.className = "row-tooltip-title";
+    title.textContent = fullTitle;
+    tooltip.appendChild(title);
+  }
+  if (cwd) {
+    const path = document.createElement("div");
+    path.className = "row-tooltip-path";
+    path.textContent = cwd;
+    tooltip.appendChild(path);
+  }
+  return tooltip;
+}
+
 function createRowForSession(session, now) {
   const row = document.createElement("div");
   row.className = "row";
@@ -249,7 +277,6 @@ function createRowForSession(session, now) {
   const feedbackText = sessionFeedbackText(session.id, now);
   if (!canFocus) {
     row.classList.add("row-unfocusable");
-    row.title = focusUnavailableTooltip(session);
   }
 
   const left = document.createElement("div");
@@ -284,8 +311,6 @@ function createRowForSession(session, now) {
   if (feedbackText) {
     title.title = feedbackText;
     title.setAttribute("aria-live", "polite");
-  } else if (shortTitle && shortTitle !== fullTitle) {
-    title.title = fullTitle;
   }
   left.appendChild(title);
 
@@ -379,8 +404,25 @@ function createRowForSession(session, now) {
 
   row.appendChild(left);
   if (hasRightContent) row.appendChild(right);
+  const tooltip = createRowTooltip(session);
+  if (tooltip) {
+    row.appendChild(tooltip);
+    row.addEventListener("mouseenter", () => {
+      hoveredSessionId = session.id;
+      row.classList.add("tooltip-active");
+      window.sessionHudAPI.setTooltipVisible(true);
+    });
+    row.addEventListener("mouseleave", () => {
+      hoveredSessionId = null;
+      row.classList.remove("tooltip-active");
+      window.sessionHudAPI.setTooltipVisible(false);
+      render();
+    });
+  }
 
   row.addEventListener("click", () => {
+    hoveredSessionId = null;
+    window.sessionHudAPI.setTooltipVisible(false);
     unreadSessions.delete(session.id);
     if (canFocus) {
       render();
@@ -397,7 +439,6 @@ function createRowForSession(session, now) {
       });
     }
   });
-
   return row;
 }
 
@@ -442,6 +483,7 @@ function createPinButton(pinned) {
 }
 
 function render() {
+  if (hoveredSessionId) return;
   const sessions = orderedHudSessions(snapshot);
   const currentIds = new Set(sessions.map((session) => session.id));
   for (const sessionId of pendingFolderSessions) {
@@ -455,11 +497,11 @@ function render() {
   updateUnread(sessions);
   hudEl.replaceChildren();
   hudEl.classList.add("has-pin");
+  hudEl.classList.toggle("tooltip-above", snapshot.hudFlippedAbove === true);
   if (!sessions.length) return;
 
   const now = Date.now();
   const { expanded, folded } = splitHudLayout(sessions);
-
   for (const session of expanded) {
     hudEl.appendChild(createRowForSession(session, now));
   }

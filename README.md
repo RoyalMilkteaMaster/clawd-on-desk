@@ -12,14 +12,14 @@
   <a href="README.ja-JP.md">日本語</a>
 </p>
 <p align="center">
-  <sub>🌏 Don't see your language? <a href="https://github.com/rullerzhou-afk/clawd-on-desk/pulls">Open a PR</a> to add one — Español, Français, Deutsch, etc. all welcome.</sub>
+  <sub>🌏 Don't see your language? <a href="https://github.com/RoyalMilkteaMaster/clawd-on-desk/pulls">Open a PR</a> to add one — Español, Français, Deutsch, etc. all welcome.</sub>
 </p>
 <p align="center">
-  <a href="https://github.com/rullerzhou-afk/clawd-on-desk/releases"><img src="https://img.shields.io/github/v/release/rullerzhou-afk/clawd-on-desk" alt="Version"></a>
+  <a href="https://github.com/RoyalMilkteaMaster/clawd-on-desk/releases"><img src="https://img.shields.io/github/v/release/RoyalMilkteaMaster/clawd-on-desk" alt="Version"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Platform">
 </p>
 <p align="center">
-  <a href="https://github.com/rullerzhou-afk/clawd-on-desk/stargazers"><img src="https://img.shields.io/github/stars/rullerzhou-afk/clawd-on-desk?style=flat&logo=github&color=yellow" alt="Stars"></a>
+  <a href="https://github.com/RoyalMilkteaMaster/clawd-on-desk/stargazers"><img src="https://img.shields.io/github/stars/RoyalMilkteaMaster/clawd-on-desk?style=flat&logo=github&color=yellow" alt="Stars"></a>
   <a href="https://github.com/hesreallyhim/awesome-claude-code"><img src="https://awesome.re/mentioned-badge-flat.svg" alt="Mentioned in Awesome Claude Code"></a>
 </p>
 
@@ -140,7 +140,7 @@ Clawd adapts to multi-monitor setups: proportional sizing uses the display Clawd
 
 ## Quick Start
 
-For normal use, download the latest prebuilt installer from **[GitHub Releases](https://github.com/rullerzhou-afk/clawd-on-desk/releases/latest)**:
+For normal use, download the latest prebuilt installer from **[GitHub Releases](https://github.com/RoyalMilkteaMaster/clawd-on-desk/releases/latest)**:
 
 - **Windows**: `Clawd-on-Desk-Setup-<version>-x64.exe` or `Clawd-on-Desk-Setup-<version>-arm64.exe`
 - **macOS**: `.dmg`
@@ -152,7 +152,7 @@ Run from source only if you're contributing, testing unreleased code, or debuggi
 
 ```bash
 # Clone the repo
-git clone https://github.com/rullerzhou-afk/clawd-on-desk.git
+git clone https://github.com/RoyalMilkteaMaster/clawd-on-desk.git
 cd clawd-on-desk
 
 # Install dependencies
@@ -211,7 +211,7 @@ Some things we'd like to explore in the future:
 
 ## Contributing
 
-Clawd on Desk is a community-driven project. Bug reports, feature ideas, and pull requests are all welcome — open an [issue](https://github.com/rullerzhou-afk/clawd-on-desk/issues) to discuss or submit a PR directly.
+Clawd on Desk is a community-driven project. Bug reports, feature ideas, and pull requests are all welcome — open an [issue](https://github.com/RoyalMilkteaMaster/clawd-on-desk/issues) to discuss or submit a PR directly.
 
 ### Maintainers
 
