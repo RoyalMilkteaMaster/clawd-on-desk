@@ -45,6 +45,33 @@ describe("CodexLogMonitor", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  it("keeps polling when the initial scan fails", (_, done) => {
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {});
+    let polls = 0;
+    monitor._poll = () => {
+      polls += 1;
+      if (polls === 1) throw new Error("bad rollout");
+      monitor.stop();
+      assert.strictEqual(polls, 2);
+      done();
+    };
+
+    monitor.start();
+  });
+
+  it("bounds each incremental read from a large live rollout", () => {
+    const testFile = path.join(dateDir, TEST_FILENAME);
+    const meta = '{"type":"session_meta","payload":{"cwd":"/projects/foo"}}\n';
+    fs.writeFileSync(testFile, meta + "x".repeat(9 * 1024 * 1024) + "\n");
+
+    monitor = new CodexLogMonitor(makeConfig(tmpDir), () => {});
+    monitor._pollFile(testFile, path.basename(testFile));
+
+    const tracked = monitor._tracked.get(testFile);
+    assert.ok(tracked.offset > 0);
+    assert.ok(tracked.offset < fs.statSync(testFile).size);
+  });
+
   it("should extract session ID from filename", (_, done) => {
     const testFile = path.join(dateDir, TEST_FILENAME);
     fs.writeFileSync(testFile, '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n');

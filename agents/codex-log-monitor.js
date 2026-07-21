@@ -29,6 +29,7 @@ const MAX_TRACKED_FILES = 50;
 const MAX_RETIRED_TRACKED_FILES = 100;
 const MAX_PARTIAL_BYTES = 65536;
 const MAX_INITIAL_BACKFILL_BYTES = 8 * 1024 * 1024;
+const MAX_POLL_READ_BYTES = 8 * 1024 * 1024;
 const RECENT_DAY_DIR_CACHE_MS = 60 * 60 * 1000; // 1 hour
 // A rollout file is considered "active" if written within this window. Used by
 // both the untracked-file pickup gate in _poll and the _getActiveDayDirs scan
@@ -194,12 +195,17 @@ class CodexLogMonitor {
     // its own recovery sweep, not just the very first one this instance ever
     // saw.
     this._didInitialRecoveryScan = false;
-    // Initial scan
-    this._poll();
-    this._interval = setInterval(
-      () => this._poll(),
-      this._config.logConfig.pollIntervalMs || 1500
-    );
+    const poll = () => {
+      try {
+        this._poll();
+      } catch (err) {
+        console.warn("Clawd: Codex log poll failed:", err && err.message);
+      }
+    };
+    // Install the timer before the initial scan so one bad/oversized rollout
+    // cannot permanently disable monitoring for every other Codex session.
+    this._interval = setInterval(poll, this._config.logConfig.pollIntervalMs || 1500);
+    poll();
   }
 
   stop() {
@@ -768,7 +774,7 @@ class CodexLogMonitor {
         });
         return;
       }
-      const readLen = openedStat.size - tracked.offset;
+      const readLen = Math.min(openedStat.size - tracked.offset, MAX_POLL_READ_BYTES);
       if (readLen <= 0) return;
       buf = Buffer.alloc(readLen);
       bytesRead = fs.readSync(fd, buf, 0, readLen, tracked.offset);
